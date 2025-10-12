@@ -18,12 +18,15 @@ try:
 except (ImportError, ModuleNotFoundError):
     from sqlalchemy.orm import joinedload
 
-    from . import Session
-    from .embeddings import Embedder
-    from .feedback import Reviewer
-    from .logger import log_event
-    from .main import process_document
-    from .models import Document, User
+    def _lazy_components():
+        from . import Session as SessionMaker
+        from .embeddings import Embedder
+        from .feedback import Reviewer
+        from .logger import log_event
+        from .main import process_document
+        from .models import Document, User
+
+        return SessionMaker, Embedder, Reviewer, log_event, process_document, Document, User
 
     logger = logging.getLogger(__name__)
 
@@ -33,7 +36,8 @@ except (ImportError, ModuleNotFoundError):
         doc_text: str,
         generate_feedback: bool = True,
     ) -> Mapping[str, list[str]]:
-        with Session() as session:
+        SessionMaker, Embedder, Reviewer, log_event, process_document, Document, User = _lazy_components()
+        with SessionMaker() as session:
             user = session.query(User).filter(User.user_id == user_id).first()
             if not user:
                 logger.warning("User not found for document processing", extra={"user_id": user_id})
