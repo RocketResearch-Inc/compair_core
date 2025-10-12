@@ -62,8 +62,8 @@ See `compair_core/server/settings.py` for the full settings surface.
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e .[dev]
-uvicorn compair_core.server.app:create_app --factory --reload
+pip install -e ".[dev]"
+uvicorn compair.server.app:create_app --factory --reload
 ```
 
 The API will be available at http://127.0.0.1:8000 and supports the Swagger UI at `/docs`.
@@ -71,6 +71,8 @@ The API will be available at http://127.0.0.1:8000 and supports the Swagger UI a
 ## Tests / Linting
 
 Core currently ships with a syntax sanity check (`python -m compileall ...`). You can add pytest or other tooling as needed.
+
+Release and packaging steps are documented in `docs/maintainers.md`.
 
 ## Reporting Issues
 

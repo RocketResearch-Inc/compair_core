@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "compair-core"
-version = "0.3.1"
+version = "0.3.2"
 description = "Open-source foundation of the Compair collaboration platform."
 readme = "README.md"
 license = { text = "MIT" }
@@ -46,7 +46,16 @@ Source = "https://github.com/RocketResearch-Inc/compair_core"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["compair_core", "compair_core.*"]
+include = [
+  "compair_core",
+  "compair_core.*",
+  "compair",
+  "compair.*",
+  "server",
+  "server.*",
+  "compair_email",
+  "compair_email.*"
+]
 
 [tool.setuptools.package-data]
 "*" = ["*.md"]
