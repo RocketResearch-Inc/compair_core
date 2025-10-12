@@ -51,7 +51,7 @@ Container definitions and build pipelines live outside this public package:
 Key environment variables for the core edition:
 
 - `COMPAIR_EDITION` (`core`) – corresponds to this core local implementation.
-- `COMPAIR_SQLITE_DIR` / `COMPAIR_SQLITE_NAME` – override the default local SQLite path.
+- `COMPAIR_SQLITE_DIR` / `COMPAIR_SQLITE_NAME` – override the default local SQLite path (falls back to `./compair_data` if `/data` is not writable).
 - `COMPAIR_LOCAL_MODEL_URL` – endpoint for your local embeddings/feedback service (defaults to `http://local-model:9000`).
 - `COMPAIR_EMAIL_BACKEND` – the core mailer logs emails to stdout; cloud overrides this with transactional delivery.
 

@@ -61,7 +61,12 @@ def _handle_engine() -> Engine:
         )
 
     sqlite_dir = os.getenv("COMPAIR_SQLITE_DIR", "/data")
-    os.makedirs(sqlite_dir, exist_ok=True)
+    try:
+        os.makedirs(sqlite_dir, exist_ok=True)
+    except OSError:
+        fallback_dir = os.path.join(os.getcwd(), "compair_data")
+        os.makedirs(fallback_dir, exist_ok=True)
+        sqlite_dir = fallback_dir
     sqlite_path = os.path.join(sqlite_dir, os.getenv("COMPAIR_SQLITE_NAME", "compair.db"))
     return create_engine(f"sqlite:///{sqlite_path}", connect_args={"check_same_thread": False})
 
