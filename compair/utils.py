@@ -2,14 +2,10 @@ from __future__ import annotations
 
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Any
 
 from sqlalchemy.orm import Session
 
-try:
-    from compair_cloud.utils import log_activity as cloud_log_activity  # type: ignore
-except (ImportError, ModuleNotFoundError):
-    cloud_log_activity = None
+from compair.models import Activity
 
 
 def chunk_text(text: str) -> list[str]:
@@ -33,29 +29,14 @@ def log_activity(
     object_name: str,
     object_type: str,
 ) -> None:
-    if cloud_log_activity:
-        cloud_log_activity(
-            session=session,
-            user_id=user_id,
-            group_id=group_id,
-            action=action,
-            object_id=object_id,
-            object_name=object_name,
-            object_type=object_type,
-        )
-
-
-def aggregate_usage_by_user() -> dict[str, Any]:
-    if cloud_log_activity:
-        from compair_cloud.utils import aggregate_usage_by_user as cloud_usage  # type: ignore
-
-        return cloud_usage()
-    return {}
-
-
-def aggregate_service_resources() -> dict[str, Any]:
-    if cloud_log_activity:
-        from compair_cloud.utils import aggregate_service_resources as cloud_resources  # type: ignore
-
-        return cloud_resources()
-    return {}
+    activity = Activity(
+        user_id=user_id,
+        group_id=group_id,
+        action=action,
+        object_id=object_id,
+        object_name=object_name,
+        object_type=object_type,
+        timestamp=datetime.now(timezone.utc),
+    )
+    session.add(activity)
+    session.commit()

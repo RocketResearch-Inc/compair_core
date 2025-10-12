@@ -38,7 +38,7 @@ class BaseObject(Base):
 
 class User(Base):
     __tablename__ = "user"
-    __table_args__ = {"schema": "public"}
+    
 
     user_id: Mapped[str] = mapped_column(String(36), primary_key=True, init=False, default=lambda: str(uuid4()))
     username: Mapped[str] = mapped_column(String(128))
@@ -108,17 +108,17 @@ class User(Base):
 
 class Session(Base):
     __tablename__ = "session"
-    __table_args__ = {"schema": "public"}
+    
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True, init=True)
-    user_id: Mapped[str] = mapped_column(ForeignKey("public.user.user_id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("user.user_id", ondelete="CASCADE"), index=True)
     datetime_created: Mapped[datetime]
     datetime_valid_until: Mapped[datetime]
 
 
 class Group(BaseObject):
     __tablename__ = "group"
-    __table_args__ = {"schema": "public"}
+    
 
     group_id: Mapped[str] = mapped_column(String(36), primary_key=True, init=False, default=lambda: str(uuid4()))
     name: Mapped[str] = mapped_column(String(256))
@@ -150,10 +150,10 @@ class Group(BaseObject):
 
 class Administrator(Base):
     __tablename__ = "administrator"
-    __table_args__ = {"schema": "public"}
+    
 
     admin_id: Mapped[str] = mapped_column(String(36), primary_key=True, init=False, default=lambda: str(uuid4()))
-    user_id: Mapped[str] = mapped_column(ForeignKey("public.user.user_id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("user.user_id", ondelete="CASCADE"), index=True)
 
     user = relationship("User")
     groups = relationship("Group", secondary="admin_to_group", back_populates="admins")
@@ -161,11 +161,11 @@ class Administrator(Base):
 
 class JoinRequest(Base):
     __tablename__ = "join_request"
-    __table_args__ = {"schema": "public"}
+    
 
     request_id: Mapped[int] = mapped_column(Identity(), primary_key=True, autoincrement=True, init=False)
-    user_id: Mapped[str] = mapped_column(ForeignKey("public.user.user_id", ondelete="CASCADE"))
-    group_id: Mapped[str] = mapped_column(ForeignKey("public.group.group_id", ondelete="CASCADE"))
+    user_id: Mapped[str] = mapped_column(ForeignKey("user.user_id", ondelete="CASCADE"))
+    group_id: Mapped[str] = mapped_column(ForeignKey("group.group_id", ondelete="CASCADE"))
     datetime_requested: Mapped[datetime] = mapped_column(default=datetime.now(timezone.utc), init=False)
 
     user = relationship("User")
@@ -174,11 +174,11 @@ class JoinRequest(Base):
 
 class GroupInvitation(Base):
     __tablename__ = "group_invitation"
-    __table_args__ = {"schema": "public"}
+    
 
     invitation_id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True, autoincrement=True, init=False)
-    group_id: Mapped[str] = mapped_column(ForeignKey("public.group.group_id", ondelete="CASCADE"))
-    inviter_id: Mapped[str] = mapped_column(ForeignKey("public.user.user_id", ondelete="CASCADE"))
+    group_id: Mapped[str] = mapped_column(ForeignKey("group.group_id", ondelete="CASCADE"))
+    inviter_id: Mapped[str] = mapped_column(ForeignKey("user.user_id", ondelete="CASCADE"))
     token: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     email: Mapped[str | None] = mapped_column(String(256), nullable=True)
     datetime_expiration: Mapped[datetime]
@@ -191,10 +191,10 @@ class GroupInvitation(Base):
 
 class Document(BaseObject):
     __tablename__ = "document"
-    __table_args__ = {"schema": "public"}
+    
 
     document_id: Mapped[str] = mapped_column(String(36), primary_key=True, init=False, default=lambda: str(uuid4()))
-    user_id: Mapped[str] = mapped_column(ForeignKey("public.user.user_id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("user.user_id", ondelete="CASCADE"), index=True)
     author_id: Mapped[str]
     title: Mapped[str]
     content: Mapped[str] = mapped_column(Text)
@@ -230,12 +230,12 @@ class Document(BaseObject):
 
 class Note(Base):
     __tablename__ = "note"
-    __table_args__ = {"schema": "public"}
+    
 
     note_id: Mapped[str] = mapped_column(String(36), primary_key=True, init=False, default=lambda: str(uuid4()))
-    document_id: Mapped[str] = mapped_column(ForeignKey("public.document.document_id", ondelete="CASCADE"), index=True)
-    author_id: Mapped[str] = mapped_column(ForeignKey("public.user.user_id", ondelete="CASCADE"), index=True)
-    group_id: Mapped[str | None] = mapped_column(ForeignKey("public.group.group_id", ondelete="CASCADE"), index=True, nullable=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("document.document_id", ondelete="CASCADE"), index=True)
+    author_id: Mapped[str] = mapped_column(ForeignKey("user.user_id", ondelete="CASCADE"), index=True)
+    group_id: Mapped[str | None] = mapped_column(ForeignKey("group.group_id", ondelete="CASCADE"), index=True, nullable=True)
     content: Mapped[str] = mapped_column(Text)
     datetime_created: Mapped[datetime] = mapped_column(default=datetime.now(timezone.utc))
     embedding = mapped_column(Vector(1536))
@@ -259,13 +259,13 @@ class Note(Base):
 
 class Chunk(Base):
     __tablename__ = "chunk"
-    __table_args__ = {"schema": "public"}
+    
 
     chunk_id: Mapped[str] = mapped_column(String(36), primary_key=True, init=False, default=lambda: str(uuid4()))
     hash: Mapped[str] = mapped_column(String(32))
     content: Mapped[str] = mapped_column(Text)
-    document_id: Mapped[str | None] = mapped_column(ForeignKey("public.document.document_id", ondelete="CASCADE"), index=True, nullable=True)
-    note_id: Mapped[str | None] = mapped_column(ForeignKey("public.note.note_id", ondelete="CASCADE"), index=True, nullable=True)
+    document_id: Mapped[str | None] = mapped_column(ForeignKey("document.document_id", ondelete="CASCADE"), index=True, nullable=True)
+    note_id: Mapped[str | None] = mapped_column(ForeignKey("note.note_id", ondelete="CASCADE"), index=True, nullable=True)
     chunk_type: Mapped[str] = mapped_column(String(16), default="document")
     embedding = mapped_column(Vector(1536))
 
@@ -287,12 +287,12 @@ class Chunk(Base):
 
 class Reference(Base):
     __tablename__ = "reference"
-    __table_args__ = {"schema": "public"}
+    
 
     reference_id: Mapped[str] = mapped_column(String(36), primary_key=True, init=False, default=lambda: str(uuid4()))
-    source_chunk_id: Mapped[str] = mapped_column(ForeignKey("public.chunk.chunk_id", ondelete="CASCADE"), index=True)
-    reference_document_id: Mapped[str | None] = mapped_column(ForeignKey("public.document.document_id", ondelete="CASCADE"), index=True, nullable=True)
-    reference_note_id: Mapped[str | None] = mapped_column(ForeignKey("public.note.note_id", ondelete="CASCADE"), index=True, nullable=True)
+    source_chunk_id: Mapped[str] = mapped_column(ForeignKey("chunk.chunk_id", ondelete="CASCADE"), index=True)
+    reference_document_id: Mapped[str | None] = mapped_column(ForeignKey("document.document_id", ondelete="CASCADE"), index=True, nullable=True)
+    reference_note_id: Mapped[str | None] = mapped_column(ForeignKey("note.note_id", ondelete="CASCADE"), index=True, nullable=True)
     reference_type: Mapped[str] = mapped_column(String(16), default="document")
 
     chunk = relationship("Chunk", back_populates="references")
@@ -302,10 +302,10 @@ class Reference(Base):
 
 class Feedback(Base):
     __tablename__ = "feedback"
-    __table_args__ = {"schema": "public"}
+    
 
     feedback_id: Mapped[str] = mapped_column(String(36), primary_key=True, init=False, default=lambda: str(uuid4()))
-    source_chunk_id: Mapped[str] = mapped_column(ForeignKey("public.chunk.chunk_id", ondelete="CASCADE"), index=True)
+    source_chunk_id: Mapped[str] = mapped_column(ForeignKey("chunk.chunk_id", ondelete="CASCADE"), index=True)
     feedback: Mapped[str] = mapped_column(Text)
     model: Mapped[str] = mapped_column(Text)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.now(timezone.utc))
@@ -318,31 +318,31 @@ class Feedback(Base):
 user_to_group_table = Table(
     "user_to_group",
     Base.metadata,
-    Column("user_id", ForeignKey("public.user.user_id", ondelete="CASCADE"), primary_key=True),
-    Column("group_id", ForeignKey("public.group.group_id", ondelete="CASCADE"), primary_key=True),
+    Column("user_id", ForeignKey("user.user_id", ondelete="CASCADE"), primary_key=True),
+    Column("group_id", ForeignKey("group.group_id", ondelete="CASCADE"), primary_key=True),
 )
 
 
 admin_to_group_table = Table(
     "admin_to_group",
     Base.metadata,
-    Column("admin_id", ForeignKey("public.administrator.admin_id", ondelete="CASCADE"), primary_key=True),
-    Column("group_id", ForeignKey("public.group.group_id", ondelete="CASCADE"), primary_key=True),
+    Column("admin_id", ForeignKey("administrator.admin_id", ondelete="CASCADE"), primary_key=True),
+    Column("group_id", ForeignKey("group.group_id", ondelete="CASCADE"), primary_key=True),
 )
 
 
 document_to_group_table = Table(
     "document_to_group",
     Base.metadata,
-    Column("document_id", ForeignKey("public.document.document_id", ondelete="CASCADE"), primary_key=True),
-    Column("group_id", ForeignKey("public.group.group_id", ondelete="CASCADE"), primary_key=True),
+    Column("document_id", ForeignKey("document.document_id", ondelete="CASCADE"), primary_key=True),
+    Column("group_id", ForeignKey("group.group_id", ondelete="CASCADE"), primary_key=True),
 )
 
 note_to_group_table = Table(
     "note_to_group",
     Base.metadata,
-    Column("note_id", ForeignKey("public.note.note_id", ondelete="CASCADE"), primary_key=True),
-    Column("group_id", ForeignKey("public.group.group_id", ondelete="CASCADE"), primary_key=True),
+    Column("note_id", ForeignKey("note.note_id", ondelete="CASCADE"), primary_key=True),
+    Column("group_id", ForeignKey("group.group_id", ondelete="CASCADE"), primary_key=True),
 )
 
 
