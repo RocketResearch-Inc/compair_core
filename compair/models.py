@@ -73,6 +73,12 @@ class User(Base):
         passive_deletes=True,
     )
 
+    activities = relationship(
+        "Activity",
+        back_populates="user",
+        cascade="all, delete-orphan"
+    )
+
     def __init__(
         self,
         username: str,
@@ -132,6 +138,12 @@ class Group(BaseObject):
     admins = relationship("Administrator", secondary="admin_to_group", back_populates="groups")
     documents = relationship("Document", secondary="document_to_group", back_populates="groups")
     notes = relationship("Note", secondary="note_to_group", back_populates="groups")
+
+    activities = relationship(
+        "Activity",
+        back_populates="group",
+        cascade="all, delete-orphan"
+    )
 
     __mapper_args__ = {"primary_key": [group_id]}
 
@@ -302,7 +314,7 @@ class Reference(Base):
 
 class Feedback(Base):
     __tablename__ = "feedback"
-    
+
 
     feedback_id: Mapped[str] = mapped_column(String(36), primary_key=True, init=False, default=lambda: str(uuid4()))
     source_chunk_id: Mapped[str] = mapped_column(ForeignKey("chunk.chunk_id", ondelete="CASCADE"), index=True)
@@ -313,6 +325,22 @@ class Feedback(Base):
     is_hidden: Mapped[bool] = mapped_column(Boolean, default=False)
 
     chunk = relationship("Chunk", back_populates="feedbacks")
+
+
+class Activity(Base):
+    __tablename__ = "activity"
+
+    activity_id: Mapped[int] = mapped_column(Identity(), primary_key=True, init=False, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("user.user_id", ondelete="CASCADE"), nullable=False)
+    group_id: Mapped[str] = mapped_column(ForeignKey("group.group_id", ondelete="CASCADE"), nullable=False)
+    action: Mapped[str] = mapped_column(String(32))
+    object_id: Mapped[str] = mapped_column(String(36))
+    object_name: Mapped[str] = mapped_column(Text)
+    object_type: Mapped[str] = mapped_column(String(32))
+    timestamp: Mapped[datetime] = mapped_column(default=datetime.now(timezone.utc))
+
+    user = relationship("User", back_populates="activities", lazy="joined")
+    group = relationship("Group", back_populates="activities")
 
 
 user_to_group_table = Table(
