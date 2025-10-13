@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import importlib
 import logging
 import os
+import sys
 
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import sessionmaker
+
+from ..compair import embeddings, feedback, logger, main, models, tasks, utils
+from ..compair.default_groups import initialize_default_groups
 
 edition = os.getenv("COMPAIR_EDITION", "core").lower()
 
 _cloud_available = False
 if edition == "cloud":
     try:  # Import cloud overrides if the private package is installed
-        from compair_cloud import (
+        from ..compair_cloud import (
             bootstrap as cloud_bootstrap,
             celery_app as cloud_celery_app,
             default_groups as cloud_default_groups,
@@ -29,7 +34,7 @@ if edition == "cloud":
         _cloud_available = False
 
 if _cloud_available:
-    from compair_cloud.default_groups import initialize_default_groups  # type: ignore
+    from ..compair_cloud.default_groups import initialize_default_groups  # type: ignore
     embeddings = cloud_embeddings
     feedback = cloud_feedback
     logger = cloud_logger
@@ -43,8 +48,6 @@ else:
     from .default_groups import initialize_default_groups
     initialize_database_override = None
 
-
-logging.basicConfig(level=logging.INFO)
 
 
 def _handle_engine() -> Engine:
@@ -80,13 +83,6 @@ def initialize_database() -> None:
         initialize_database_override(engine)
 
 
-initialize_database()
-
-Session = sessionmaker(engine)
-embedder = embeddings.Embedder()
-reviewer = feedback.Reviewer()
-
-with Session() as session:
-    initialize_default_groups(session)
-
-__all__ = ["embeddings", "feedback", "main", "models", "utils", "Session"]
+__all__ = ["embeddings", "feedback", "main", "models", "utils"]
+sys.modules.setdefault(__name__ + ".server", importlib.import_module("server"))
+sys.modules.setdefault(__name__ + ".compair_email", importlib.import_module("compair_email"))

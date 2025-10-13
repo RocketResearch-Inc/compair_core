@@ -16,17 +16,17 @@ from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from sqlalchemy import distinct, func, select, or_
 from sqlalchemy.orm import joinedload, Session
 
-from server.deps import get_analytics, get_billing, get_ocr, get_settings_dependency, get_storage
-from server.providers.contracts import Analytics, BillingProvider, OCRProvider, StorageProvider
-from server.settings import Settings
+from .server.deps import get_analytics, get_billing, get_ocr, get_settings_dependency, get_storage
+from .server.providers.contracts import Analytics, BillingProvider, OCRProvider, StorageProvider
+from .server.settings import Settings
 
-import compair
-from compair import models, schema
-from compair.embeddings import create_embedding, Embedder
-from compair.logger import log_event 
-from compair.utils import chunk_text, generate_verification_token, log_activity
-from compair_email.email import emailer, EMAIL_USER
-from compair_email.templates import (
+from . import compair
+from .compair import models, schema
+from .compair.embeddings import create_embedding, Embedder
+from .compair.logger import log_event 
+from .compair.utils import chunk_text, generate_verification_token, log_activity
+from .compair_email.email import emailer, EMAIL_USER
+from .compair_email.templates import (
     ACCOUNT_VERIFY_TEMPLATE, 
     GROUP_INVITATION_TEMPLATE, 
     GROUP_JOIN_TEMPLATE, 
@@ -34,7 +34,7 @@ from compair_email.templates import (
     PASSWORD_RESET_TEMPLATE, 
     REFERRAL_CREDIT_TEMPLATE
 )
-from compair.tasks import process_document_task as process_document_celery, send_feature_announcement_task, send_deactivate_request_email, send_help_request_email
+from .compair.tasks import process_document_task as process_document_celery, send_feature_announcement_task, send_deactivate_request_email, send_help_request_email
 
 import redis
 

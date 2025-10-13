@@ -63,7 +63,7 @@ See `compair_core/server/settings.py` for the full settings surface.
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
-uvicorn compair.server.app:create_app --factory --reload
+uvicorn compair_core.server.app:create_app --factory --reload
 ```
 
 The API will be available at http://127.0.0.1:8000 and supports the Swagger UI at `/docs`.
