@@ -28,7 +28,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="Compair API", version=resolved_settings.version)
 
-    from api import router as legacy_router
+    from ..api import router as legacy_router
 
     app.include_router(legacy_router)
     app.include_router(capabilities_router)
