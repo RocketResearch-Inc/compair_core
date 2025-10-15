@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     premium_models: bool = False
 
     # Core/local storage defaults
-    local_upload_dir: str = "/data/uploads"
+    local_upload_dir: str = "~/.compair-core/data/uploads"
     local_upload_base_url: str = "/uploads"
 
     # Cloud storage (R2/S3-compatible)

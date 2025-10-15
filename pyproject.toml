@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "compair-core"
-version = "0.3.9"
+version = "0.3.10"
 description = "Open-source foundation of the Compair collaboration platform."
 readme = "README.md"
 license = { text = "MIT" }
@@ -26,6 +26,7 @@ dependencies = [
   "psutil>=5.9",
   "python-Levenshtein>=0.23",
   "redmail>=0.6",
+  "python-multipart>=0.0.20",
 ]
 
 [project.optional-dependencies]

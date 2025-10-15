@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
-from compair.models import Activity
+from .models import Activity
 
 
 def chunk_text(text: str) -> list[str]:

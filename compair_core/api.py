@@ -36,10 +36,13 @@ from .compair_email.templates import (
 )
 from .compair.tasks import process_document_task as process_document_celery, send_feature_announcement_task, send_deactivate_request_email, send_help_request_email
 
-import redis
+try:
+    import redis  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    redis = None
 
 redis_url = os.environ.get("REDIS_URL")
-redis_client = redis.Redis.from_url(redis_url)
+redis_client = redis.Redis.from_url(redis_url) if (redis and redis_url) else None
 #from compair.main import process_document
 
 router = APIRouter()
@@ -80,6 +83,7 @@ HAS_ACTIVITY = hasattr(models, "Activity")
 HAS_REFERRALS = hasattr(models.User, "referral_code")
 HAS_BILLING = hasattr(models.User, "stripe_customer_id")
 HAS_TRIALS = hasattr(models.User, "trial_expiration_date")
+HAS_REDIS = redis_client is not None
 
 
 def require_feature(flag: bool, feature: str) -> None:
@@ -3228,11 +3232,12 @@ def generate_download_token(
         else:
             raise HTTPException(status_code=403, detail="Not authorized to download this file.")
 
+    if not HAS_REDIS:
+        raise HTTPException(status_code=501, detail="Secure download links require Redis, which is unavailable in the core edition.")
+
     token = secrets.token_urlsafe(32)
     key = f"download_token:{token}"
     redis_client.setex(key, 300, document_id)
-    print('Setting redis kv')
-    print(key, document_id)
     return {"download_url": f"/documents/download/{token}"}
 
 
@@ -3241,10 +3246,12 @@ def download_document_with_token(
     token: str,
     storage: StorageProvider = Depends(get_storage),
 ):
+    if not HAS_REDIS:
+        raise HTTPException(status_code=501, detail="Secure download links require Redis, which is unavailable in the core edition.")
+
     key = f"download_token:{token}"
-    print(f'Retrieving redis kv with key {key}')
-    document_id = redis_client.get(key).decode('utf-8') if redis_client.get(key) else None
-    print(f'Value {document_id}')
+    value = redis_client.get(key) if redis_client else None
+    document_id = value.decode('utf-8') if value else None
     if not document_id:
         raise HTTPException(status_code=403, detail="Invalid or expired token")
     redis_client.delete(key)
