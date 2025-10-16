@@ -54,6 +54,8 @@ Key environment variables for the core edition:
 - `COMPAIR_SQLITE_DIR` / `COMPAIR_SQLITE_NAME` – override the default local SQLite path (falls back to `./compair_data` if `/data` is not writable).
 - `COMPAIR_LOCAL_MODEL_URL` – endpoint for your local embeddings/feedback service (defaults to `http://local-model:9000`).
 - `COMPAIR_EMAIL_BACKEND` – the core mailer logs emails to stdout; cloud overrides this with transactional delivery.
+- `COMPAIR_REQUIRE_AUTHENTICATION` (`true`) – set to `false` to run the API in single-user mode without login or account management. When disabled, Compair auto-provisions a local user, group, and long-lived session token so you can upload documents immediately.
+- `COMPAIR_SINGLE_USER_USERNAME` / `COMPAIR_SINGLE_USER_NAME` – override the email-style username and display name that are used for the auto-provisioned local user in single-user mode.
 
 See `compair_core/server/settings.py` for the full settings surface.
 

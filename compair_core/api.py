@@ -59,6 +59,112 @@ GA4_MEASUREMENT_ID = os.getenv("GA4_MEASUREMENT_ID")
 GA4_API_SECRET = os.getenv("GA4_API_SECRET")
 
 IS_CLOUD = os.getenv("COMPAIR_EDITION", "core").lower() == "cloud"
+SINGLE_USER_SESSION_TTL = timedelta(days=365)
+
+
+def _ensure_single_user(session: Session, settings: Settings) -> models.User:
+    """Create or fetch the singleton user used when authentication is disabled."""
+    changed = False
+    user = (
+        session.query(models.User)
+        .options(joinedload(models.User.groups))
+        .filter(models.User.username == settings.single_user_username)
+        .first()
+    )
+    if user is None:
+        now = datetime.now(timezone.utc)
+        user = models.User(
+            username=settings.single_user_username,
+            name=settings.single_user_name,
+            datetime_registered=now,
+            verification_token=None,
+            token_expiration=None,
+        )
+        user.set_password(secrets.token_urlsafe(16))
+        user.status = "active"
+        user.status_change_date = now
+        session.add(user)
+        session.flush()
+        admin = models.Administrator(user_id=user.user_id)
+        group = models.Group(
+            name=user.username,
+            datetime_created=now,
+            group_image=None,
+            category="Private",
+            description=f"Private workspace for {settings.single_user_name}",
+            visibility="private",
+        )
+        group.admins.append(admin)
+        user.groups = [group]
+        session.add_all([group, admin])
+        changed = True
+    else:
+        now = datetime.now(timezone.utc)
+        if user.status != "active":
+            user.status = "active"
+            user.status_change_date = now
+            changed = True
+        group = next((g for g in user.groups if g.name == user.username), None)
+        if group is None:
+            group = session.query(models.Group).filter(models.Group.name == user.username).first()
+            if group is None:
+                group = models.Group(
+                    name=user.username,
+                    datetime_created=now,
+                    group_image=None,
+                    category="Private",
+                    description=f"Private workspace for {user.name}",
+                    visibility="private",
+                )
+                session.add(group)
+                changed = True
+            if group not in user.groups:
+                user.groups.append(group)
+                changed = True
+        admin = session.query(models.Administrator).filter(models.Administrator.user_id == user.user_id).first()
+        if admin is None:
+            admin = models.Administrator(user_id=user.user_id)
+            session.add(admin)
+            changed = True
+        if admin not in group.admins:
+            group.admins.append(admin)
+            changed = True
+
+    if changed:
+        session.commit()
+        user = (
+            session.query(models.User)
+            .options(joinedload(models.User.groups))
+            .filter(models.User.username == settings.single_user_username)
+            .first()
+        )
+    if user is None:
+        raise RuntimeError("Failed to initialize the local Compair user.")
+    user.groups  # ensure relationship is loaded before detaching
+    return user
+
+
+def _ensure_single_user_session(session: Session, user: models.User) -> models.Session:
+    """Return a long-lived session token for the singleton user."""
+    now = datetime.now(timezone.utc)
+    existing = (
+        session.query(models.Session)
+        .filter(models.Session.user_id == user.user_id, models.Session.datetime_valid_until >= now)
+        .order_by(models.Session.datetime_valid_until.desc())
+        .first()
+    )
+    if existing:
+        return existing
+    token = secrets.token_urlsafe()
+    user_session = models.Session(
+        id=token,
+        user_id=user.user_id,
+        datetime_created=now,
+        datetime_valid_until=now + SINGLE_USER_SESSION_TTL,
+    )
+    session.add(user_session)
+    session.commit()
+    return user_session
 
 
 def require_cloud(feature: str) -> None:
@@ -90,7 +196,13 @@ def require_feature(flag: bool, feature: str) -> None:
     if not flag:
         raise HTTPException(status_code=501, detail=f"{feature} is only available in the Compair Cloud edition.")
 
-def get_current_user(auth_token: str = Header(...)):
+def get_current_user(auth_token: str | None = Header(None)):
+    settings = get_settings_dependency()
+    if not settings.require_authentication:
+        with compair.Session() as session:
+            return _ensure_single_user(session, settings)
+    if not auth_token:
+        raise HTTPException(status_code=401, detail="Missing session token")
     with compair.Session() as session:
         user_session = session.query(models.Session).filter(models.Session.id == auth_token).first()
         if not user_session:
@@ -154,9 +266,20 @@ log_service_resource_metrics(service_name="backend")  # or "frontend"
 
 @router.post("/login")
 def login(request: schema.LoginRequest) -> dict:
+    settings = get_settings_dependency()
     with compair.Session() as session:
+        if not settings.require_authentication:
+            user = _ensure_single_user(session, settings)
+            user_session = _ensure_single_user_session(session, user)
+            return {
+                "user_id": user.user_id,
+                "username": user.username,
+                "name": user.name,
+                "status": user.status,
+                "role": user.role,
+                "auth_token": user_session.id,
+            }
         user = session.query(models.User).filter(models.User.username == request.username).first()
-        print("PW yo: {request.password}")
         if not user or not user.check_password(request.password):
             raise HTTPException(status_code=401, detail="Invalid credentials")
         if user.status == 'inactive':
@@ -530,8 +653,15 @@ def create_user(
 
 
 @router.get("/load_session")
-def load_session(auth_token: str) -> schema.Session | None:
+def load_session(auth_token: str | None = None) -> schema.Session | None:
+    settings = get_settings_dependency()
+    if not settings.require_authentication:
+        with compair.Session() as session:
+            user = _ensure_single_user(session, settings)
+            return _ensure_single_user_session(session, user)
     with compair.Session() as session:
+        if not auth_token:
+            raise HTTPException(status_code=400, detail="auth_token is required when authentication is enabled.")
         user_session = session.query(models.Session).filter(models.Session.id == auth_token).first()
         if not user_session:
             raise HTTPException(status_code=404, detail="Session not found")
@@ -596,6 +726,9 @@ def update_session_duration(
 def delete_user(
     current_user: models.User = Depends(get_current_user)
 ):
+    settings = get_settings_dependency()
+    if not settings.require_authentication:
+        raise HTTPException(status_code=403, detail="Deleting the local user is not supported when authentication is disabled.")
     with compair.Session() as session:
         current_user.delete()
         session.commit()
@@ -1711,6 +1844,9 @@ def load_references(
 
 @router.get("/verify-email")
 def verify_email(token: str):
+    settings = get_settings_dependency()
+    if not settings.require_authentication:
+        raise HTTPException(status_code=403, detail="Email verification is disabled when authentication is disabled.")
     with compair.Session() as session:
         print(token)
         user = session.query(models.User).filter(models.User.verification_token == token).first()
@@ -1769,6 +1905,9 @@ def sign_up(
     request: schema.SignUpRequest,
     analytics: Analytics = Depends(get_analytics),
 ) -> dict:
+    settings = get_settings_dependency()
+    if not settings.require_authentication:
+        raise HTTPException(status_code=403, detail="Sign-up is disabled when authentication is disabled.")
     print('1')
     if not is_valid_email(request.username):
         raise HTTPException(status_code=400, detail="Invalid email address")
@@ -1802,6 +1941,9 @@ def sign_up(
 
 @router.post("/forgot-password")
 def forgot_password(request: schema.ForgotPasswordRequest) -> dict:
+    settings = get_settings_dependency()
+    if not settings.require_authentication:
+        raise HTTPException(status_code=403, detail="Password resets are disabled when authentication is disabled.")
     print('1')
     with compair.Session() as session:
         print('2')
@@ -1834,6 +1976,9 @@ def forgot_password(request: schema.ForgotPasswordRequest) -> dict:
 
 @router.post("/reset-password")
 def reset_password(request: schema.ResetPasswordRequest) -> dict:
+    settings = get_settings_dependency()
+    if not settings.require_authentication:
+        raise HTTPException(status_code=403, detail="Password resets are disabled when authentication is disabled.")
     with compair.Session() as session:
         print('1')
         print(request.token)

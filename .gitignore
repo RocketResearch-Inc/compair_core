@@ -1,0 +1,8 @@
+compair_core/__pycache__/*
+compair_core/compair/__pycache__/*
+compair_core/compair_email/__pycache__/*
+compair_core/server/__pycache__/*
+compair_core/server/local_model/__pycache__/*
+compair_core/server/providers/__pycache__/*
+compair_core/server/routers/__pycache__/*
+`

@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     billing_enabled: bool = False
     integrations_enabled: bool = False
     premium_models: bool = False
+    require_authentication: bool = False
+    single_user_username: str = "compair-local@example.com"
+    single_user_name: str = "Compair Local User"
 
     # Core/local storage defaults
     local_upload_dir: str = "~/.compair-core/data/uploads"

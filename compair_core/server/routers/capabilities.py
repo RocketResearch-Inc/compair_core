@@ -11,10 +11,13 @@ router = APIRouter(tags=["meta"])
 @router.get("/capabilities")
 def capabilities(settings: Settings = Depends(get_settings)) -> dict[str, object]:
     edition = settings.edition.lower()
+    require_auth = settings.require_authentication
     return {
         "auth": {
             "device_flow": edition == "cloud",
-            "password_login": True,
+            "password_login": require_auth,
+            "required": require_auth,
+            "single_user": not require_auth,
         },
         "inputs": {
             "text": True,
