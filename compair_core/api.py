@@ -13,6 +13,7 @@ import psutil
 from celery.result import AsyncResult
 from fastapi import APIRouter, Body, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.routing import APIRoute
 from sqlalchemy import distinct, func, select, or_
 from sqlalchemy.orm import joinedload, Session
 
@@ -46,6 +47,7 @@ redis_client = redis.Redis.from_url(redis_url) if (redis and redis_url) else Non
 #from compair.main import process_document
 
 router = APIRouter()
+core_router = APIRouter()
 WEB_URL = os.environ.get("WEB_URL")
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")
 
@@ -3495,6 +3497,34 @@ def submit_deactivate_request(
             raise HTTPException(status_code=501, detail="Deactivate request emails require the Compair Cloud edition.")
         send_deactivate_request_email.delay(deactivate_request.request_id)
         return {"message": f"We’ve received your request and will delete your account and data shortly. If you change your mind, reach out within 24 hours at {EMAIL_USER}."}
+
+
+CORE_PATHS: set[str] = {
+    "/login",
+    "/load_session",
+    "/load_groups",
+    "/load_group",
+    "/create_group",
+    "/join_group",
+    "/load_group_users",
+    "/delete_group",
+    "/load_documents",
+    "/load_document",
+    "/load_document_by_id",
+    "/create_doc",
+    "/process_doc",
+    "/status/{task_id}",
+    "/upload/ocr-file",
+    "/ocr-file-result/{task_id}",
+    "/load_chunks",
+    "/load_references",
+    "/load_feedback",
+    "/documents/{document_id}/feedback",
+}
+
+for route in router.routes:
+    if isinstance(route, APIRoute) and route.path in CORE_PATHS:
+        core_router.routes.append(route)
 
 
 def create_fastapi_app():

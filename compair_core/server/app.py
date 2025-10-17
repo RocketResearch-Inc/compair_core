@@ -28,9 +28,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="Compair API", version=resolved_settings.version)
 
-    from ..api import router as legacy_router
+    from ..api import core_router, router as legacy_router
 
-    app.include_router(legacy_router)
+    if edition == "cloud":
+        app.include_router(legacy_router)
+    else:
+        if resolved_settings.include_legacy_routes:
+            app.include_router(legacy_router)
+        else:
+            app.include_router(core_router)
     app.include_router(capabilities_router)
 
     # Share the resolved settings with request handlers

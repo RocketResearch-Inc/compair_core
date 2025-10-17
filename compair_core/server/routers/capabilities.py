@@ -38,4 +38,5 @@ def capabilities(settings: Settings = Depends(get_settings)) -> dict[str, object
         },
         "server": "Compair Cloud" if edition == "cloud" else "Compair Core",
         "version": settings.version,
+        "legacy_routes": settings.include_legacy_routes,
     }

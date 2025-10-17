@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     require_authentication: bool = False
     single_user_username: str = "compair-local@example.com"
     single_user_name: str = "Compair Local User"
+    include_legacy_routes: bool = False
 
     # Core/local storage defaults
     local_upload_dir: str = "~/.compair-core/data/uploads"
