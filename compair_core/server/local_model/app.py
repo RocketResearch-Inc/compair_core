@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from typing import List
 
 from fastapi import FastAPI
@@ -9,7 +10,17 @@ from pydantic import BaseModel
 
 app = FastAPI(title="Compair Local Model", version="0.1.0")
 
-EMBED_DIMENSION = 384
+_DEFAULT_DIM = 384
+_DIM_ENV = (
+    os.getenv("COMPAIR_EMBEDDING_DIM")
+    or os.getenv("COMPAIR_EMBEDDING_DIMENSION")
+    or os.getenv("COMPAIR_LOCAL_EMBED_DIM")
+    or str(_DEFAULT_DIM)
+)
+try:
+    EMBED_DIMENSION = int(_DIM_ENV)
+except ValueError:  # pragma: no cover - invalid configuration
+    EMBED_DIMENSION = _DEFAULT_DIM
 
 
 def _hash_embedding(text: str, dimension: int = EMBED_DIMENSION) -> List[float]:

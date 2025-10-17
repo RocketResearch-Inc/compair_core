@@ -12,7 +12,17 @@ from sqlalchemy.orm import Session as SASession
 
 from .embeddings import create_embedding, Embedder
 from .feedback import get_feedback, Reviewer
-from .models import Chunk, Document, Feedback, Group, Note, Reference, User
+from .models import (
+    Chunk,
+    Document,
+    Feedback,
+    Group,
+    Note,
+    Reference,
+    User,
+    VECTOR_BACKEND,
+    cosine_similarity,
+)
 from .utils import chunk_text, log_activity
 
 
@@ -159,22 +169,41 @@ def process_text(
         Chunk.note_id == note_id,
     ).first()
 
+    references: list[Chunk] = []
     if generate_feedback and existing_chunk:
         doc_group_ids = [g.group_id for g in doc.groups]
-        references = (
-            session.query(Chunk)
-            .join(Chunk.document)
-            .join(Document.groups)
-            .filter(
-                Document.is_published.is_(True),
-                Document.document_id != doc.document_id,
-                Chunk.chunk_type == "document",
-                Group.group_id.in_(doc_group_ids),
+        target_embedding = existing_chunk.embedding
+
+        if target_embedding is not None:
+            base_query = (
+                session.query(Chunk)
+                .join(Chunk.document)
+                .join(Document.groups)
+                .filter(
+                    Document.is_published.is_(True),
+                    Document.document_id != doc.document_id,
+                    Chunk.chunk_type == "document",
+                    Group.group_id.in_(doc_group_ids),
+                )
             )
-            .order_by(Chunk.embedding.cosine_distance(existing_chunk.embedding))
-            .limit(3)
-            .all()
-        )
+
+            if VECTOR_BACKEND == "pgvector":
+                references = (
+                    base_query.order_by(
+                        Chunk.embedding.cosine_distance(existing_chunk.embedding)
+                    )
+                    .limit(3)
+                    .all()
+                )
+            else:
+                candidates = base_query.all()
+                scored: list[tuple[float, Chunk]] = []
+                for candidate in candidates:
+                    score = cosine_similarity(candidate.embedding, target_embedding)
+                    if score is not None:
+                        scored.append((score, candidate))
+                scored.sort(key=lambda item: item[0], reverse=True)
+                references = [chunk for _, chunk in scored[:3]]
 
         sql_references: list[Reference] = []
         for ref_chunk in references:

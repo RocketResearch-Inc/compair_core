@@ -5,9 +5,15 @@ import hashlib
 import os
 import secrets
 from datetime import datetime, timezone
+from math import sqrt
+from typing import Sequence
 from uuid import uuid4
 
-from pgvector.sqlalchemy import Vector
+try:  # Optional: only required when using pgvector backend
+    from pgvector.sqlalchemy import Vector
+except ImportError:  # pragma: no cover - optional dependency in core
+    Vector = None  # type: ignore[assignment]
+
 from sqlalchemy import (
     Boolean,
     Column,
@@ -15,6 +21,7 @@ from sqlalchemy import (
     ForeignKey,
     Identity,
     Integer,
+    JSON,
     String,
     Table,
     Text,
@@ -26,6 +33,65 @@ from sqlalchemy.orm import (
     mapped_column,
     relationship,
 )
+
+_EDITION = os.getenv("COMPAIR_EDITION", "core").lower()
+_DEFAULT_DIM = 1536 if _EDITION == "cloud" else 384
+_DIM_ENV = (
+    os.getenv("COMPAIR_EMBEDDING_DIM")
+    or os.getenv("COMPAIR_EMBEDDING_DIMENSION")
+    or os.getenv("COMPAIR_LOCAL_EMBED_DIM")
+    or str(_DEFAULT_DIM)
+)
+
+try:
+    EMBEDDING_DIMENSION = int(_DIM_ENV)
+except ValueError:  # pragma: no cover - invalid configuration
+    EMBEDDING_DIMENSION = _DEFAULT_DIM
+
+
+def _detect_vector_backend() -> str:
+    explicit = os.getenv("COMPAIR_VECTOR_BACKEND")
+    if explicit:
+        return explicit.lower()
+
+    db = os.getenv("DB")
+    db_user = os.getenv("DB_USER")
+    db_passw = os.getenv("DB_PASSW")
+    db_url = os.getenv("DB_URL")
+    database_url = os.getenv("DATABASE_URL", "")
+
+    if all([db, db_user, db_passw, db_url]):
+        return "pgvector"
+    if database_url.lower().startswith(("postgres://", "postgresql://")):
+        return "pgvector"
+    return "json"
+
+
+VECTOR_BACKEND = _detect_vector_backend()
+
+
+def _embedding_column():
+    if VECTOR_BACKEND == "pgvector":
+        if Vector is None:
+            raise RuntimeError(
+                "pgvector is required when COMPAIR_VECTOR_BACKEND is set to 'pgvector'."
+            )
+        return mapped_column(Vector(EMBEDDING_DIMENSION), nullable=True)
+    # Store embeddings as JSON arrays (works across SQLite/Postgres without pgvector)
+    return mapped_column(JSON, nullable=True)
+
+
+def cosine_similarity(vec1: Sequence[float] | None, vec2: Sequence[float] | None) -> float | None:
+    if not vec1 or not vec2:
+        return None
+    if len(vec1) != len(vec2):
+        return None
+    dot = sum(a * b for a, b in zip(vec1, vec2))
+    norm1 = sqrt(sum(a * a for a in vec1))
+    norm2 = sqrt(sum(b * b for b in vec2))
+    if norm1 == 0 or norm2 == 0:
+        return None
+    return dot / (norm1 * norm2)
 
 
 class Base(DeclarativeBase, MappedAsDataclass):
@@ -216,7 +282,7 @@ class Document(BaseObject):
     file_key: Mapped[str | None] = mapped_column(String, nullable=True, default=None)
     image_key: Mapped[str | None] = mapped_column(String, nullable=True, default=None)
     is_published: Mapped[bool] = mapped_column(Boolean, default=False)
-    embedding = mapped_column(Vector(1536))
+    embedding: Mapped[list[float] | None] = _embedding_column()
 
     user = relationship("User", back_populates="documents")
     groups = relationship("Group", secondary="document_to_group", back_populates="documents")
@@ -250,7 +316,7 @@ class Note(Base):
     group_id: Mapped[str | None] = mapped_column(ForeignKey("group.group_id", ondelete="CASCADE"), index=True, nullable=True)
     content: Mapped[str] = mapped_column(Text)
     datetime_created: Mapped[datetime] = mapped_column(default=datetime.now(timezone.utc))
-    embedding = mapped_column(Vector(1536))
+    embedding: Mapped[list[float] | None] = _embedding_column()
 
     document = relationship("Document", back_populates="notes")
     author = relationship("User", back_populates="notes")
@@ -279,7 +345,7 @@ class Chunk(Base):
     document_id: Mapped[str | None] = mapped_column(ForeignKey("document.document_id", ondelete="CASCADE"), index=True, nullable=True)
     note_id: Mapped[str | None] = mapped_column(ForeignKey("note.note_id", ondelete="CASCADE"), index=True, nullable=True)
     chunk_type: Mapped[str] = mapped_column(String(16), default="document")
-    embedding = mapped_column(Vector(1536))
+    embedding: Mapped[list[float] | None] = _embedding_column()
 
     document = relationship("Document", back_populates="chunks")
     note = relationship("Note", back_populates="chunks")

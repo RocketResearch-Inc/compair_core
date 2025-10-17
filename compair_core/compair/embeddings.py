@@ -23,7 +23,17 @@ class Embedder:
 
         if self._cloud_impl is None:
             self.model = os.getenv("COMPAIR_LOCAL_EMBED_MODEL", "hash-embedding")
-            self.dimension = int(os.getenv("COMPAIR_LOCAL_EMBED_DIM", "384"))
+            default_dim = 1536 if self.edition == "cloud" else 384
+            dim_env = (
+                os.getenv("COMPAIR_EMBEDDING_DIM")
+                or os.getenv("COMPAIR_EMBEDDING_DIMENSION")
+                or os.getenv("COMPAIR_LOCAL_EMBED_DIM")
+                or str(default_dim)
+            )
+            try:
+                self.dimension = int(dim_env)
+            except ValueError:  # pragma: no cover - invalid configuration
+                self.dimension = default_dim
             base_url = os.getenv("COMPAIR_LOCAL_MODEL_URL", "http://local-model:9000")
             route = os.getenv("COMPAIR_LOCAL_EMBED_ROUTE", "/embed")
             self.endpoint = f"{base_url.rstrip('/')}{route}"
