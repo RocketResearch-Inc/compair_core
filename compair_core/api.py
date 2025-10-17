@@ -1403,21 +1403,24 @@ def create_doc(
             datetime_modified=datetime.now(timezone.utc)
         )
         print('About to assign groups!')
-        print(groups.split(','))
-        if groups is not None:
-            group_ids = groups.split(',')
-            q = select(models.Group).filter(
-                models.Group.group_id.in_(group_ids)
-            )
-            groups = session.execute(q).fetchall()[0]
-            for group in groups:
-                document.groups.append(group)
+        target_group_ids = []
+        if groups:
+            target_group_ids = [gid.strip() for gid in groups.split(',') if gid.strip()]
+
+        if target_group_ids:
+            q = select(models.Group).filter(models.Group.group_id.in_(target_group_ids))
+            resolved_groups = session.execute(q).scalars().all()
+            if not resolved_groups:
+                raise HTTPException(status_code=404, detail="No matching groups found for provided IDs.")
+            document.groups = resolved_groups
         else:
-            q = select(models.Group).filter(
-                models.Group.name == current_user.username
-            )
-            group = session.execute(q).fetchone()[0]
-            document.groups = [group]
+            q = select(models.Group).filter(models.Group.name == current_user.username)
+            default_group = session.execute(q).scalars().first()
+            if default_group is None:
+                raise HTTPException(status_code=404, detail="Default group not found for user.")
+            document.groups = [default_group]
+
+        primary_group = document.groups[0]
 
         print(f'doc check!!! {document.content}')
         session.add(document)
@@ -1435,7 +1438,7 @@ def create_doc(
         log_activity(
             session=session, 
             user_id=document.author_id, 
-            group_id=group.group_id,
+            group_id=primary_group.group_id,
             action="create", 
             object_id=document.document_id, 
             object_name=document.title,
