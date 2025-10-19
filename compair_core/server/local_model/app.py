@@ -46,13 +46,19 @@ class EmbedResponse(BaseModel):
 
 
 class GenerateRequest(BaseModel):
+    # Legacy format used by the CLI shim
     system: str | None = None
-    prompt: str
+    prompt: str | None = None
     verbosity: str | None = None
+
+    # Core API payload (document + references)
+    document: str | None = None
+    references: List[str] | None = None
+    length_instruction: str | None = None
 
 
 class GenerateResponse(BaseModel):
-    text: str
+    feedback: str
 
 
 @app.post("/embed", response_model=EmbedResponse)
@@ -62,12 +68,20 @@ def embed(request: EmbedRequest) -> EmbedResponse:
 
 @app.post("/generate", response_model=GenerateResponse)
 def generate(request: GenerateRequest) -> GenerateResponse:
-    prompt = request.prompt.strip()
-    if not prompt:
-        return GenerateResponse(text="NONE")
+    # Determine the main text input (document or prompt)
+    text_input = request.document or request.prompt or ""
+    text_input = text_input.strip()
 
-    first_sentence = prompt.split("\n", 1)[0][:200]
-    verbosity = request.verbosity or "default"
-    return GenerateResponse(
-        text=f"[local-{verbosity}] Key takeaway: {first_sentence}"
-    )
+    if not text_input:
+        return GenerateResponse(feedback="NONE")
+
+    first_sentence = text_input.split("\n", 1)[0][:200]
+    verbosity = request.length_instruction or request.verbosity or "brief response"
+    ref_snippet = ""
+    if request.references:
+        top_ref = (request.references[0] or "").strip()
+        if top_ref:
+            ref_snippet = f" Reference: {top_ref[:160]}"
+
+    feedback = f"[local-feedback] {verbosity}: {first_sentence}{ref_snippet}".strip()
+    return GenerateResponse(feedback=feedback or "NONE")

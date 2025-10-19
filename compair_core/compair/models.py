@@ -76,9 +76,13 @@ def _embedding_column():
             raise RuntimeError(
                 "pgvector is required when COMPAIR_VECTOR_BACKEND is set to 'pgvector'."
             )
-        return mapped_column(Vector(EMBEDDING_DIMENSION), nullable=True)
+        return mapped_column(
+            Vector(EMBEDDING_DIMENSION),
+            nullable=True,
+            default=None,
+        )
     # Store embeddings as JSON arrays (works across SQLite/Postgres without pgvector)
-    return mapped_column(JSON, nullable=True)
+    return mapped_column(JSON, nullable=True, default=None)
 
 
 def cosine_similarity(vec1: Sequence[float] | None, vec2: Sequence[float] | None) -> float | None:
@@ -279,10 +283,10 @@ class Document(BaseObject):
     doc_type: Mapped[str]
     datetime_created: Mapped[datetime]
     datetime_modified: Mapped[datetime]
+    embedding: Mapped[list[float] | None] = _embedding_column()
     file_key: Mapped[str | None] = mapped_column(String, nullable=True, default=None)
     image_key: Mapped[str | None] = mapped_column(String, nullable=True, default=None)
     is_published: Mapped[bool] = mapped_column(Boolean, default=False)
-    embedding: Mapped[list[float] | None] = _embedding_column()
 
     user = relationship("User", back_populates="documents")
     groups = relationship("Group", secondary="document_to_group", back_populates="documents")
@@ -315,8 +319,8 @@ class Note(Base):
     author_id: Mapped[str] = mapped_column(ForeignKey("user.user_id", ondelete="CASCADE"), index=True)
     group_id: Mapped[str | None] = mapped_column(ForeignKey("group.group_id", ondelete="CASCADE"), index=True, nullable=True)
     content: Mapped[str] = mapped_column(Text)
-    datetime_created: Mapped[datetime] = mapped_column(default=datetime.now(timezone.utc))
     embedding: Mapped[list[float] | None] = _embedding_column()
+    datetime_created: Mapped[datetime] = mapped_column(default=datetime.now(timezone.utc))
 
     document = relationship("Document", back_populates="notes")
     author = relationship("User", back_populates="notes")
