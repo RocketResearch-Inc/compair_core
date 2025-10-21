@@ -2370,6 +2370,8 @@ def get_activity_feed(
 ):
     """Retrieve recent activities for a user's groups."""
     require_feature(HAS_ACTIVITY, "Activity feed")
+    if not IS_CLOUD:
+        raise HTTPException(status_code=501, detail="Activity feed is only available in the Compair Cloud edition.")
     with compair.Session() as session:
         # Get user's groups
         
@@ -3514,7 +3516,11 @@ CORE_PATHS: set[str] = {
     "/load_documents",
     "/load_document",
     "/load_document_by_id",
+    "/load_user_files",
     "/create_doc",
+    "/update_doc",
+    "/delete_doc",
+    "/delete_docs",
     "/process_doc",
     "/status/{task_id}",
     "/upload/ocr-file",
@@ -3523,6 +3529,7 @@ CORE_PATHS: set[str] = {
     "/load_references",
     "/load_feedback",
     "/documents/{document_id}/feedback",
+    "/get_activity_feed",
 }
 
 for route in router.routes:

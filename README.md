@@ -51,7 +51,8 @@ Container definitions and build pipelines live outside this public package:
 Key environment variables for the core edition:
 
 - `COMPAIR_EDITION` (`core`) – corresponds to this core local implementation.
-- `COMPAIR_SQLITE_DIR` / `COMPAIR_SQLITE_NAME` – override the default local SQLite path (falls back to `./compair_data` if `/data` is not writable).
+- `COMPAIR_DATABASE_URL` – optional explicit SQLAlchemy URL (e.g. `postgresql+psycopg2://user:pass@host/db`). When omitted, Compair falls back to a local SQLite file.
+- `COMPAIR_DB_DIR` / `COMPAIR_DB_NAME` – directory and filename for the bundled SQLite database (default: `~/.compair-core/data/compair.db`). Legacy `COMPAIR_SQLITE_*` variables remain supported.
 - `COMPAIR_LOCAL_MODEL_URL` – endpoint for your local embeddings/feedback service (defaults to `http://local-model:9000`).
 - `COMPAIR_EMAIL_BACKEND` – the core mailer logs emails to stdout; cloud overrides this with transactional delivery.
 - `COMPAIR_REQUIRE_AUTHENTICATION` (`true`) – set to `false` to run the API in single-user mode without login or account management. When disabled, Compair auto-provisions a local user, group, and long-lived session token so you can upload documents immediately.
@@ -59,8 +60,10 @@ Key environment variables for the core edition:
 - `COMPAIR_INCLUDE_LEGACY_ROUTES` (`false`) – opt-in to the full legacy API surface (used by the hosted product) when running the core edition. Leave unset to expose only the streamlined single-user endpoints in Swagger.
 - `COMPAIR_EMBEDDING_DIM` – force the embedding vector size stored in the database (defaults to 384 for core, 1536 for cloud). Keep this in sync with whichever embedding model you configure.
 - `COMPAIR_VECTOR_BACKEND` (`auto`) – set to `pgvector` when running against PostgreSQL with the pgvector extension, or `json` to store embeddings as JSON (the default for SQLite deployments).
-- `COMPAIR_GENERATION_PROVIDER` (`local`) – choose how feedback is produced. Options: `local` (call the bundled FastAPI service), `openai` (use ChatGPT-compatible APIs with an API key), or `fallback` (skip generation and surface similar references only).
+- `COMPAIR_GENERATION_PROVIDER` (`local`) – choose how feedback is produced. Options: `local` (call the bundled FastAPI service), `openai` (use ChatGPT-compatible APIs with an API key), `http` (POST the request to a custom endpoint), or `fallback` (skip generation and surface similar references only).
 - `COMPAIR_OPENAI_API_KEY` / `COMPAIR_OPENAI_MODEL` – when using the OpenAI provider, supply your API key and optional model name (defaults to `gpt-4o-mini`). The fallback kicks in automatically if the key or SDK is unavailable.
+- `COMPAIR_GENERATION_ENDPOINT` – HTTP endpoint invoked when `COMPAIR_GENERATION_PROVIDER=http`; the service receives a JSON payload (`document`, `references`, `length_instruction`) and should return `{"feedback": ...}`.
+- `COMPAIR_OCR_ENDPOINT` – endpoint the backend calls for OCR uploads (defaults to the bundled Tesseract wrapper at `http://local-ocr:9001/ocr-file`). Provide your own service by overriding this URL.
 
 See `compair_core/server/settings.py` for the full settings surface.
 

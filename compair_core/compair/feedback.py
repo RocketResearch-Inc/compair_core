@@ -35,7 +35,8 @@ class Reviewer:
 
         self._cloud_impl = None
         self._openai_client = None
-        self.openai_model = os.getenv("COMPAIR_OPENAI_MODEL", "gpt-4o-mini")
+        self.openai_model = os.getenv("COMPAIR_OPENAI_MODEL", "gpt-5-nano")
+        self.custom_endpoint = os.getenv("COMPAIR_GENERATION_ENDPOINT")
 
         if self.edition == "cloud" and CloudReviewer is not None:
             self._cloud_impl = CloudReviewer()
@@ -55,6 +56,9 @@ class Reviewer:
                 if self._openai_client is None and not hasattr(openai, "ChatCompletion"):
                     log_event("openai_feedback_unavailable", reason="openai_library_missing")
                     self.provider = "fallback"
+            if self.provider == "http" and not self.custom_endpoint:
+                log_event("custom_feedback_unavailable", reason="missing_endpoint")
+                self.provider = "fallback"
             if self.provider == "local":
                 self.model = os.getenv("COMPAIR_LOCAL_GENERATION_MODEL", "local-feedback")
                 base_url = os.getenv("COMPAIR_LOCAL_MODEL_URL", "http://local-model:9000")
@@ -63,6 +67,9 @@ class Reviewer:
             else:
                 self.model = "external"
                 self.endpoint = None
+            if self.provider not in {"local", "openai", "http", "fallback"}:
+                log_event("feedback_provider_unknown", provider=self.provider)
+                self.provider = "fallback"
 
     @property
     def is_cloud(self) -> bool:
@@ -181,6 +188,36 @@ def _local_feedback(
     return None
 
 
+def _http_feedback(
+    reviewer: Reviewer,
+    text: str,
+    references: list[Any],
+    user: User,
+) -> str | None:
+    if not reviewer.custom_endpoint:
+        return None
+    payload = {
+        "document": text,
+        "references": [getattr(ref, "content", "") for ref in references],
+        "length_instruction": reviewer.length_map.get(
+            user.preferred_feedback_length,
+            "1–2 short sentences",
+        ),
+    }
+    try:
+        response = requests.post(reviewer.custom_endpoint, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        feedback = data.get("feedback") or data.get("text")
+        if isinstance(feedback, str):
+            feedback = feedback.strip()
+        if feedback:
+            return feedback
+    except Exception as exc:  # pragma: no cover - network failures stay graceful
+        log_event("custom_feedback_failed", error=str(exc))
+    return None
+
+
 def get_feedback(
     reviewer: Reviewer,
     doc: Document,
@@ -193,6 +230,11 @@ def get_feedback(
 
     if reviewer.provider == "openai":
         feedback = _openai_feedback(reviewer, doc, text, references, user)
+        if feedback:
+            return feedback
+
+    if reviewer.provider == "http":
+        feedback = _http_feedback(reviewer, text, references, user)
         if feedback:
             return feedback
 

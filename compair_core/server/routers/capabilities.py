@@ -36,6 +36,10 @@ def capabilities(settings: Settings = Depends(get_settings)) -> dict[str, object
             "docs": None if edition == "core" else 100,
             "feedback_per_day": None if edition == "core" else 50,
         },
+        "features": {
+            "ocr_upload": settings.ocr_enabled,
+            "activity_feed": edition == "cloud",
+        },
         "server": "Compair Cloud" if edition == "cloud" else "Compair Core",
         "version": settings.version,
         "legacy_routes": settings.include_legacy_routes,
