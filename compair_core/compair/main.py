@@ -41,7 +41,11 @@ def process_document(
     if prev_content:
         prev_chunks = chunk_text(prev_content[-1])
 
-    feedback_limit = int(os.getenv("COMPAIR_CORE_FEEDBACK_LIMIT", "5"))
+    feedback_limit_env = os.getenv("COMPAIR_CORE_FEEDBACK_LIMIT")
+    try:
+        feedback_limit = int(feedback_limit_env) if feedback_limit_env else None
+    except ValueError:
+        feedback_limit = None
     time_cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
 
     recent_feedback_count = session.query(Feedback).filter(
@@ -59,8 +63,11 @@ def process_document(
     if generate_feedback:
         prioritized_chunk_indices = detect_significant_edits(prev_chunks=prev_chunks, new_chunks=new_chunks)
 
-    num_chunks_can_generate_feedback = max((feedback_limit - recent_feedback_count), 0)
-    indices_to_generate_feedback = prioritized_chunk_indices[:num_chunks_can_generate_feedback]
+    if feedback_limit is None:
+        indices_to_generate_feedback = prioritized_chunk_indices
+    else:
+        num_chunks_can_generate_feedback = max((feedback_limit - recent_feedback_count), 0)
+        indices_to_generate_feedback = prioritized_chunk_indices[:num_chunks_can_generate_feedback]
 
     for i, chunk in enumerate(new_chunks):
         should_generate_feedback = i in indices_to_generate_feedback

@@ -1373,22 +1373,35 @@ def create_doc(
             current_user.status_change_date = datetime.now(timezone.utc)
             session.commit()
 
-        # Enforce document limits
+        # Enforce document limits (cloud plans) – core runs are unrestricted unless explicitly configured
         team = _user_team(current_user)
+        document_limit: int | None = None
         if IS_CLOUD and HAS_TEAM and team and current_user.status == "active":
             document_limit = team.total_documents_limit  # type: ignore[union-attr]
+        elif IS_CLOUD and _user_plan(current_user) == "individual" and current_user.status == "active":
+            document_limit = 100
         else:
-            if IS_CLOUD and _user_plan(current_user) == 'individual' and current_user.status == "active":
-                document_limit = 100
-            else:
-                document_limit = int(os.getenv("COMPAIR_CORE_DOCUMENT_LIMIT", "10"))
+            raw_core_limit = os.getenv("COMPAIR_CORE_DOCUMENT_LIMIT")
+            if raw_core_limit:
+                try:
+                    document_limit = int(raw_core_limit)
+                except ValueError:
+                    document_limit = None
+
         document_count = session.query(models.Document).filter(models.Document.user_id == current_user.user_id).count()
 
-        if document_count >= document_limit:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Document limit reached. Individual plan users can have 100, team plans have 100 times the number of users (pooled); other plans can have 10",
-            )
+        if document_limit is not None and document_count >= document_limit:
+            if IS_CLOUD:
+                detail_msg = (
+                    "Document limit reached. Individual plan users can have 100, team plans have 100 times "
+                    "the number of users (pooled); other plans can have 10"
+                )
+            else:
+                detail_msg = (
+                    f"Document limit of {document_limit} reached. Adjust COMPAIR_CORE_DOCUMENT_LIMIT to raise "
+                    "or unset it to remove limits in core deployments."
+                )
+            raise HTTPException(status_code=403, detail=detail_msg)
 
         if not authorid:
             authorid = current_user.user_id
