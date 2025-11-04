@@ -36,6 +36,10 @@ dev = [
   "pytest>=8.0",
   "ruff>=0.3",
 ]
+ocr = [
+  "pillow>=10.0",
+  "pytesseract>=0.3.10",
+]
 postgres = [
   "psycopg2-binary>=2.9"
 ]

@@ -97,6 +97,7 @@ def _initialize_defaults() -> None:
 
 
 engine = _handle_engine()
+initialize_database()
 Session = sessionmaker(engine)
 embedder = embeddings.Embedder()
 reviewer = feedback.Reviewer()
