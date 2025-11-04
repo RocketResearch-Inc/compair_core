@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "compair-core"
-version = "0.4.2"
+version = "0.4.3"
 description = "Open-source foundation of the Compair collaboration platform."
 readme = "README.md"
 license = { text = "MIT" }
