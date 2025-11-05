@@ -28,7 +28,7 @@ Compair Core ships with helper services that let you run everything offline:
 
 1. **Local embeddings** – When `COMPAIR_GENERATION_PROVIDER=local`, the server calls the URL in `COMPAIR_LOCAL_MODEL_URL` to create embeddings and feedback. Point this URL at the FastAPI worker started by `compair_core.compair.local_models`. The helper service defaults to a small sentence-transformer (384 dimensions) and a lightweight instruction-tuned text generator. Both models run on CPU by default.
 2. **Custom models** – Swap in your own container or script that exposes the same HTTP interface. Ensure the embedding dimensionality matches `COMPAIR_EMBEDDING_DIM` (defaults to 384). If you change the embedding size, update existing tables or recreate the database to avoid shape mismatches.
-3. **OpenAI or other providers** – To call OpenAI, set `COMPAIR_GENERATION_PROVIDER=openai`, provide `COMPAIR_OPENAI_API_KEY`, and optionally override `COMPAIR_OPENAI_MODEL` (defaults to `gpt-4o-mini`). For a bespoke hosted model, use `COMPAIR_GENERATION_PROVIDER=http` and point `COMPAIR_GENERATION_ENDPOINT` at your service.
+3. **OpenAI or other providers** – To call OpenAI, set `COMPAIR_GENERATION_PROVIDER=openai`, provide `COMPAIR_OPENAI_API_KEY`, and optionally override `COMPAIR_OPENAI_MODEL` (defaults to `gpt-5-nano`). For a bespoke hosted model, use `COMPAIR_GENERATION_PROVIDER=http` and point `COMPAIR_GENERATION_ENDPOINT` at your service.
 
 If you do not run any model service, set `COMPAIR_GENERATION_PROVIDER=fallback` to skip generation while still storing document embeddings (useful for similarity-only scenarios).
 
@@ -242,6 +242,7 @@ Most deployments do not need the knobs below, but they are available for advance
 - `COMPAIR_INCLUDE_LEGACY_ROUTES` – Opt in to the larger API surface that matches the hosted product.
 - `COMPAIR_EMBEDDING_DIM` – Override the embedding vector length stored in the database. Changing this requires a matching model and may necessitate reinitializing embeddings.
 - `COMPAIR_OPENAI_API_KEY` / `COMPAIR_OPENAI_MODEL` – Required when using the OpenAI generator.
+- `COMPAIR_OPENAI_REASONING_EFFORT` – Override the `reasoning.effort` value (`low`, `medium`, or `high`) sent to OpenAI reasoning models.
 - `COMPAIR_GENERATION_ENDPOINT` – Target for custom HTTP-based generation services.
 - `COMPAIR_OCR_ENDPOINT` – Override the OCR endpoint when connecting to an external OCR processor. Defaults to the bundled service at `http://127.0.0.1:9001/ocr-file`.
 

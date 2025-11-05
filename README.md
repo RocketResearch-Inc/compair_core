@@ -61,7 +61,7 @@ Key environment variables for the core edition:
 - `COMPAIR_EMBEDDING_DIM` – force the embedding vector size stored in the database (defaults to 384 for core, 1536 for cloud). Keep this in sync with whichever embedding model you configure.
 - `COMPAIR_VECTOR_BACKEND` (`auto`) – set to `pgvector` when running against PostgreSQL with the pgvector extension, or `json` to store embeddings as JSON (the default for SQLite deployments).
 - `COMPAIR_GENERATION_PROVIDER` (`local`) – choose how feedback is produced. Options: `local` (call the bundled FastAPI service), `openai` (use ChatGPT-compatible APIs with an API key), `http` (POST the request to a custom endpoint), or `fallback` (skip generation and surface similar references only).
-- `COMPAIR_OPENAI_API_KEY` / `COMPAIR_OPENAI_MODEL` – when using the OpenAI provider, supply your API key and optional model name (defaults to `gpt-4o-mini`). The fallback kicks in automatically if the key or SDK is unavailable.
+- `COMPAIR_OPENAI_API_KEY` / `COMPAIR_OPENAI_MODEL` – when using the OpenAI provider, supply your API key and optional model name (defaults to `gpt-5-nano`). The fallback kicks in automatically if the key or SDK is unavailable.
 - `COMPAIR_GENERATION_ENDPOINT` – HTTP endpoint invoked when `COMPAIR_GENERATION_PROVIDER=http`; the service receives a JSON payload (`document`, `references`, `length_instruction`) and should return `{"feedback": ...}`.
 - `COMPAIR_OCR_ENDPOINT` – endpoint the backend calls for OCR uploads (defaults to the bundled Tesseract wrapper at `http://local-ocr:9001/ocr-file`). Provide your own service by overriding this URL.
 

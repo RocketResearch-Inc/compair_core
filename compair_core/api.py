@@ -660,7 +660,8 @@ def load_session(auth_token: str | None = None) -> schema.Session | None:
     if not settings.require_authentication:
         with compair.Session() as session:
             user = _ensure_single_user(session, settings)
-            return _ensure_single_user_session(session, user)
+            session_model = _ensure_single_user_session(session, user)
+            return schema.Session.model_validate(session_model, from_attributes=True)
     with compair.Session() as session:
         if not auth_token:
             raise HTTPException(status_code=400, detail="auth_token is required when authentication is enabled.")
@@ -672,7 +673,7 @@ def load_session(auth_token: str | None = None) -> schema.Session | None:
             valid_until = valid_until.replace(tzinfo=timezone.utc)
         if valid_until < datetime.now(timezone.utc):
             raise HTTPException(status_code=401, detail="Invalid or expired session token")
-        return user_session
+        return schema.Session.model_validate(user_session, from_attributes=True)
 
 
 @router.post("/update_user")

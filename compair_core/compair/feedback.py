@@ -21,6 +21,25 @@ except (ImportError, ModuleNotFoundError):
     cloud_get_feedback = None  # type: ignore
 
 
+_REASONING_PREFIXES = ("gpt-5", "o1", "o2", "o3", "o4")
+
+
+def _is_reasoning_model_name(model_name: str | None) -> bool:
+    if not model_name:
+        return False
+    normalized = model_name.lower()
+    for prefix in _REASONING_PREFIXES:
+        if normalized == prefix or normalized.startswith(f"{prefix}-") or normalized.startswith(f"{prefix}."):
+            return True
+    return False
+
+
+def _get_field(source: Any, key: str) -> Any:
+    if isinstance(source, dict):
+        return source.get(key)
+    return getattr(source, key, None)
+
+
 class Reviewer:
     """Edition-aware wrapper that selects a feedback provider based on configuration."""
 
@@ -36,6 +55,8 @@ class Reviewer:
         self._cloud_impl = None
         self._openai_client = None
         self.openai_model = os.getenv("COMPAIR_OPENAI_MODEL", "gpt-5-nano")
+        self.openai_reasoning_effort = os.getenv("COMPAIR_OPENAI_REASONING_EFFORT", "medium")
+        self.uses_reasoning_model = _is_reasoning_model_name(self.openai_model)
         self.custom_endpoint = os.getenv("COMPAIR_GENERATION_ENDPOINT")
 
         if self.edition == "cloud" and CloudReviewer is not None:
@@ -143,33 +164,39 @@ def _openai_feedback(
         f"Respond with {instruction} that highlights the most valuable revision to make next."
     )
 
-    def _extract_response_text(response: Any) -> str | None:
+    def _extract_response_text(response: Any, reasoning_mode: bool) -> str | None:
         if response is None:
             return None
-        text_out = getattr(response, "output_text", None)
+        text_out = _get_field(response, "output_text")
         if isinstance(text_out, str) and text_out.strip():
             return text_out.strip()
-        outputs = getattr(response, "output", None) or getattr(response, "outputs", None)
+        outputs = _get_field(response, "output") or _get_field(response, "outputs")
         pieces: list[str] = []
         if outputs:
             for item in outputs:
-                content_field = None
-                if isinstance(item, dict):
-                    content_field = item.get("content")
-                else:
-                    content_field = getattr(item, "content", None)
+                item_type = _get_field(item, "type")
+                if reasoning_mode and item_type and item_type not in {"message", "assistant"}:
+                    continue
+                content_field = _get_field(item, "content")
                 if not content_field:
                     continue
                 for part in content_field:
-                    if isinstance(part, dict):
-                        val = part.get("text") or part.get("output_text")
-                        if val:
-                            pieces.append(str(val))
-                    elif part:
+                    part_type = _get_field(part, "type")
+                    if reasoning_mode and part_type and part_type not in {"output_text", "text"}:
+                        continue
+                    val = _get_field(part, "text") or _get_field(part, "output_text")
+                    if val:
+                        pieces.append(str(val))
+                    elif part and not reasoning_mode:
                         pieces.append(str(part))
         if pieces:
-            merged = "\n".join(pieces).strip()
+            merged = "\n".join(piece.strip() for piece in pieces if piece and str(piece).strip())
             return merged or None
+        message = _get_field(response, "message")
+        if isinstance(message, dict):
+            message_content = message.get("content") or message.get("text")
+            if isinstance(message_content, str) and message_content.strip():
+                return message_content.strip()
         return None
 
     try:
@@ -183,15 +210,27 @@ def _openai_feedback(
             reviewer._openai_client = client
 
         content: str | None = None
+        uses_reasoning = reviewer.uses_reasoning_model
         if client is not None and hasattr(client, "responses"):
+            request_kwargs: dict[str, Any] = {
+                "model": reviewer.openai_model,
+                "max_output_tokens": 256,
+                "store": False,
+            }
+            if uses_reasoning:
+                request_kwargs["input"] = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ]
+                if reviewer.openai_reasoning_effort:
+                    request_kwargs["reasoning"] = {"effort": reviewer.openai_reasoning_effort}
+            else:
+                request_kwargs["instructions"] = system_prompt
+                request_kwargs["input"] = user_prompt
             response = client.responses.create(
-                model=reviewer.openai_model,
-                instructions=system_prompt,
-                input=user_prompt,
-                max_output_tokens=256,
-                store=False,
+                **request_kwargs,
             )
-            content = _extract_response_text(response)
+            content = _extract_response_text(response, reasoning_mode=uses_reasoning)
         elif client is not None and hasattr(client, "chat") and hasattr(client.chat, "completions"):
             response = client.chat.completions.create(
                 model=reviewer.openai_model,

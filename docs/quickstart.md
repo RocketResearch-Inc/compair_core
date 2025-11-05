@@ -46,7 +46,7 @@ import requests
 BASE_URL = "http://127.0.0.1:8000"
 
 response = requests.get(f"{BASE_URL}/load_session", timeout=10)
-content = response.json()
+session = response.json()
 AUTH_HEADERS = {"auth-token": session["id"]}
 print(f'User with user_id {session["user_id"]} is ready!')
 ```
@@ -56,17 +56,32 @@ print(f'User with user_id {session["user_id"]} is ready!')
 Create a document that will serve as the reference material for later feedback. Set `is_published=true` so it can be surfaced during comparison.
 
 ```python
+reference_text = "1. Define the goal.\n2. Gather assets.\n3. Announce launch."
+
 reference = requests.post(
     f"{BASE_URL}/create_doc",
     headers=AUTH_HEADERS,
     data={
         "document_title": "Launch Checklist",
         "document_type": "txt",
-        "document_content": "1. Define the goal.\n2. Gather assets.\n3. Announce launch.",
+        "document_content": "",
         "is_published": True,
     },
     timeout=10,
 ).json()
+
+# Process once so the published doc has embeddings available for retrieval
+requests.post(
+    f"{BASE_URL}/process_doc",
+    headers=AUTH_HEADERS,
+    data={
+        "doc_id": reference["document_id"],
+        "doc_text": reference_text,
+        "generate_feedback": False,
+    },
+    timeout=10,
+)
+
 print("Reference doc id:", reference["document_id"])
 ```
 
@@ -75,13 +90,18 @@ print("Reference doc id:", reference["document_id"])
 Create another document, then immediately call `POST /process_doc` with `generate_feedback=true`. Compair will embed the new content, look for relevant published references (including the one you just created), and produce AI feedback.
 
 ```python
+candidate_text = (
+    "Hi team, the launch happens tomorrow. "
+    "Let's meet at noon to finalize assets."
+)
+
 candidate = requests.post(
     f"{BASE_URL}/create_doc",
     headers=AUTH_HEADERS,
     data={
         "document_title": "Launch Email Draft",
         "document_type": "txt",
-        "document_content": "Hi team, the launch happens tomorrow. Let's meet at noon to finalize assets.",
+        "document_content": "",
         "is_published": False,
     },
     timeout=10,
@@ -92,7 +112,7 @@ process = requests.post(
     headers=AUTH_HEADERS,
     data={
         "doc_id": candidate["document_id"],
-        "doc_text": "Hi team, the launch happens tomorrow. Let's meet at noon to finalize assets.",
+        "doc_text": candidate_text,
         "generate_feedback": True,
     },
     timeout=10,
