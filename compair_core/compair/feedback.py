@@ -48,14 +48,14 @@ class Reviewer:
         self.provider = os.getenv("COMPAIR_GENERATION_PROVIDER", "local").lower()
         self.length_map = {
             "Brief": "1–2 short sentences",
-            "Detailed": "A couple short paragraphs",
-            "Verbose": "As thorough as reasonably possible without repeating information",
+            "Detailed": "a couple short paragraphs",
+            "Verbose": "as thorough as reasonably possible without repeating information",
         }
 
         self._cloud_impl = None
         self._openai_client = None
         self.openai_model = os.getenv("COMPAIR_OPENAI_MODEL", "gpt-5-nano")
-        self.openai_reasoning_effort = os.getenv("COMPAIR_OPENAI_REASONING_EFFORT", "medium")
+        self.openai_reasoning_effort = os.getenv("COMPAIR_OPENAI_REASONING_EFFORT", "minimal")
         self.uses_reasoning_model = _is_reasoning_model_name(self.openai_model)
         self.custom_endpoint = os.getenv("COMPAIR_GENERATION_ENDPOINT")
 
@@ -155,13 +155,31 @@ def _openai_feedback(
         return None
     instruction = reviewer.length_map.get(user.preferred_feedback_length, "1–2 short sentences")
     ref_text = "\n\n".join(_reference_snippets(references, limit=3))
-    system_prompt = (
-        "You are Compair, an assistant that delivers concise, actionable feedback on a user's document. "
-        "Focus on clarity, cohesion, and usefulness."
-    )
+    system_prompt = """# Identity
+You are a collaborative team member on Compair, a platform designed to help teammates uncover connections, share insights, and accelerate collective learning by comparing user documents with relevant references.
+
+# Purpose
+Your goal is to quickly surface **meaningful** connections or useful contrasts between a user’s main document and shared references—especially details that could help the document author or other team members work more effectively together.
+
+# Instructions
+
+- **Connect the Dots:** Highlight unique insights, similarities, differences, or answers between the main document and its references. Prioritize information that is truly meaningful or helpful to the author or team.
+- **Qualified Sharing:** Only point out connections that matter—avoid commenting on trivial or already-obvious overlapping details. If nothing significant stands out, respond with: **NONE**.
+- **Relay Messages:** If user documents or notes are being used to communicate with teammates, relay any important updates or questions to help foster further discussion or action.
+- **Be Conversational:** Respond in a friendly, direct tone—never formal or repetitive.
+- **Be Constructive:** Focus on actionable insights, especially those that could inform or inspire team decisions, workflow improvements, or new ideas.
+
+# Output Format
+- If no meaningful connections or insights are present: **NONE**
+
+# Be sure NOT to:
+- Repeat the user’s content back without adding value.
+- Offer generic praise or vague observations.
+- Use overly technical or robotic language.
+    """
     user_prompt = (
-        f"Document:\n{text}\n\nHelpful reference excerpts:\n{ref_text or 'None provided'}\n\n"
-        f"Respond with {instruction} that highlights the most valuable revision to make next."
+        f"Document:\n{text}\n\nRelevant reference excerpts:\n{ref_text or 'None provided'}\n\n"
+        f"Respond with {instruction}."
     )
 
     def _extract_response_text(response: Any, reasoning_mode: bool) -> str | None:
@@ -214,12 +232,10 @@ def _openai_feedback(
         if client is not None and hasattr(client, "responses"):
             request_kwargs: dict[str, Any] = {
                 "model": reviewer.openai_model,
-                "max_output_tokens": 256,
-                "store": False,
             }
             if uses_reasoning:
                 request_kwargs["input"] = [
-                    {"role": "system", "content": system_prompt},
+                    {"role": "developer", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ]
                 if reviewer.openai_reasoning_effort:
