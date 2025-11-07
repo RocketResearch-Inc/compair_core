@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     integrations_enabled: bool = False
     premium_models: bool = False
     require_authentication: bool = False
+    require_email_verification: bool = False
     single_user_username: str = "compair-local@example.com"
     single_user_name: str = "Compair Local User"
     include_legacy_routes: bool = False
@@ -41,9 +42,13 @@ class Settings(BaseSettings):
     ga4_api_secret: str | None = None
 
     # Local model endpoints
-    local_model_url: str = "http://local-model:9000"
+    local_model_url: str = "http://127.0.0.1:9000"
     local_embedding_route: str = "/embed"
     local_generation_route: str = "/generate"
+
+    # OCR
+    ocr_endpoint: str | None = None
+    ocr_request_timeout: float = 30.0
 
     class Config:
         env_prefix = "COMPAIR_"
@@ -52,4 +57,10 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     """Cached settings instance for dependency injection."""
-    return Settings()
+    settings = Settings()
+    # Auto-enable OCR when a local endpoint is configured (Core) unless explicitly disabled.
+    if settings.ocr_endpoint and not settings.ocr_enabled:
+        object.__setattr__(settings, "ocr_enabled", True)
+    if not settings.ocr_endpoint and settings.edition.lower() != "cloud":
+        object.__setattr__(settings, "ocr_enabled", False)
+    return settings

@@ -82,7 +82,7 @@ class Reviewer:
                 self.provider = "fallback"
             if self.provider == "local":
                 self.model = os.getenv("COMPAIR_LOCAL_GENERATION_MODEL", "local-feedback")
-                base_url = os.getenv("COMPAIR_LOCAL_MODEL_URL", "http://local-model:9000")
+                base_url = os.getenv("COMPAIR_LOCAL_MODEL_URL", "http://127.0.0.1:9000")
                 route = os.getenv("COMPAIR_LOCAL_GENERATION_ROUTE", "/generate")
                 self.endpoint = f"{base_url.rstrip('/')}{route}"
             else:

@@ -10,15 +10,20 @@ Before hitting the API, configure the deployment with environment variables. The
 | --- | --- | --- |
 | `COMPAIR_EDITION` | Keeps the code in "core" mode. | `core` |
 | `COMPAIR_REQUIRE_AUTHENTICATION` | Enables full sign-up/login flows. Disable for single-user demos. | `true` (or `false` for kiosks) |
+| `COMPAIR_REQUIRE_EMAIL_VERIFICATION` | When auth is enabled, decide if users must confirm via email before activation. | `false` |
 | `COMPAIR_DATABASE_URL` | Points to a custom PostgreSQL/MySQL instance instead of SQLite. | Leave unset to use SQLite |
 | `COMPAIR_DB_DIR` / `COMPAIR_DB_NAME` | Location of the SQLite database file when `COMPAIR_DATABASE_URL` is omitted. | `${HOME}/.compair-core/data` / `compair.db` |
 | `COMPAIR_VECTOR_BACKEND` | Chooses how embeddings are stored (`json` for SQLite, `pgvector` for PostgreSQL). | `json` |
 | `COMPAIR_GENERATION_PROVIDER` | Selects the feedback generator: `local`, `openai`, `http`, or `fallback`. | `local` |
 | `COMPAIR_LOCAL_MODEL_URL` | Base URL of the bundled/local text generation + embedding service used when `COMPAIR_GENERATION_PROVIDER=local`. | `http://127.0.0.1:9000` |
-| `COMPAIR_OCR_ENDPOINT` | HTTP endpoint used for OCR uploads. Defaults to the bundled Tesseract sidecar. | `http://127.0.0.1:9001/ocr-file` |
+| `COMPAIR_OCR_ENDPOINT` | HTTP endpoint used for OCR uploads. When set, OCR auto-enables for core deployments. | `http://127.0.0.1:9001/ocr-file` |
 | `COMPAIR_EMAIL_BACKEND` | Controls how verification/reset emails are sent. | `console` (logs to stdout) |
 
 > 💡 Export these variables in your shell or drop them into a `.env` file loaded by your process manager (e.g., `uvicorn`, `docker-compose`, `systemd`).
+
+When both `COMPAIR_REQUIRE_AUTHENTICATION=true` and `COMPAIR_REQUIRE_EMAIL_VERIFICATION=true`, configure SMTP credentials via `EMAIL_HOST`, `EMAIL_USER`, and `EMAIL_PW` so the server can send verification and reset emails. Leave verification disabled (the default) to avoid the mailer dependency during quick tests.
+
+When `COMPAIR_OCR_ENDPOINT` is defined (for example, pointing at the bundled Tesseract service on port `9001`), the server automatically reports OCR capability and allows `/upload/ocr-file`. If the endpoint is missing or unreachable, OCR stays disabled and the API returns `501 Not Implemented`.
 
 Install optional extras as needed: `pip install "compair-core[ocr]"` adds Pillow and pytesseract for in-process OCR support.
 
@@ -26,9 +31,10 @@ Install optional extras as needed: `pip install "compair-core[ocr]"` adds Pillow
 
 Compair Core ships with helper services that let you run everything offline:
 
-1. **Local embeddings** – When `COMPAIR_GENERATION_PROVIDER=local`, the server calls the URL in `COMPAIR_LOCAL_MODEL_URL` to create embeddings and feedback. Point this URL at the FastAPI worker started by `compair_core.compair.local_models`. The helper service defaults to a small sentence-transformer (384 dimensions) and a lightweight instruction-tuned text generator. Both models run on CPU by default.
-2. **Custom models** – Swap in your own container or script that exposes the same HTTP interface. Ensure the embedding dimensionality matches `COMPAIR_EMBEDDING_DIM` (defaults to 384). If you change the embedding size, update existing tables or recreate the database to avoid shape mismatches.
-3. **OpenAI or other providers** – To call OpenAI, set `COMPAIR_GENERATION_PROVIDER=openai`, provide `COMPAIR_OPENAI_API_KEY`, and optionally override `COMPAIR_OPENAI_MODEL` (defaults to `gpt-5-nano`). For a bespoke hosted model, use `COMPAIR_GENERATION_PROVIDER=http` and point `COMPAIR_GENERATION_ENDPOINT` at your service.
+1. **Local embeddings + feedback (default)** – When `COMPAIR_GENERATION_PROVIDER=local`, the server calls `COMPAIR_LOCAL_MODEL_URL` (defaults to `http://127.0.0.1:9000`) to create embeddings and templated feedback. The bundled FastAPI worker uses deterministic hash embeddings and a heuristic feedback stub so you can run 100% offline without extra dependencies. Override the service with your own HTTP endpoint if you need higher-fidelity models.
+2. **OpenAI embeddings** – Set `COMPAIR_EMBEDDING_PROVIDER=openai`, supply `COMPAIR_OPENAI_API_KEY`, and optionally override `COMPAIR_OPENAI_EMBED_MODEL` (defaults to `text-embedding-3-small`) to call the OpenAI Embeddings API while still using the local feedback provider.
+3. **Custom models** – Swap in your own container or script that exposes the same HTTP interface. Ensure the embedding dimensionality matches `COMPAIR_EMBEDDING_DIM` (defaults to 384). If you change the embedding size, update existing tables or recreate the database to avoid shape mismatches.
+4. **OpenAI or other feedback providers** – To call OpenAI for feedback, set `COMPAIR_GENERATION_PROVIDER=openai`, provide `COMPAIR_OPENAI_API_KEY`, and optionally override `COMPAIR_OPENAI_MODEL` (defaults to `gpt-5-nano`). For a bespoke hosted model, use `COMPAIR_GENERATION_PROVIDER=http` and point `COMPAIR_GENERATION_ENDPOINT` at your service.
 
 If you do not run any model service, set `COMPAIR_GENERATION_PROVIDER=fallback` to skip generation while still storing document embeddings (useful for similarity-only scenarios).
 
@@ -57,7 +63,7 @@ When running behind a reverse proxy (e.g., Traefik, nginx), forward the ports yo
 
 ### 1.1 Create an account
 
-Call `POST /sign-up` with the user’s email (used as `username`), display name, password, and optional group IDs or referral code. The backend validates the email, creates the user record, adds them to the welcome/private groups, triggers analytics, and emails a verification link containing a time-limited token.
+Call `POST /sign-up` with the user’s email (used as `username`), display name, password, and optional group IDs or referral code. The backend validates the email, creates the user record, assigns a private group, triggers analytics, and (when verification is enabled) emails a verification link containing a time-limited token. When `COMPAIR_REQUIRE_EMAIL_VERIFICATION=false`, the account is activated immediately after sign-up.
 
 ```python
 import requests
@@ -78,7 +84,7 @@ print(resp.json())
 
 ### 1.2 Verify the email address
 
-Follow the verification link emailed by Compair, which hits `GET /verify-email?token=...`. Verification activates the account, starts a 30-day trial (when trials are enabled), clears the token, and sends pending group invitations if any.
+When `COMPAIR_REQUIRE_EMAIL_VERIFICATION=true`, follow the verification link emailed by Compair, which hits `GET /verify-email?token=...`. Verification activates the account, starts a 30-day trial (when trials are enabled), clears the token, and sends pending group invitations if any. Skip this step when verification is disabled.
 
 ### 1.3 Log in and maintain a session
 
@@ -133,7 +139,7 @@ List members of a specific group with `GET /load_group_users?group_id=...`, whic
 
 ### 3.2 Join existing groups
 
-Submitting `POST /join_group` with the target group ID automatically accepts pending invitations, instantly joins public groups, or files a join request for internal groups. Private groups reject direct joins without an invite.
+Submitting `POST /join_group` with the target group ID automatically accepts pending invitations, instantly joins public groups, or files a join request for internal groups. Private groups reject direct joins without an invite. On a fresh Compair Core install there are no shared groups yet, so skip ahead to the next section to create one before returning to this join workflow.
 
 ```python
 join_resp = requests.post(
@@ -149,7 +155,23 @@ print(join_resp.json())
 
 Group creators call `POST /create_group` with name, category, description, visibility, and an optional image file. Internal groups are limited to active team-plan users. The creator automatically becomes an administrator and gains ownership of the new group.
 
-Group admins can review pending join requests (`GET /admin/join_requests`), approve them (`POST /admin/approve_request`), and list the groups they manage (`GET /admin/groups`).
+```python
+group_resp = requests.post(
+    f"{BASE_URL}/create_group",
+    headers=headers,
+    data={
+        "name": "Product Feedback Guild",
+        "category": "Research",
+        "description": "Share launch assets and critique drafts.",
+        "visibility": "private",
+    },
+    timeout=10,
+).json()
+MY_GROUP_ID = group_resp["group_id"]
+print("Created group:", MY_GROUP_ID)
+```
+
+Group admins can review pending join requests (`GET /admin/join_requests`), approve them (`POST /admin/approve_request`), and list the groups they manage (`GET /admin/groups`). Keep the new `MY_GROUP_ID` handy—the following document examples scope access and feedback to this group.
 
 ## 4. Managing Documents
 
@@ -161,30 +183,76 @@ Group admins can review pending join requests (`GET /admin/join_requests`), appr
 
 Create new documents via `POST /create_doc` using form fields for title, type, content, and group assignments. The server enforces per-plan document limits, assigns default groups when none are provided, logs creation activity, and optionally publishes immediately if `is_published=true`.
 
-Update metadata with `POST /update_doc` (same `auth-token` header) and publish/unpublish using `GET /publish_doc?doc_id=...&is_published=true|false`. Suspended users cannot publish until reactivated.
+Update metadata with `POST /update_doc` (same `auth-token` header) and publish/unpublish using `GET /publish_doc?doc_id=...&is_published=true|false`. Suspended users cannot publish until reactivated. Delete single or multiple documents through `GET /delete_doc` or `GET /delete_docs`, which also log the deletion event.
 
-Delete single or multiple documents through `GET /delete_doc` or `GET /delete_docs`, which also log the deletion event.
+The feedback pipeline only considers **published** documents that share at least one group with the draft being processed. The snippet below creates a reference document inside `MY_GROUP_ID`, publishes it, and processes it once so embeddings are ready for future drafts.
 
 ```python
-create_resp = requests.post(
+reference_text = (
+    "Launch Playbook v1:\n"
+    "- Confirm positioning with product and sales.\n"
+    "- Publish the launch blog and partner toolkit.\n"
+    "- Host a customer webinar within 7 days of GA."
+)
+
+reference = requests.post(
     f"{BASE_URL}/create_doc",
     headers=headers,
     data={
-        "document_title": "Q1 Market Analysis",
+        "document_title": "Launch Playbook",
         "document_type": "txt",
-        "document_content": "Initial draft content...",
-        "is_published": False,
+        "document_content": reference_text,
+        "groups": MY_GROUP_ID,
+        "is_published": True,
+    },
+    timeout=10,
+).json()
+REFERENCE_DOC_ID = reference["document_id"]
+
+# Process once without generating feedback so the published doc
+# has embeddings available for future similarity searches.
+requests.post(
+    f"{BASE_URL}/process_doc",
+    headers=headers,
+    data={
+        "doc_id": REFERENCE_DOC_ID,
+        "doc_text": reference_text,
+        "generate_feedback": False,
     },
     timeout=10,
 )
-doc_id = create_resp.json()["document_id"]
+```
+
+Create a draft document in the same group whenever you want feedback that leverages the published reference:
+
+```python
+candidate_text = (
+    "Team,\n"
+    "We're announcing Aurora Analytics next month. "
+    "Product already approved the messaging, but we still need the partner toolkit "
+    "and webinar deck before GA."
+)
+
+candidate = requests.post(
+    f"{BASE_URL}/create_doc",
+    headers=headers,
+    data={
+        "document_title": "Aurora Launch Email",
+        "document_type": "txt",
+        "document_content": candidate_text,
+        "groups": MY_GROUP_ID,
+        "is_published": False,
+    },
+    timeout=10,
+).json()
+CANDIDATE_DOC_ID = candidate["document_id"]
 ```
 
 ## 5. Generating and Reviewing Automated Feedback
 
 ### 5.1 Trigger document processing
 
-Send updated text to `POST /process_doc` to chunk the document, generate embeddings, and (optionally) request AI feedback. Only the author may process a document; suspended users can save edits but do not receive new feedback. Cloud deployments queue work asynchronously (returning a `task_id`), while core deployments process immediately and return `None`.
+Send updated text to `POST /process_doc` to chunk the document, generate embeddings, and (optionally) request AI feedback. Only the author may process a document; suspended users can save edits but do not receive new feedback. Cloud deployments queue work asynchronously (returning a `task_id`), while core deployments process immediately and return `None`. Because the reference document is already published and processed, the draft below can pick it up as a candidate reference.
 
 Check asynchronous progress with `GET /status/{task_id}` when a task ID is provided.
 
@@ -192,7 +260,11 @@ Check asynchronous progress with `GET /status/{task_id}` when a task ID is provi
 process_resp = requests.post(
     f"{BASE_URL}/process_doc",
     headers=headers,
-    data={"doc_id": doc_id, "doc_text": "Revised content...", "generate_feedback": True},
+    data={
+        "doc_id": CANDIDATE_DOC_ID,
+        "doc_text": candidate_text,
+        "generate_feedback": True,
+    },
     timeout=10,
 )
 print(process_resp.json())
@@ -209,7 +281,7 @@ Users may hide feedback (`POST /feedback/{feedback_id}/hide` with `is_hidden=tru
 
 ```python
 feedback_resp = requests.get(
-    f"{BASE_URL}/documents/{doc_id}/feedback",
+    f"{BASE_URL}/documents/{CANDIDATE_DOC_ID}/feedback",
     headers=headers,
     timeout=10,
 )
@@ -241,9 +313,14 @@ Most deployments do not need the knobs below, but they are available for advance
 - `COMPAIR_SINGLE_USER_USERNAME` / `COMPAIR_SINGLE_USER_NAME` – Customize the auto-provisioned account when authentication is disabled.
 - `COMPAIR_INCLUDE_LEGACY_ROUTES` – Opt in to the larger API surface that matches the hosted product.
 - `COMPAIR_EMBEDDING_DIM` – Override the embedding vector length stored in the database. Changing this requires a matching model and may necessitate reinitializing embeddings.
+- `COMPAIR_EMBEDDING_PROVIDER` – Choose `local` (default) or `openai` for embeddings without affecting the feedback provider.
+- `COMPAIR_OPENAI_EMBED_MODEL` – Embedding model name when `COMPAIR_EMBEDDING_PROVIDER=openai` (defaults to `text-embedding-3-small`).
+- `COMPAIR_REQUIRE_EMAIL_VERIFICATION` – Require email confirmation before activating users (defaults to `false` for core demos).
 - `COMPAIR_OPENAI_API_KEY` / `COMPAIR_OPENAI_MODEL` – Required when using the OpenAI generator.
 - `COMPAIR_OPENAI_REASONING_EFFORT` – Override the `reasoning.effort` value (`low`, `medium`, or `high`) sent to OpenAI reasoning models.
 - `COMPAIR_GENERATION_ENDPOINT` – Target for custom HTTP-based generation services.
-- `COMPAIR_OCR_ENDPOINT` – Override the OCR endpoint when connecting to an external OCR processor. Defaults to the bundled service at `http://127.0.0.1:9001/ocr-file`.
+- `COMPAIR_OCR_ENDPOINT` – Override the OCR endpoint when connecting to an external OCR processor. Defaults to the bundled service at `http://127.0.0.1:9001/ocr-file` when running the container image.
+- `COMPAIR_OCR_REQUEST_TIMEOUT` – Adjust the HTTP timeout (seconds) used when calling the OCR endpoint (default: `30`).
+- `EMAIL_HOST` / `EMAIL_USER` / `EMAIL_PW` – SMTP credentials used when sending verification or password reset emails.
 
 Consult `compair_core/server/settings.py` for the authoritative list and defaults.

@@ -7,6 +7,7 @@ from fastapi import Depends
 
 from .providers.console_mailer import ConsoleMailer
 from .providers.contracts import Analytics, BillingProvider, Mailer, OCRProvider, StorageProvider
+from .providers.http_ocr import HTTPOCR
 from .providers.local_storage import LocalStorage
 from .providers.noop_analytics import NoopAnalytics
 from .providers.noop_billing import NoopBilling
@@ -27,6 +28,11 @@ def _noop_billing() -> NoopBilling:
 @lru_cache
 def _noop_ocr() -> NoopOCR:
     return NoopOCR()
+
+
+@lru_cache
+def _http_ocr(endpoint: str, timeout: float) -> HTTPOCR:
+    return HTTPOCR(endpoint=endpoint, timeout=timeout)
 
 
 @lru_cache
@@ -55,7 +61,11 @@ def get_billing() -> BillingProvider:
     return _noop_billing()
 
 
-def get_ocr() -> OCRProvider:
+def get_ocr(
+    settings: Settings = Depends(get_settings_dependency),
+) -> OCRProvider:
+    if settings.ocr_enabled and settings.ocr_endpoint:
+        return _http_ocr(settings.ocr_endpoint, settings.ocr_request_timeout)
     return _noop_ocr()
 
 

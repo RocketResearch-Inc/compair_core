@@ -81,6 +81,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if analytics_provider is not None:
             app.dependency_overrides[get_analytics] = lambda ap=analytics_provider: ap
         app.dependency_overrides[get_mailer] = lambda mp=mailer_provider: mp
+        object.__setattr__(resolved_settings, "ocr_enabled", True)
 
     else:
         storage_provider = LocalStorage(

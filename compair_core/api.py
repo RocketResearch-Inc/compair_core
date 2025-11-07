@@ -599,22 +599,6 @@ def create_user(
     if groups is not None:
         user.groups = load_groups_by_ids(groups)
     else:
-        # Add the welcome group and default user group
-        welcome_group = session.query(models.Group).filter(
-            models.Group.name == "Welcome to Compair"
-        ).first()
-        welcome_doc_id = create_doc(
-            authorid=user.user_id,
-            document_title=f'Introducing {user.name} to Compair',
-            document_type='txt',
-            document_content="",
-            groups=welcome_group.group_id,
-            is_published=False,
-            current_user=user
-        )['document_id']
-        welcome_doc = session.query(models.Document).filter(
-            models.Document.document_id == welcome_doc_id
-        ).first()
         group = models.Group(
             name=username,
             datetime_created=datetime.now(),
@@ -626,10 +610,9 @@ def create_user(
         admin = models.Administrator(user_id=user.user_id)
         session.add(admin)
         session.add(group)
-        session.add(welcome_doc)
         session.commit()
         group.admins.append(admin)
-        user.groups = [group, welcome_group]
+        user.groups = [group]
     
     # Track referral if a code is provided
     if referral_code:
@@ -652,6 +635,51 @@ def create_user(
     except Exception as exc:
         print(f"analytics track failed: {exc}")
     return user
+
+
+def _activate_user_account(
+    session: Session,
+    user: models.User,
+    *,
+    send_group_invites: bool = True,
+) -> None:
+    user.status = "trial" if HAS_TRIALS else "active"
+    user.status_change_date = datetime.now(timezone.utc)
+    if HAS_TRIALS:
+        user.trial_expiration_date = datetime.now(timezone.utc) + timedelta(days=30)
+    user.verification_token = None
+    session.commit()
+
+    if not send_group_invites:
+        return
+
+    pending_invitations = session.query(models.GroupInvitation).filter(
+        models.GroupInvitation.email == user.username,
+        models.GroupInvitation.status == "pending"
+    ).all()
+    for invitation in pending_invitations:
+        invitation.status = "sent"
+        if not invitation.token:
+            invitation.token = secrets.token_urlsafe(32).lower()
+        invitation.datetime_expiration = datetime.now(timezone.utc) + timedelta(days=7)
+        session.commit()
+
+        group = invitation.group
+        inviter = invitation.inviter
+        invitation_link = f"http://{WEB_URL}/accept-group-invitation?token={invitation.token}&user_id={user.user_id}"
+        emailer.connect()
+        emailer.send(
+            subject="You’re Invited to Join a Group on Compair",
+            sender=EMAIL_USER,
+            receivers=[user.username],
+            html=GROUP_INVITATION_TEMPLATE.replace(
+                "{{inviter_name}}", inviter.name
+            ).replace(
+                "{{group_name}}", group.name
+            ).replace(
+                "{{invitation_link}}", invitation_link
+            )
+        )
 
 
 @router.get("/load_session")
@@ -1122,6 +1150,12 @@ async def create_group(
                 upload_type='group',
                 file=file
             )
+        return {
+            "group_id": created_group.group_id,
+            "name": created_group.name,
+            "visibility": created_group.visibility,
+            "category": created_group.category,
+        }
 
 
 @router.get("/load_documents")
@@ -1876,44 +1910,7 @@ def verify_email(token: str):
             raise HTTPException(status_code=400, detail="Invalid or expired token")
         if user.token_expiration < datetime.now(timezone.utc):
             raise HTTPException(status_code=400, detail="Token has expired")
-        user.status = 'trial'
-        user.status_change_date = datetime.now(timezone.utc)
-        if HAS_TRIALS:
-            user.trial_expiration_date = datetime.now(timezone.utc) + timedelta(days=30)
-        user.verification_token = None  # Invalidate the token
-        session.commit()
-
-        pending_invitations = session.query(models.GroupInvitation).filter(
-            models.GroupInvitation.email == user.username,
-            models.GroupInvitation.status == "pending"
-        ).all()
-        for invitation in pending_invitations:
-            # Mark as "sent"
-            invitation.status = "sent"
-            # Generate invitation token if not present
-            if not invitation.token:
-                invitation.token = secrets.token_urlsafe(32).lower()
-            invitation.datetime_expiration = datetime.now(timezone.utc) + timedelta(days=7)
-            session.commit()
-
-            # Send the actual group invitation email
-            group = invitation.group
-            inviter = invitation.inviter
-            invitation_link = f"http://{WEB_URL}/accept-group-invitation?token={invitation.token}&user_id={user.user_id}"
-            emailer.connect()
-            emailer.send(
-                subject="You’re Invited to Join a Group on Compair",
-                sender=EMAIL_USER,
-                receivers=[user.username],
-                html=GROUP_INVITATION_TEMPLATE.replace(
-                    "{{inviter_name}}", inviter.name
-                ).replace(
-                    "{{group_name}}", group.name
-                ).replace(
-                    "{{invitation_link}}", invitation_link
-                )
-            )
-
+        _activate_user_account(session, user, send_group_invites=True)
         return {"message": "Email verified successfully. Your free trial has started!"}
 
 def is_valid_email(email):
@@ -1943,20 +1940,21 @@ def sign_up(
             referral_code=request.referral_code,
         )
         print('Passed create_user')
-        # Generate the verification link
-        verification_link = f"http://{WEB_URL}/verify-email?token={user.verification_token}"
-        print('3?')
-        emailer.connect()
-        print('4??')
-        # Send the verification email
-        emailer.send(
-            subject="Verify your email address",
-            sender=EMAIL_USER,
-            receivers=[user.username],
-            html=ACCOUNT_VERIFY_TEMPLATE.replace("{{verification_link}}", verification_link)
-        )
-        print('The end???')
-        return {"message": "Sign-up successful. Please check your email for verification."}
+        if settings.require_email_verification:
+            verification_link = f"http://{WEB_URL}/verify-email?token={user.verification_token}"
+            print('3?')
+            emailer.connect()
+            print('4??')
+            emailer.send(
+                subject="Verify your email address",
+                sender=EMAIL_USER,
+                receivers=[user.username],
+                html=ACCOUNT_VERIFY_TEMPLATE.replace("{{verification_link}}", verification_link)
+            )
+            print('The end???')
+            return {"message": "Sign-up successful. Please check your email for verification."}
+        _activate_user_account(session, user, send_group_invites=False)
+        return {"message": "Sign-up successful. Your account is ready to use."}
 
 @router.post("/forgot-password")
 def forgot_password(request: schema.ForgotPasswordRequest) -> dict:
@@ -3519,8 +3517,13 @@ def submit_deactivate_request(
 
 
 CORE_PATHS: set[str] = {
+    "/sign-up",
+    "/verify-email",
     "/login",
+    "/forgot-password",
+    "/reset-password",
     "/load_session",
+    "/update_user",
     "/load_groups",
     "/load_group",
     "/create_group",
@@ -3533,6 +3536,7 @@ CORE_PATHS: set[str] = {
     "/load_user_files",
     "/create_doc",
     "/update_doc",
+    "/publish_doc",
     "/delete_doc",
     "/delete_docs",
     "/process_doc",
