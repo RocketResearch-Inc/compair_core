@@ -39,6 +39,8 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
+> 🔧 The optional OCR stack relies on the Tesseract CLI. When running outside the container image, install Tesseract separately (for example, `brew install tesseract` on macOS or `apt-get install tesseract-ocr` on Debian/Ubuntu) so pytesseract can invoke it.
+
 ## Containers
 
 Container definitions and build pipelines live outside this public package:

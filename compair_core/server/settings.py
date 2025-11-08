@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     version: str = "dev"
 
     # Feature gates
-    ocr_enabled: bool = False
+    ocr_enabled: bool = True
     billing_enabled: bool = False
     integrations_enabled: bool = False
     premium_models: bool = False
@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     local_generation_route: str = "/generate"
 
     # OCR
-    ocr_endpoint: str | None = None
+    ocr_endpoint: str | None = "http://127.0.0.1:9001"
     ocr_request_timeout: float = 30.0
 
     class Config:

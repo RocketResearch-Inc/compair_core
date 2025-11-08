@@ -25,7 +25,7 @@ When both `COMPAIR_REQUIRE_AUTHENTICATION=true` and `COMPAIR_REQUIRE_EMAIL_VERIF
 
 When `COMPAIR_OCR_ENDPOINT` is defined (for example, pointing at the bundled Tesseract service on port `9001`), the server automatically reports OCR capability and allows `/upload/ocr-file`. If the endpoint is missing or unreachable, OCR stays disabled and the API returns `501 Not Implemented`.
 
-Install optional extras as needed: `pip install "compair-core[ocr]"` adds Pillow and pytesseract for in-process OCR support.
+Install optional extras as needed: `pip install "compair-core[ocr]"` adds Pillow, pytesseract, and pypdf for in-process OCR support. When running outside the container, install the Tesseract CLI separately (e.g., `brew install tesseract` on macOS or `apt-get install tesseract-ocr` on Debian/Ubuntu) so pytesseract can find the binary.
 
 ### Local embeddings and generation
 
@@ -293,6 +293,8 @@ for fb in feedback_resp.json()["feedback"]:
 
 If OCR is enabled, upload files to convert them into text with `POST /upload/ocr-file`. The endpoint forwards the binary to the configured OCR provider and returns a task ID whose status can be polled with `GET /ocr-file-result/{task_id}`. Editions without OCR support return a 501 error.
 
+The bundled OCR service accepts PDFs (text extraction via pypdf) and common image types such as PNG or JPEG (direct pytesseract). Other formats fall back to plain-text decoding when `COMPAIR_LOCAL_OCR_FALLBACK=text`.
+
 ```python
 with open("scan.pdf", "rb") as handle:
     ocr_resp = requests.post(
@@ -301,7 +303,16 @@ with open("scan.pdf", "rb") as handle:
         files={"file": ("scan.pdf", handle, "application/pdf")},
         timeout=20,
     )
-print(ocr_resp.json())
+ocr_task = ocr_resp.json()
+task_id = ocr_task["task_id"]
+
+result_resp = requests.get(
+    f"{BASE_URL}/ocr-file-result/{task_id}",
+    headers=headers,
+    timeout=10,
+).json()
+print("OCR status:", result_resp.get("status"))
+print("OCR text:", result_resp.get("extracted_text", "")[:500])
 ```
 
 ---
