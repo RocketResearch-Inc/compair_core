@@ -42,7 +42,18 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     redis = None
 
-redis_url = os.environ.get("REDIS_URL")
+
+def _getenv(*names: str, default: Optional[str] = None) -> Optional[str]:
+    """Return the first populated environment variable in the provided list."""
+    for name in names:
+        if not name:
+            continue
+        value = os.getenv(name)
+        if value:
+            return value
+    return default
+
+redis_url = _getenv("COMPAIR_REDIS_URL", "REDIS_URL")
 redis_client = redis.Redis.from_url(redis_url) if (redis and redis_url) else None
 #from compair.main import process_document
 
@@ -57,8 +68,8 @@ CLOUDFLARE_IMAGES_BASE_URL = f"https://imagedelivery.net/{CLOUDFLARE_IMAGES_URL_
 CLOUDFLARE_IMAGES_TOKEN = os.environ.get("CLOUDFLARE_IMAGES_TOKEN")
 CLOUDFLARE_IMAGES_UPLOAD_URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_IMAGES_ACCOUNT}/images/v1"
 
-GA4_MEASUREMENT_ID = os.getenv("GA4_MEASUREMENT_ID")
-GA4_API_SECRET = os.getenv("GA4_API_SECRET")
+GA4_MEASUREMENT_ID = _getenv("COMPAIR_GA4_MEASUREMENT_ID", "GA4_MEASUREMENT_ID")
+GA4_API_SECRET = _getenv("COMPAIR_GA4_API_SECRET", "GA4_API_SECRET")
 
 IS_CLOUD = os.getenv("COMPAIR_EDITION", "core").lower() == "cloud"
 SINGLE_USER_SESSION_TTL = timedelta(days=365)
