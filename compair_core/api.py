@@ -75,6 +75,15 @@ IS_CLOUD = os.getenv("COMPAIR_EDITION", "core").lower() == "cloud"
 SINGLE_USER_SESSION_TTL = timedelta(days=365)
 
 
+def _render_email(template: str, **context: str) -> str:
+    """Lightweight template renderer for {{placeholders}} found in email HTML."""
+    rendered = template
+    for key, value in context.items():
+        replacement = value or ""
+        rendered = rendered.replace(f"{{{{{key}}}}}", replacement)
+    return rendered
+
+
 def _ensure_single_user(session: Session, settings: Settings) -> models.User:
     """Create or fetch the singleton user used when authentication is disabled."""
     changed = False
@@ -1960,7 +1969,11 @@ def sign_up(
                 subject="Verify your email address",
                 sender=EMAIL_USER,
                 receivers=[user.username],
-                html=ACCOUNT_VERIFY_TEMPLATE.replace("{{verification_link}}", verification_link)
+                html=_render_email(
+                    ACCOUNT_VERIFY_TEMPLATE,
+                    verification_link=verification_link,
+                    user_name=user.name or user.username or "there",
+                ),
             )
             print('The end???')
             return {"message": "Sign-up successful. Please check your email for verification."}
@@ -1997,7 +2010,11 @@ def forgot_password(request: schema.ForgotPasswordRequest) -> dict:
             subject="Password Reset Request",
             sender=EMAIL_USER,
             receivers=[request.email],
-            html=PASSWORD_RESET_TEMPLATE.replace("{{reset_link}}", reset_link)
+            html=_render_email(
+                PASSWORD_RESET_TEMPLATE,
+                reset_link=reset_link,
+                user_name=user.name or user.username or "",
+            ),
         )
         print('5')
         return {"message": "If the email exists, a reset link will be sent."}
