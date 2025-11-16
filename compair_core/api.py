@@ -84,6 +84,18 @@ def _render_email(template: str, **context: str) -> str:
     return rendered
 
 
+def _dispatch_process_document_task(
+    user_id: str,
+    doc_id: str,
+    doc_text: str,
+    generate_feedback: bool,
+):
+    task_callable = getattr(process_document_celery, "delay", None)
+    if callable(task_callable):
+        return task_callable(user_id, doc_id, doc_text, generate_feedback)
+    return process_document_celery(user_id, doc_id, doc_text, generate_feedback)
+
+
 def _ensure_single_user(session: Session, settings: Settings) -> models.User:
     """Create or fetch the singleton user used when authentication is disabled."""
     changed = False
@@ -215,7 +227,7 @@ HAS_REDIS = redis_client is not None
 
 
 def require_feature(flag: bool, feature: str) -> None:
-    if not flag:
+    if not flag and not IS_CLOUD:
         raise HTTPException(status_code=501, detail=f"{feature} is only available in the Compair Cloud edition.")
 
 def get_current_user(auth_token: str | None = Header(None)):
@@ -543,7 +555,7 @@ def load_user_status(
 def load_user_status(
     current_user: models.User = Depends(get_current_user)
 ) -> datetime:
-    if not (HAS_TRIALS or HAS_BILLING):
+    if not (HAS_TRIALS or HAS_BILLING) and not IS_CLOUD:
         raise HTTPException(status_code=501, detail="User status dates are only tracked in the Compair Cloud edition.")
     with compair.Session() as session:
         user_status = current_user.status
@@ -564,7 +576,7 @@ def load_user_status(
 def load_referral_credits(
     current_user: models.User = Depends(get_current_user)
 ) -> Tuple[int, int]:
-    if not HAS_REFERRALS:
+    if not HAS_REFERRALS and not IS_CLOUD:
         raise HTTPException(status_code=501, detail="Referral credits are only available in the Compair Cloud edition.")
     with compair.Session() as session:
         referral_credits_earned = current_user.referral_credits
@@ -1623,22 +1635,13 @@ async def process_doc(
         if current_user.status == "suspended":
             generate_feedback=False
 
-    if IS_CLOUD:
-        task = process_document_celery.delay(
-            user_id=current_user.user_id,
-            doc_id=doc_id,
-            doc_text=doc_text,
-            generate_feedback=generate_feedback
-        )
-        task_id = task.id
-    else:
-        process_document_celery(
-            user_id=current_user.user_id,
-            doc_id=doc_id,
-            doc_text=doc_text,
-            generate_feedback=generate_feedback
-        )
-        task_id = None
+    task_result = _dispatch_process_document_task(
+        user_id=current_user.user_id,
+        doc_id=doc_id,
+        doc_text=doc_text,
+        generate_feedback=generate_feedback,
+    )
+    task_id = getattr(task_result, "id", None)
 
     if generate_feedback:
         try:
