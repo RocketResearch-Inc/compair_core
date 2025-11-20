@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import sessionmaker
@@ -33,8 +34,9 @@ if edition == "cloud":
         tasks = cloud_tasks
         utils = cloud_utils
         initialize_database_override = getattr(cloud_bootstrap, "initialize_database", None)
-    except ImportError:
-        pass
+    except Exception as exc:
+        print(f"[compair_core] Failed to import compair_cloud: {exc}", file=sys.stderr)
+        import traceback; traceback.print_exc()
 
 
 def _handle_engine() -> Engine:
