@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from typing import Mapping
 
+logger = logging.getLogger(__name__)
+
 try:
     from compair_cloud.tasks import (  # type: ignore
         process_document_task,
@@ -15,7 +17,13 @@ try:
         send_help_request_email,
         send_daily_usage_report,
     )
-except (ImportError, ModuleNotFoundError):
+except (ImportError, ModuleNotFoundError) as exc:
+    logger.warning(
+        "Failed to import compair_cloud.tasks; using core task implementations. (%s: %s)",
+        exc.__class__.__name__,
+        exc,
+        exc_info=exc,
+    )
     from sqlalchemy.orm import joinedload
 
     def _lazy_components():

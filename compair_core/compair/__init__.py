@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import os
 import sys
-from pathlib import Path
-from sqlalchemy import Engine, create_engine
-from sqlalchemy.orm import sessionmaker
 
 from . import embeddings, feedback, logger, main, models, tasks, utils
+from compair_core.db import SessionLocal as Session
+from compair_core.db import engine
 from .default_groups import initialize_default_groups
 
 edition = os.getenv("COMPAIR_EDITION", "core").lower()
@@ -39,54 +38,6 @@ if edition == "cloud":
         import traceback; traceback.print_exc()
 
 
-def _handle_engine() -> Engine:
-    # Preferred configuration: explicit database URL
-    explicit_url = (
-        os.getenv("COMPAIR_DATABASE_URL")
-        or os.getenv("COMPAIR_DB_URL")
-        or os.getenv("DATABASE_URL")
-    )
-    if explicit_url:
-        if explicit_url.startswith("sqlite:"):
-            return create_engine(explicit_url, connect_args={"check_same_thread": False})
-        return create_engine(explicit_url)
-
-    # Backwards compatibility with legacy Postgres env variables
-    db = os.getenv("DB")
-    db_user = os.getenv("DB_USER")
-    db_passw = os.getenv("DB_PASSW")
-    db_host = os.getenv("DB_URL")
-
-    if all([db, db_user, db_passw, db_host]):
-        return create_engine(
-            f"postgresql+psycopg2://{db_user}:{db_passw}@{db_host}/{db}",
-            pool_size=10,
-            max_overflow=0,
-        )
-
-    # Local default: place an SQLite database inside COMPAIR_DB_DIR
-    db_dir = (
-        os.getenv("COMPAIR_DB_DIR")
-        or os.getenv("COMPAIR_SQLITE_DIR")
-        or os.path.join(Path.home(), ".compair-core", "data")
-    )
-    db_name = os.getenv("COMPAIR_DB_NAME") or os.getenv("COMPAIR_SQLITE_NAME") or "compair.db"
-
-    db_path = Path(db_dir).expanduser()
-    try:
-        db_path.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        fallback_dir = Path(os.getcwd()) / "compair_data"
-        fallback_dir.mkdir(parents=True, exist_ok=True)
-        db_path = fallback_dir
-
-    sqlite_path = db_path / db_name
-    return create_engine(
-        f"sqlite:///{sqlite_path}",
-        connect_args={"check_same_thread": False},
-    )
-
-
 def initialize_database() -> None:
     models.Base.metadata.create_all(engine)
     if initialize_database_override:
@@ -98,9 +49,7 @@ def _initialize_defaults() -> None:
         initialize_default_groups(session)
 
 
-engine = _handle_engine()
 initialize_database()
-Session = sessionmaker(engine)
 embedder = embeddings.Embedder()
 reviewer = feedback.Reviewer()
 _initialize_defaults()
