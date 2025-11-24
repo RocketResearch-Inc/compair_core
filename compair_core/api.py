@@ -1390,6 +1390,7 @@ def update_doc(
     datetime_created: datetime = Form(None),
     group_ids: list[str] = Form(None),
     image_url: str = Form(None),
+    is_published: str = Form(None),
     current_user: models.User = Depends(get_current_user)
 ):
     print('In update doc')
@@ -1417,6 +1418,8 @@ def update_doc(
                 print(f'New groups here? {doc.groups}')
             if image_url is not None:
                 doc.image_url = image_url
+            if is_published is not None:
+                doc.is_published = str(is_published).lower() == "true"
             session.commit()
 
 
@@ -1860,6 +1863,16 @@ def list_document_feedback(
         q = (
             session.query(models.Feedback)
             .join(models.Chunk, models.Feedback.source_chunk_id == models.Chunk.chunk_id)
+            .options(
+                joinedload(models.Feedback.chunk)
+                .joinedload(models.Chunk.references)
+                .joinedload(models.Reference.document)
+                .joinedload(models.Document.user),
+                joinedload(models.Feedback.chunk)
+                .joinedload(models.Chunk.references)
+                .joinedload(models.Reference.note)
+                .joinedload(models.Note.author),
+            )
             .filter(models.Chunk.document_id == document_id)
             .order_by(models.Feedback.timestamp.desc())
         )
@@ -1871,9 +1884,23 @@ def list_document_feedback(
                 {
                     "feedback_id": f.feedback_id,
                     "chunk_id": f.source_chunk_id,
+                    "chunk_content": getattr(f.chunk, "content", None),
                     "feedback": f.feedback,
                     "user_feedback": f.user_feedback,
                     "timestamp": f.timestamp,
+                    "references": [
+                        {
+                            "reference_id": ref.reference_id,
+                            "type": ref.reference_type,
+                            "title": getattr(ref.document, "title", None) if ref.document else getattr(ref.note, "title", None),
+                            "author": (
+                                getattr(getattr(ref.document, "user", None), "name", None)
+                                if ref.document else getattr(getattr(ref.note, "author", None), "name", None)
+                            ),
+                            "content": getattr(ref.document, "content", None) if ref.document else getattr(ref.note, "content", None),
+                        }
+                        for ref in getattr(f.chunk, "references", []) or []
+                    ],
                 } for f in rows
             ],
         }
