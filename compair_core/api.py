@@ -2432,7 +2432,7 @@ def get_feedback_tooltip(
 
 @router.get("/get_activity_feed")
 def get_activity_feed(
-    user_id: str, 
+    user_id: Optional[str] = None, 
     page: int = 1, 
     page_size: int = 10, 
     include_own_activities: bool = True,
@@ -2443,7 +2443,8 @@ def get_activity_feed(
     if not IS_CLOUD:
         raise HTTPException(status_code=501, detail="Activity feed is only available in the Compair Cloud edition.")
     with compair.Session() as session:
-        # Get user's groups
+        # Default to current user if none provided
+        user_id = user_id or current_user.user_id
         
         # Query recent activities related to user's groups
         group_ids = [g.group_id for g in current_user.groups]
