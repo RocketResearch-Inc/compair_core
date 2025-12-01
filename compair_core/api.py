@@ -2487,10 +2487,14 @@ def delete_group(
 ):
     """Delete a group. Allowed only if the current user is an admin of the group.
 
-    This removes the group and its associations. Documents remain but lose their link to this group.
+    This removes the group and cascades documents that only belong to this group.
     """
     with compair.Session() as session:
-        group = session.query(models.Group).filter(models.Group.group_id == group_id).first()
+        group = (
+            session.query(models.Group)
+            .filter(models.Group.group_id == group_id)
+            .first()
+        )
         if not group:
             raise HTTPException(status_code=404, detail="Group not found")
         # Check admin rights
@@ -2498,6 +2502,10 @@ def delete_group(
         if not is_admin:
             raise HTTPException(status_code=403, detail="Not authorized to delete this group")
         name = group.name
+        # Delete documents that belong only to this group
+        docs_to_delete = [d for d in group.documents if len(d.groups) == 1]
+        for doc in docs_to_delete:
+            session.delete(doc)
         session.delete(group)
         session.commit()
         # Log activity
