@@ -2480,6 +2480,135 @@ def get_activity_feed(
             "total_count": total_count
         }
 
+
+def _serialize_notification_event(event: Any) -> dict[str, Any]:
+    return {
+        "event_id": event.event_id,
+        "user_id": event.user_id,
+        "group_id": event.group_id,
+        "intent": event.intent,
+        "dedupe_key": event.dedupe_key,
+        "target_doc_id": event.target_doc_id,
+        "target_chunk_id": event.target_chunk_id,
+        "peer_doc_ids": event.peer_doc_ids or [],
+        "relevance": event.relevance,
+        "novelty": event.novelty,
+        "severity": event.severity,
+        "certainty": event.certainty,
+        "delivery_action": event.delivery_action,
+        "channel": event.channel,
+        "parse_mode": event.parse_mode,
+        "model": event.model,
+        "run_id": event.run_id,
+        "digest_bucket": event.digest_bucket,
+        "rationale": event.rationale or [],
+        "evidence_target": event.evidence_target,
+        "evidence_peer": event.evidence_peer,
+        "created_at": event.created_at,
+        "delivered_at": event.delivered_at,
+        "acknowledged_at": event.acknowledged_at,
+        "dismissed_at": getattr(event, "dismissed_at", None),
+    }
+
+
+@router.get("/notification_events")
+def get_notification_events(
+    group_id: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+    include_acknowledged: bool = False,
+    include_dismissed: bool = False,
+    current_user: models.User = Depends(get_current_user),
+):
+    if not IS_CLOUD:
+        raise HTTPException(status_code=501, detail="Notifications are only available in the Compair Cloud edition.")
+    with compair.Session() as session:
+        group_ids = [g.group_id for g in current_user.groups]
+        q = session.query(models.NotificationEvent).filter(
+            models.NotificationEvent.user_id == current_user.user_id
+        )
+        if group_ids:
+            q = q.filter(models.NotificationEvent.group_id.in_(group_ids))
+        if group_id:
+            if group_id not in group_ids:
+                raise HTTPException(status_code=403, detail="Not authorized for this group.")
+            q = q.filter(models.NotificationEvent.group_id == group_id)
+        if not include_acknowledged:
+            q = q.filter(models.NotificationEvent.acknowledged_at.is_(None))
+        if not include_dismissed:
+            q = q.filter(models.NotificationEvent.dismissed_at.is_(None))
+
+        total_count = q.count()
+        offset = (page - 1) * page_size
+        events = q.order_by(models.NotificationEvent.created_at.desc()).offset(offset).limit(page_size).all()
+
+        return {
+            "events": [_serialize_notification_event(event) for event in events],
+            "total_count": total_count,
+        }
+
+
+@router.post("/notification_events/{event_id}/acknowledge")
+def acknowledge_notification_event(
+    event_id: str,
+    current_user: models.User = Depends(get_current_user),
+):
+    if not IS_CLOUD:
+        raise HTTPException(status_code=501, detail="Notifications are only available in the Compair Cloud edition.")
+    with compair.Session() as session:
+        event = (
+            session.query(models.NotificationEvent)
+            .filter(models.NotificationEvent.event_id == event_id)
+            .first()
+        )
+        if not event:
+            raise HTTPException(status_code=404, detail="Notification event not found.")
+        if event.user_id != current_user.user_id:
+            raise HTTPException(status_code=403, detail="Not authorized for this event.")
+        group_ids = [g.group_id for g in current_user.groups]
+        if event.group_id not in group_ids:
+            raise HTTPException(status_code=403, detail="Not authorized for this group.")
+
+        event.acknowledged_at = datetime.now(timezone.utc)
+        session.commit()
+        return {
+            "event_id": event.event_id,
+            "acknowledged_at": event.acknowledged_at,
+        }
+
+
+@router.post("/notification_events/{event_id}/dismiss")
+def dismiss_notification_event(
+    event_id: str,
+    current_user: models.User = Depends(get_current_user),
+):
+    if not IS_CLOUD:
+        raise HTTPException(status_code=501, detail="Notifications are only available in the Compair Cloud edition.")
+    with compair.Session() as session:
+        event = (
+            session.query(models.NotificationEvent)
+            .filter(models.NotificationEvent.event_id == event_id)
+            .first()
+        )
+        if not event:
+            raise HTTPException(status_code=404, detail="Notification event not found.")
+        if event.user_id != current_user.user_id:
+            raise HTTPException(status_code=403, detail="Not authorized for this event.")
+        group_ids = [g.group_id for g in current_user.groups]
+        if event.group_id not in group_ids:
+            raise HTTPException(status_code=403, detail="Not authorized for this group.")
+
+        now = datetime.now(timezone.utc)
+        event.dismissed_at = now
+        if event.acknowledged_at is None:
+            event.acknowledged_at = now
+        session.commit()
+        return {
+            "event_id": event.event_id,
+            "dismissed_at": event.dismissed_at,
+            "acknowledged_at": event.acknowledged_at,
+        }
+
 @router.delete("/delete_group")
 def delete_group(
     group_id: str,
