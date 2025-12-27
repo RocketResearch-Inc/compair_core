@@ -284,6 +284,7 @@ class Document(BaseObject):
     datetime_created: Mapped[datetime]
     datetime_modified: Mapped[datetime]
     embedding: Mapped[list[float] | None] = _embedding_column()
+    topic_tags: Mapped[list[str] | None] = mapped_column(JSON, nullable=True, default=None)
     file_key: Mapped[str | None] = mapped_column(String, nullable=True, default=None)
     image_key: Mapped[str | None] = mapped_column(String, nullable=True, default=None)
     is_published: Mapped[bool] = mapped_column(Boolean, default=False)

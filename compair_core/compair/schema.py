@@ -70,6 +70,7 @@ class Document(BaseModel):
     is_published: bool
     file_key: Optional[str] = None
     image_key: Optional[str] = None
+    topic_tags: Optional[list[str]] = None
 
     model_config = {"from_attributes": True}
 

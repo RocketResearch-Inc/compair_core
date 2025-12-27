@@ -23,6 +23,7 @@ from .models import (
     VECTOR_BACKEND,
     cosine_similarity,
 )
+from .topic_tags import extract_topic_tags
 from .utils import chunk_text, log_activity
 
 
@@ -56,6 +57,7 @@ def process_document(
     ).count()
 
     content = doc.content
+    doc.topic_tags = extract_topic_tags(content)
     chunks = chunk_text(content)
     new_chunks = list(set(chunks) - set(prev_chunks))
 

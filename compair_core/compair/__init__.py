@@ -38,8 +38,26 @@ if edition == "cloud":
         import traceback; traceback.print_exc()
 
 
+def _ensure_topic_tags_column() -> None:
+    try:
+        from sqlalchemy import inspect, text
+
+        insp = inspect(engine)
+        if "document" not in insp.get_table_names():
+            return
+        cols = {c["name"] for c in insp.get_columns("document")}
+        if "topic_tags" in cols:
+            return
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE document ADD COLUMN topic_tags JSON"))
+    except Exception as exc:
+        print(f"[compair_core] topic_tags migration skipped: {exc}", file=sys.stderr)
+
+
 def initialize_database() -> None:
     models.Base.metadata.create_all(engine)
+    if edition == "core":
+        _ensure_topic_tags_column()
     if initialize_database_override:
         initialize_database_override(engine)
 
