@@ -33,8 +33,9 @@ except (ImportError, ModuleNotFoundError) as exc:
         from .logger import log_event
         from .main import process_document
         from .models import Document, User
+        from .topic_tags import extract_topic_tags
 
-        return SessionMaker, Embedder, Reviewer, log_event, process_document, Document, User
+        return SessionMaker, Embedder, Reviewer, log_event, process_document, Document, User, extract_topic_tags
 
     logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ except (ImportError, ModuleNotFoundError) as exc:
         doc_text: str,
         generate_feedback: bool = True,
     ) -> Mapping[str, list[str]]:
-        SessionMaker, Embedder, Reviewer, log_event, process_document, Document, User = _lazy_components()
+        SessionMaker, Embedder, Reviewer, log_event, process_document, Document, User, extract_topic_tags = _lazy_components()
         with SessionMaker() as session:
             user = session.query(User).filter(User.user_id == user_id).first()
             if not user:
@@ -62,6 +63,7 @@ except (ImportError, ModuleNotFoundError) as exc:
                 return {"chunk_task_ids": []}
 
             doc.content = doc_text
+            doc.topic_tags = extract_topic_tags(doc_text)
             session.add(doc)
 
             embedder = Embedder()

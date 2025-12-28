@@ -1892,6 +1892,8 @@ def list_document_feedback(
                         {
                             "reference_id": ref.reference_id,
                             "type": ref.reference_type,
+                            "document_id": ref.reference_document_id,
+                            "note_id": ref.reference_note_id,
                             "title": getattr(ref.document, "title", None) if ref.document else getattr(ref.note, "title", None),
                             "author": (
                                 getattr(getattr(ref.document, "user", None), "name", None)
@@ -2608,6 +2610,99 @@ def dismiss_notification_event(
             "dismissed_at": event.dismissed_at,
             "acknowledged_at": event.acknowledged_at,
         }
+
+
+@router.post("/notification_events/{event_id}/share")
+def share_notification_event(
+    event_id: str,
+    note: Optional[str] = Body(default=None, embed=True),
+    current_user: models.User = Depends(get_current_user),
+):
+    if not IS_CLOUD:
+        raise HTTPException(status_code=501, detail="Notifications are only available in the Compair Cloud edition.")
+    with compair.Session() as session:
+        event = (
+            session.query(models.NotificationEvent)
+            .filter(models.NotificationEvent.event_id == event_id)
+            .first()
+        )
+        if not event:
+            raise HTTPException(status_code=404, detail="Notification event not found.")
+        if event.user_id != current_user.user_id:
+            raise HTTPException(status_code=403, detail="Not authorized for this event.")
+        group_ids = [g.group_id for g in current_user.groups]
+        if event.group_id not in group_ids:
+            raise HTTPException(status_code=403, detail="Not authorized for this group.")
+
+        group = (
+            session.query(models.Group)
+            .options(joinedload(models.Group.users))
+            .filter(models.Group.group_id == event.group_id)
+            .first()
+        )
+        if not group:
+            raise HTTPException(status_code=404, detail="Group not found.")
+
+        note_clean = (note or "").strip()
+        if note_clean:
+            note_clean = note_clean[:240]
+
+        sharer_name = current_user.name or current_user.username or "Teammate"
+        rationale: list[str] = [f"Shared by {sharer_name}."]
+        if note_clean:
+            rationale.append(note_clean)
+        if event.rationale:
+            for r in event.rationale:
+                if r and r.strip():
+                    rationale.append(r.strip())
+                if len(rationale) >= 4:
+                    break
+
+        shared = 0
+        skipped = 0
+        for member in group.users:
+            if member.user_id == current_user.user_id:
+                continue
+            dedupe_key = f"share:{event.event_id}:{member.user_id}"
+            exists = (
+                session.query(models.NotificationEvent.event_id)
+                .filter(
+                    models.NotificationEvent.user_id == member.user_id,
+                    models.NotificationEvent.dedupe_key == dedupe_key,
+                )
+                .first()
+            )
+            if exists:
+                skipped += 1
+                continue
+            share_event = models.NotificationEvent(
+                user_id=member.user_id,
+                group_id=event.group_id,
+                dedupe_key=dedupe_key,
+                intent=event.intent or "relevant_update",
+                relevance=event.relevance or "MEDIUM",
+                novelty=event.novelty or "LOW",
+                severity=event.severity or "LOW",
+                certainty=event.certainty or "MEDIUM",
+                parse_mode="shared",
+                delivery_action="digest",
+                target_doc_id=event.target_doc_id,
+                target_chunk_id=event.target_chunk_id,
+                peer_doc_ids=event.peer_doc_ids or [],
+                channel="inbox_only",
+                model=event.model,
+                run_id=f"share:{event.event_id}",
+                digest_bucket=event.digest_bucket or "general",
+                rationale=rationale,
+                evidence_target=event.evidence_target,
+                evidence_peer=event.evidence_peer,
+                created_at=datetime.now(timezone.utc),
+            )
+            session.add(share_event)
+            shared += 1
+
+        session.commit()
+        return {"shared_count": shared, "skipped": skipped}
 
 @router.delete("/delete_group")
 def delete_group(
