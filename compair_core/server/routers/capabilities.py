@@ -1,9 +1,11 @@
 """Meta endpoints that describe edition capabilities for the CLI."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import text
 
 from ..settings import Settings, get_settings
+from ...db import engine
 
 router = APIRouter(tags=["meta"])
 
@@ -43,4 +45,18 @@ def capabilities(settings: Settings = Depends(get_settings)) -> dict[str, object
         "server": "Compair Cloud" if edition == "cloud" else "Compair Core",
         "version": settings.version,
         "legacy_routes": settings.include_legacy_routes,
+    }
+
+
+@router.get("/health")
+def health(settings: Settings = Depends(get_settings)) -> dict[str, object]:
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="database_unavailable") from exc
+    return {
+        "status": "ok",
+        "edition": settings.edition,
+        "version": settings.version,
     }
