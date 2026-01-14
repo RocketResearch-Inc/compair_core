@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Mapping
+from typing import Mapping, Optional
 
 import Levenshtein
 from sqlalchemy import select
@@ -24,7 +24,12 @@ from .models import (
     cosine_similarity,
 )
 from .topic_tags import extract_topic_tags
-from .utils import chunk_text, log_activity
+from .utils import (
+    chunk_text_with_mode,
+    count_tokens,
+    log_activity,
+    stable_chunk_hash,
+)
 
 
 def process_document(
@@ -34,13 +39,14 @@ def process_document(
     reviewer: Reviewer,
     doc: Document,
     generate_feedback: bool = True,
+    chunk_mode: Optional[str] = None,
 ) -> Mapping[str, int]:
     new = False
 
     prev_content = get_history(doc, "content").deleted
     prev_chunks: list[str] = []
     if prev_content:
-        prev_chunks = chunk_text(prev_content[-1])
+        prev_chunks = chunk_text_with_mode(prev_content[-1], chunk_mode=chunk_mode)
 
     feedback_limit_env = os.getenv("COMPAIR_CORE_FEEDBACK_LIMIT")
     try:
@@ -58,12 +64,27 @@ def process_document(
 
     content = doc.content
     doc.topic_tags = extract_topic_tags(content)
-    chunks = chunk_text(content)
-    new_chunks = list(set(chunks) - set(prev_chunks))
+    chunks = chunk_text_with_mode(content, chunk_mode=chunk_mode)
+    prev_set = set(prev_chunks)
+    new_chunks = [c for c in chunks if c not in prev_set]
 
     prioritized_chunk_indices: list[int] = []
     if generate_feedback:
         prioritized_chunk_indices = detect_significant_edits(prev_chunks=prev_chunks, new_chunks=new_chunks)
+
+    feedback_min_tokens = int(os.getenv("COMPAIR_FEEDBACK_MIN_TOKENS", "120"))
+    feedback_fallback_min = int(os.getenv("COMPAIR_FEEDBACK_MIN_TOKENS_FALLBACK", "20"))
+    token_lens = [count_tokens(c) for c in new_chunks]
+    eligible_indices = [i for i, t in enumerate(token_lens) if t >= feedback_min_tokens]
+    if generate_feedback and feedback_min_tokens > 0:
+        prioritized_chunk_indices = [i for i in prioritized_chunk_indices if i in eligible_indices]
+        if not prioritized_chunk_indices and eligible_indices:
+            fallback_idx = max(eligible_indices, key=lambda idx: token_lens[idx])
+            prioritized_chunk_indices = [fallback_idx]
+        elif not eligible_indices and new_chunks:
+            fallback_idx = max(range(len(token_lens)), key=lambda idx: token_lens[idx])
+            if token_lens[fallback_idx] >= feedback_fallback_min:
+                prioritized_chunk_indices = [fallback_idx]
 
     if feedback_limit is None:
         indices_to_generate_feedback = prioritized_chunk_indices
@@ -82,8 +103,8 @@ def process_document(
             generate_feedback=should_generate_feedback,
         )
 
-    remove_chunks = set(prev_chunks) - set(chunks)
-    for chunk in remove_chunks:
+    removed = [c for c in prev_chunks if c not in set(chunks)]
+    for chunk in removed:
         remove_text(session=session, text=chunk, document_id=doc.document_id)
 
     if doc.groups:
@@ -106,27 +127,19 @@ def detect_significant_edits(
     new_chunks: list[str],
     threshold: float = 0.5,
 ) -> list[int]:
-    prev_set = set(prev_chunks)
-    new_set = set(new_chunks)
-
-    unchanged_chunks = prev_set & new_set
-    new_chunks_to_check = new_set - unchanged_chunks
-
-    process_chunks: list[str] = []
-    for new_chunk in new_chunks_to_check:
+    if not new_chunks:
+        return []
+    if not prev_chunks:
+        return list(range(len(new_chunks)))
+    candidate_indices: list[int] = []
+    for idx, new_chunk in enumerate(new_chunks):
+        if new_chunk in prev_chunks:
+            continue
         best_match = max((Levenshtein.ratio(new_chunk, prev_chunk) for prev_chunk in prev_chunks), default=0.0)
         if best_match < threshold:
-            process_chunks.append(new_chunk)
-
-    prioritized_chunks = prioritize_chunks(process_chunks)
-    return [new_chunks.index(new_chunk) for new_chunk in prioritized_chunks if new_chunk in new_chunks]
-
-
-def prioritize_chunks(chunks: list[str], limit: int | None = None) -> list[str]:
-    limit = limit or len(chunks)
-    indexed_chunks = [(chunk, idx) for idx, chunk in enumerate(chunks)]
-    indexed_chunks.sort(key=lambda x: (-len(x[0]), x[1]))
-    return [chunk for chunk, _ in indexed_chunks[:limit]]
+            candidate_indices.append(idx)
+    candidate_indices.sort(key=lambda i: (-len(new_chunks[i]), i))
+    return candidate_indices
 
 
 def process_text(
@@ -139,21 +152,23 @@ def process_text(
     note: Note | None = None,
 ) -> None:
     logger = logging.getLogger(__name__)
-    chunk_hash = hash(text)
+    chunk_hash = stable_chunk_hash(text)
 
     chunk_type = "note" if note else "document"
     note_id = note.note_id if note else None
 
     existing_chunks = session.query(Chunk).filter(
-        Chunk.hash == str(chunk_hash),
         Chunk.document_id == doc.document_id,
         Chunk.chunk_type == chunk_type,
         Chunk.note_id == note_id,
+        Chunk.content == text,
     )
 
     user = session.query(User).filter(User.user_id == doc.author_id).first()
     if existing_chunks.first():
         for chunk in existing_chunks:
+            if chunk.hash != chunk_hash:
+                chunk.hash = chunk_hash
             if chunk.embedding is None:
                 embedding = create_embedding(embedder, text, user=user)
                 existing_chunks.update({"embedding": embedding})
@@ -173,9 +188,9 @@ def process_text(
         existing_chunk = chunk
     existing_chunk = session.query(Chunk).filter(
         Chunk.document_id == doc.document_id,
-        Chunk.hash == str(chunk_hash),
         Chunk.chunk_type == chunk_type,
         Chunk.note_id == note_id,
+        Chunk.content == text,
     ).first()
 
     references: list[Chunk] = []
@@ -228,6 +243,8 @@ def process_text(
         if sql_references:
             session.add_all(sql_references)
             session.commit()
+        if not references:
+            return
 
         feedback = get_feedback(reviewer, doc, text, references, user)
         if feedback != "NONE":
@@ -254,11 +271,10 @@ def get_all_chunks_for_document(session: SASession, doc: Document) -> list[Chunk
     note_chunks: list[Chunk] = []
     notes = session.query(Note).filter(Note.document_id == doc.document_id).all()
     for note in notes:
-        note_text_chunks = chunk_text(note.content)
+        note_text_chunks = chunk_text_with_mode(note.content)
         for text in note_text_chunks:
-            chunk_hash = hash(text)
+            chunk_hash = stable_chunk_hash(text)
             existing = session.query(Chunk).filter(
-                Chunk.hash == str(chunk_hash),
                 Chunk.document_id == doc.document_id,
                 Chunk.content == text,
             ).first()
@@ -274,5 +290,8 @@ def get_all_chunks_for_document(session: SASession, doc: Document) -> list[Chunk
                 session.commit()
                 note_chunks.append(note_chunk)
             else:
+                if existing.hash != chunk_hash:
+                    existing.hash = chunk_hash
+                    session.commit()
                 note_chunks.append(existing)
     return doc_chunks + note_chunks

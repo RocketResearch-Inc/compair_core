@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     single_user_username: str = "compair-local@example.com"
     single_user_name: str = "Compair Local User"
     include_legacy_routes: bool = False
+    cors_allow_origins: str | None = None
 
     # Core/local storage defaults
     local_upload_dir: str = "~/.compair-core/data/uploads"

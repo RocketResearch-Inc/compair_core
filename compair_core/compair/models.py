@@ -414,6 +414,45 @@ class Activity(Base):
     group = relationship("Group", back_populates="activities")
 
 
+class MarketingContact(Base):
+    __tablename__ = "marketing_contact"
+
+    contact_id: Mapped[int] = mapped_column(Identity(), primary_key=True, init=False, autoincrement=True)
+    name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    email: Mapped[str] = mapped_column(String(256))
+    subject: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    message: Mapped[str] = mapped_column(Text)
+    context: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    datetime_created: Mapped[datetime] = mapped_column(DateTime, default=datetime.now(timezone.utc))
+
+
+class WaitlistSignup(Base):
+    __tablename__ = "waitlist_signup"
+
+    signup_id: Mapped[int] = mapped_column(Identity(), primary_key=True, init=False, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(256))
+    name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    platforms: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    context: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    datetime_created: Mapped[datetime] = mapped_column(DateTime, default=datetime.now(timezone.utc))
+
+
+class RoadmapPollVote(Base):
+    __tablename__ = "roadmap_poll_vote"
+
+    vote_id: Mapped[int] = mapped_column(Identity(), primary_key=True, init=False, autoincrement=True)
+    integration: Mapped[str] = mapped_column(String(64))
+    email: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    context: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    datetime_created: Mapped[datetime] = mapped_column(DateTime, default=datetime.now(timezone.utc))
+
+
 user_to_group_table = Table(
     "user_to_group",
     Base.metadata,

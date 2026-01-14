@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from .deps import (
     get_analytics,
@@ -20,6 +21,13 @@ def _normalize_edition(value: str) -> str:
     return (value or "core").lower()
 
 
+def _parse_cors_origins(value: str | None) -> list[str]:
+    if not value:
+        return []
+    origins = [item.strip() for item in value.split(",")]
+    return [origin for origin in origins if origin]
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Instantiate the FastAPI application with edition-specific wiring."""
 
@@ -27,6 +35,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     edition = _normalize_edition(resolved_settings.edition)
 
     app = FastAPI(title="Compair API", version=resolved_settings.version)
+
+    cors_origins = _parse_cors_origins(resolved_settings.cors_allow_origins)
+    if cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=cors_origins,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 
     from ..api import core_router, router as legacy_router
 

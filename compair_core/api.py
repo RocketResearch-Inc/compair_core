@@ -57,6 +57,47 @@ redis_url = _getenv("COMPAIR_REDIS_URL", "REDIS_URL")
 redis_client = redis.Redis.from_url(redis_url) if (redis and redis_url) else None
 #from compair.main import process_document
 
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _clean_text(value: Optional[str], max_len: int) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    return cleaned[:max_len]
+
+
+def _clean_email(value: Optional[str]) -> Optional[str]:
+    cleaned = _clean_text(value, 256)
+    if not cleaned:
+        return None
+    if not _EMAIL_RE.match(cleaned):
+        return None
+    return cleaned
+
+
+def _purge_notification_events_for_docs(session: Session, doc_ids: list[str]) -> int:
+    notification_model = getattr(models, "NotificationEvent", None)
+    if not notification_model or not doc_ids:
+        return 0
+    clauses = [notification_model.target_doc_id.in_(doc_ids)]
+    peer_clauses = []
+    if hasattr(notification_model, "peer_doc_ids"):
+        for doc_id in doc_ids:
+            peer_clauses.append(notification_model.peer_doc_ids.contains([doc_id]))
+    if peer_clauses:
+        clauses.append(or_(*peer_clauses))
+    q = session.query(notification_model).filter(or_(*clauses))
+    deleted = q.count()
+    q.delete(synchronize_session=False)
+    return deleted
+
+
+def _request_source(request: Request) -> Optional[str]:
+    return request.headers.get("referer") or request.headers.get("origin")
+
 router = APIRouter()
 core_router = APIRouter()
 WEB_URL = os.environ.get("WEB_URL")
@@ -89,11 +130,18 @@ def _dispatch_process_document_task(
     doc_id: str,
     doc_text: str,
     generate_feedback: bool,
+    chunk_mode: Optional[str] = None,
 ):
     task_callable = getattr(process_document_celery, "delay", None)
     if callable(task_callable):
-        return task_callable(user_id, doc_id, doc_text, generate_feedback)
-    return process_document_celery(user_id, doc_id, doc_text, generate_feedback)
+        try:
+            return task_callable(user_id, doc_id, doc_text, generate_feedback, chunk_mode)
+        except TypeError:
+            return task_callable(user_id, doc_id, doc_text, generate_feedback)
+    try:
+        return process_document_celery(user_id, doc_id, doc_text, generate_feedback, chunk_mode)
+    except TypeError:
+        return process_document_celery(user_id, doc_id, doc_text, generate_feedback)
 
 
 def _ensure_single_user(session: Session, settings: Settings) -> models.User:
@@ -1584,6 +1632,7 @@ def delete_docs(
                 object_type="document"
             )
 
+        _purge_notification_events_for_docs(session, doc_ids)
         documents.delete()
         session.commit()
 
@@ -1605,6 +1654,7 @@ def delete_doc(
         group_id = doc_group.group_id
         doc_name = document[0].title
 
+        _purge_notification_events_for_docs(session, [doc_id])
         document.delete()
         session.commit()
 
@@ -1624,6 +1674,7 @@ async def process_doc(
     doc_id: str = Form(...),
     doc_text: str = Form(...),
     generate_feedback: bool = Form(True),
+    chunk_mode: Optional[str] = Form(None),
     current_user: models.User = Depends(get_current_user),
     analytics: Analytics = Depends(get_analytics),
 ) -> Mapping[str, str | None]:
@@ -1643,6 +1694,7 @@ async def process_doc(
         doc_id=doc_id,
         doc_text=doc_text,
         generate_feedback=generate_feedback,
+        chunk_mode=chunk_mode,
     )
     task_id = getattr(task_result, "id", None)
 
@@ -3767,6 +3819,104 @@ def download_document_file(
                 "Content-Disposition": f"attachment; filename={safe_title or 'file'}"
             }
         )
+
+
+@router.post("/marketing/contact")
+def submit_marketing_contact(
+    request: Request,
+    name: Optional[str] = Form(None),
+    email: str = Form(...),
+    subject: Optional[str] = Form(None),
+    message: str = Form(...),
+    context: Optional[str] = Form(None),
+    company: Optional[str] = Form(None),
+):
+    if not IS_CLOUD:
+        raise HTTPException(status_code=501, detail="Marketing endpoints require the Compair Cloud edition.")
+    if company:
+        return {"message": "ok"}
+    email_clean = _clean_email(email)
+    if not email_clean:
+        raise HTTPException(status_code=400, detail="Invalid email.")
+    message_clean = _clean_text(message, 5000)
+    if not message_clean:
+        raise HTTPException(status_code=400, detail="Message is required.")
+    with compair.Session() as session:
+        entry = models.MarketingContact(
+            name=_clean_text(name, 256),
+            email=email_clean,
+            subject=_clean_text(subject, 256),
+            message=message_clean,
+            context=_clean_text(context, 64),
+            source=_request_source(request),
+            user_agent=_clean_text(request.headers.get("user-agent"), 512),
+            datetime_created=datetime.now(timezone.utc),
+        )
+        session.add(entry)
+        session.commit()
+    return {"message": "ok"}
+
+
+@router.post("/marketing/roadmap-poll")
+def submit_roadmap_poll(
+    request: Request,
+    integration: str = Form(...),
+    email: Optional[str] = Form(None),
+    context: Optional[str] = Form(None),
+    company: Optional[str] = Form(None),
+):
+    if not IS_CLOUD:
+        raise HTTPException(status_code=501, detail="Marketing endpoints require the Compair Cloud edition.")
+    if company:
+        return {"message": "ok"}
+    integration_clean = _clean_text(integration, 64)
+    if not integration_clean:
+        raise HTTPException(status_code=400, detail="Integration choice is required.")
+    email_clean = _clean_email(email) if email else None
+    with compair.Session() as session:
+        vote = models.RoadmapPollVote(
+            integration=integration_clean,
+            email=email_clean,
+            context=_clean_text(context, 64),
+            source=_request_source(request),
+            user_agent=_clean_text(request.headers.get("user-agent"), 512),
+            datetime_created=datetime.now(timezone.utc),
+        )
+        session.add(vote)
+        session.commit()
+    return {"message": "ok"}
+
+
+@router.post("/marketing/waitlist")
+def submit_waitlist_signup(
+    request: Request,
+    email: str = Form(...),
+    name: Optional[str] = Form(None),
+    platforms: list[str] = Form([]),
+    context: Optional[str] = Form(None),
+    company: Optional[str] = Form(None),
+):
+    if not IS_CLOUD:
+        raise HTTPException(status_code=501, detail="Marketing endpoints require the Compair Cloud edition.")
+    if company:
+        return {"message": "ok"}
+    email_clean = _clean_email(email)
+    if not email_clean:
+        raise HTTPException(status_code=400, detail="Invalid email.")
+    platforms_clean = ",".join([p.strip() for p in platforms if p and p.strip()])
+    with compair.Session() as session:
+        entry = models.WaitlistSignup(
+            email=email_clean,
+            name=_clean_text(name, 256),
+            platforms=platforms_clean or None,
+            context=_clean_text(context, 64),
+            source=_request_source(request),
+            user_agent=_clean_text(request.headers.get("user-agent"), 512),
+            datetime_created=datetime.now(timezone.utc),
+        )
+        session.add(entry)
+        session.commit()
+    return {"message": "ok"}
 
 
 @router.post("/help-request")

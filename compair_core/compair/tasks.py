@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Mapping
+from typing import Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,7 @@ except (ImportError, ModuleNotFoundError) as exc:
         doc_id: str,
         doc_text: str,
         generate_feedback: bool = True,
+        chunk_mode: Optional[str] = None,
     ) -> Mapping[str, list[str]]:
         SessionMaker, Embedder, Reviewer, log_event, process_document, Document, User, extract_topic_tags = _lazy_components()
         with SessionMaker() as session:
@@ -69,7 +70,15 @@ except (ImportError, ModuleNotFoundError) as exc:
             embedder = Embedder()
             reviewer = Reviewer()
 
-            process_document(user, session, embedder, reviewer, doc, generate_feedback=generate_feedback)
+            process_document(
+                user,
+                session,
+                embedder,
+                reviewer,
+                doc,
+                generate_feedback=generate_feedback,
+                chunk_mode=chunk_mode,
+            )
 
             log_event(
                 "core_document_processed",
