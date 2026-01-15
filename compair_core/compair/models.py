@@ -345,7 +345,7 @@ class Chunk(Base):
     
 
     chunk_id: Mapped[str] = mapped_column(String(36), primary_key=True, init=False, default=lambda: str(uuid4()))
-    hash: Mapped[str] = mapped_column(String(32))
+    hash: Mapped[str] = mapped_column(String(64))
     content: Mapped[str] = mapped_column(Text)
     document_id: Mapped[str | None] = mapped_column(ForeignKey("document.document_id", ondelete="CASCADE"), index=True, nullable=True)
     note_id: Mapped[str | None] = mapped_column(ForeignKey("note.note_id", ondelete="CASCADE"), index=True, nullable=True)
