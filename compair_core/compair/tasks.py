@@ -15,6 +15,7 @@ try:
         send_feature_announcement_task,
         send_deactivate_request_email,
         send_help_request_email,
+        send_waitlist_signup_email,
         send_daily_usage_report,
     )
 except (ImportError, ModuleNotFoundError) as exc:
@@ -109,6 +110,9 @@ except (ImportError, ModuleNotFoundError) as exc:
 
     def send_help_request_email(*args, **kwargs):  # pragma: no cover
         raise RuntimeError("send_help_request_email is only available in the Compair Cloud edition.")
+
+    def send_waitlist_signup_email(*args, **kwargs):  # pragma: no cover
+        raise RuntimeError("send_waitlist_signup_email is only available in the Compair Cloud edition.")
 
     def send_daily_usage_report():  # pragma: no cover
         raise RuntimeError("send_daily_usage_report is only available in the Compair Cloud edition.")

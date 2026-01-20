@@ -14,7 +14,8 @@ from celery.result import AsyncResult
 from fastapi import APIRouter, Body, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.routing import APIRoute
-from sqlalchemy import distinct, func, select, or_
+from sqlalchemy import distinct, func, select, or_, cast
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import joinedload, Session
 
 from .server.deps import get_analytics, get_billing, get_ocr, get_settings_dependency, get_storage
@@ -35,7 +36,13 @@ from .compair_email.templates import (
     PASSWORD_RESET_TEMPLATE, 
     REFERRAL_CREDIT_TEMPLATE
 )
-from .compair.tasks import process_document_task as process_document_celery, send_feature_announcement_task, send_deactivate_request_email, send_help_request_email
+from .compair.tasks import (
+    process_document_task as process_document_celery,
+    send_feature_announcement_task,
+    send_deactivate_request_email,
+    send_help_request_email,
+    send_waitlist_signup_email,
+)
 
 try:
     import redis  # type: ignore
@@ -85,8 +92,14 @@ def _purge_notification_events_for_docs(session: Session, doc_ids: list[str]) ->
     clauses = [notification_model.target_doc_id.in_(doc_ids)]
     peer_clauses = []
     if hasattr(notification_model, "peer_doc_ids"):
+        peer_expr = notification_model.peer_doc_ids
+        try:
+            if session.get_bind() is not None and session.get_bind().dialect.name == "postgresql":
+                peer_expr = cast(notification_model.peer_doc_ids, JSONB)
+        except Exception:
+            pass
         for doc_id in doc_ids:
-            peer_clauses.append(notification_model.peer_doc_ids.contains([doc_id]))
+            peer_clauses.append(peer_expr.contains([doc_id]))
     if peer_clauses:
         clauses.append(or_(*peer_clauses))
     q = session.query(notification_model).filter(or_(*clauses))
@@ -3916,6 +3929,10 @@ def submit_waitlist_signup(
         )
         session.add(entry)
         session.commit()
+        try:
+            send_waitlist_signup_email.delay(entry.signup_id)
+        except Exception:
+            logger.warning("Failed to enqueue waitlist signup email.")
     return {"message": "ok"}
 
 
