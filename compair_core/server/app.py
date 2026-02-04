@@ -78,13 +78,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ImportError as exc:
             print(f"Warning: OCR not available ({exc}). OCR features will be disabled.")
 
-        storage_provider = R2Storage(
-            bucket=resolved_settings.r2_bucket,
-            cdn_base=resolved_settings.r2_cdn_base,
-            access_key=resolved_settings.r2_access_key,
-            secret_key=resolved_settings.r2_secret_key,
-            endpoint_url=resolved_settings.r2_endpoint_url,
-        )
+        # Storage: Use R2 if configured, otherwise fall back to LocalStorage
+        if (resolved_settings.r2_bucket and
+            resolved_settings.r2_access_key and
+            resolved_settings.r2_secret_key):
+            storage_provider = R2Storage(
+                bucket=resolved_settings.r2_bucket,
+                cdn_base=resolved_settings.r2_cdn_base,
+                access_key=resolved_settings.r2_access_key,
+                secret_key=resolved_settings.r2_secret_key,
+                endpoint_url=resolved_settings.r2_endpoint_url,
+            )
+            print("Using R2 storage for cloud mode")
+        else:
+            storage_provider = LocalStorage(
+                base_dir=resolved_settings.local_upload_dir,
+                base_url=resolved_settings.local_upload_base_url,
+            )
+            print("Warning: R2 credentials not configured. Using local storage fallback.")
+
         billing_provider = StripeBilling(
             stripe_key=resolved_settings.stripe_key,
             endpoint_secret=resolved_settings.stripe_endpoint_secret,
