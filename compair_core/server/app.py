@@ -64,12 +64,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             from compair_cloud.analytics.ga4 import GA4Analytics
             from compair_cloud.billing.stripe_provider import StripeBilling
             from compair_cloud.mailer.transactional import TransactionalMailer
-            from compair_cloud.ocr.claude_ocr import ClaudeOCR
             from compair_cloud.storage.r2_storage import R2Storage
         except ImportError as exc:  # pragma: no cover - only triggered in misconfigured builds
             raise RuntimeError(
                 "Cloud edition requires the private 'compair_cloud' package to be installed."
             ) from exc
+
+        # OCR is optional - requires libmagic system library
+        ocr_provider = None
+        try:
+            from compair_cloud.ocr.claude_ocr import ClaudeOCR
+            ocr_provider = ClaudeOCR()
+        except ImportError as exc:
+            print(f"Warning: OCR not available ({exc}). OCR features will be disabled.")
 
         storage_provider = R2Storage(
             bucket=resolved_settings.r2_bucket,
@@ -82,7 +89,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             stripe_key=resolved_settings.stripe_key,
             endpoint_secret=resolved_settings.stripe_endpoint_secret,
         )
-        ocr_provider = ClaudeOCR()
         mailer_provider = TransactionalMailer()
 
         analytics_provider = None
@@ -94,11 +100,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         app.dependency_overrides[get_storage] = lambda sp=storage_provider: sp
         app.dependency_overrides[get_billing] = lambda bp=billing_provider: bp
-        app.dependency_overrides[get_ocr] = lambda op=ocr_provider: op
+        if ocr_provider is not None:
+            app.dependency_overrides[get_ocr] = lambda op=ocr_provider: op
+            object.__setattr__(resolved_settings, "ocr_enabled", True)
+        else:
+            object.__setattr__(resolved_settings, "ocr_enabled", False)
         if analytics_provider is not None:
             app.dependency_overrides[get_analytics] = lambda ap=analytics_provider: ap
         app.dependency_overrides[get_mailer] = lambda mp=mailer_provider: mp
-        object.__setattr__(resolved_settings, "ocr_enabled", True)
 
     else:
         storage_provider = LocalStorage(

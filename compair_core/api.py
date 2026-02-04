@@ -2028,7 +2028,24 @@ def verify_email(token: str):
         if user.token_expiration < datetime.now(timezone.utc):
             raise HTTPException(status_code=400, detail="Token has expired")
         _activate_user_account(session, user, send_group_invites=True)
-        return {"message": "Email verified successfully. Your free trial has started!"}
+        now = datetime.now(tz=timezone.utc)
+        user_session = models.Session(
+            id=secrets.token_urlsafe(),
+            user_id=user.user_id,
+            datetime_created=now,
+            datetime_valid_until=now + timedelta(days=1),
+        )
+        session.add(user_session)
+        session.commit()
+        return {
+            "message": "Email verified successfully. Your free trial has started!",
+            "user_id": user.user_id,
+            "username": user.username,
+            "name": user.name,
+            "status": user.status,
+            "role": user.role,
+            "auth_token": user_session.id,
+        }
 
 def is_valid_email(email):
     return re.match(r"[^@]+@[^@]+\.[^@]+", email)
@@ -2548,11 +2565,12 @@ def get_activity_feed(
         }
 
 
-def _serialize_notification_event(event: Any) -> dict[str, Any]:
+def _serialize_notification_event(event: Any, group_name: Optional[str] = None) -> dict[str, Any]:
     return {
         "event_id": event.event_id,
         "user_id": event.user_id,
         "group_id": event.group_id,
+        "group_name": group_name,
         "intent": event.intent,
         "dedupe_key": event.dedupe_key,
         "target_doc_id": event.target_doc_id,
@@ -2608,9 +2626,16 @@ def get_notification_events(
         total_count = q.count()
         offset = (page - 1) * page_size
         events = q.order_by(models.NotificationEvent.created_at.desc()).offset(offset).limit(page_size).all()
+        group_name_map = {}
+        if group_ids:
+            groups = session.query(models.Group).filter(models.Group.group_id.in_(group_ids)).all()
+            group_name_map = {g.group_id: (g.name or g.group_id) for g in groups}
 
         return {
-            "events": [_serialize_notification_event(event) for event in events],
+            "events": [
+                _serialize_notification_event(event, group_name_map.get(event.group_id))
+                for event in events
+            ],
             "total_count": total_count,
         }
 
