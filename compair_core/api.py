@@ -1291,6 +1291,8 @@ def load_doc(
         # --- Filter logic: publishing ---
         if filter_type == "unpublished" and own_documents_only:
             q = q.filter(models.Document.is_published == False)
+        elif filter_type == "published" and own_documents_only:
+            q = q.filter(models.Document.is_published == True)
         else:
             q = q.filter(
                 or_(
