@@ -3998,7 +3998,284 @@ def submit_deactivate_request(
         if not IS_CLOUD:
             raise HTTPException(status_code=501, detail="Deactivate request emails require the Compair Cloud edition.")
         send_deactivate_request_email.delay(deactivate_request.request_id)
-        return {"message": f"We’ve received your request and will delete your account and data shortly. If you change your mind, reach out within 24 hours at {EMAIL_USER}."}
+        return {"message": f"We've received your request and will delete your account and data shortly. If you change your mind, reach out within 24 hours at {EMAIL_USER}."}
+
+
+# ===== Notification Endpoints (Cloud only) =====
+
+@router.get("/notifications")
+def get_notifications(
+    page: int = 1,
+    page_size: int = 20,
+    filter_type: Optional[str] = None,  # all|unread|conflicts|updates|overlaps|validation
+    current_user: models.User = Depends(get_current_user)
+):
+    """Fetch user's notifications with pagination and filtering."""
+    if not IS_CLOUD:
+        raise HTTPException(status_code=404, detail="Notifications are only available in Cloud edition.")
+
+    with compair.Session() as session:
+        try:
+            from compair_cloud.models import NotificationEvent
+        except ImportError:
+            raise HTTPException(status_code=501, detail="Notification system not available.")
+
+        query = session.query(NotificationEvent).filter(
+            NotificationEvent.user_id == current_user.user_id
+        )
+
+        # Apply filters
+        if filter_type == "unread":
+            query = query.filter(NotificationEvent.acknowledged_at.is_(None))
+        elif filter_type in ["conflicts", "updates", "overlaps", "validation"]:
+            query = query.filter(NotificationEvent.digest_bucket == filter_type)
+
+        # Don't show dropped notifications
+        query = query.filter(NotificationEvent.delivery_action != "drop")
+
+        # Order by priority (desc) then created_at (desc)
+        query = query.order_by(NotificationEvent.created_at.desc())
+
+        # Count total
+        total_count = query.count()
+
+        # Paginate
+        offset = (page - 1) * page_size
+        notifications = query.offset(offset).limit(page_size).all()
+
+        return {
+            "notifications": [
+                {
+                    "event_id": n.event_id,
+                    "intent": n.intent,
+                    "relevance": n.relevance,
+                    "novelty": n.novelty,
+                    "severity": n.severity,
+                    "certainty": n.certainty,
+                    "delivery_action": n.delivery_action,
+                    "target_doc_id": n.target_doc_id,
+                    "target_chunk_id": n.target_chunk_id,
+                    "peer_doc_ids": n.peer_doc_ids,
+                    "digest_bucket": n.digest_bucket,
+                    "rationale": n.rationale,
+                    "evidence_target": n.evidence_target,
+                    "evidence_peer": n.evidence_peer,
+                    "created_at": n.created_at.isoformat(),
+                    "delivered_at": n.delivered_at.isoformat() if n.delivered_at else None,
+                    "acknowledged_at": n.acknowledged_at.isoformat() if n.acknowledged_at else None,
+                    "dismissed_at": n.dismissed_at.isoformat() if n.dismissed_at else None,
+                    "is_unread": n.acknowledged_at is None and n.dismissed_at is None,
+                }
+                for n in notifications
+            ],
+            "total_count": total_count,
+            "page": page,
+            "page_size": page_size,
+        }
+
+
+@router.get("/notifications/unread_count")
+def get_unread_count(current_user: models.User = Depends(get_current_user)):
+    """Get count of unread notifications for badge display."""
+    if not IS_CLOUD:
+        return {"count": 0}
+
+    with compair.Session() as session:
+        try:
+            from compair_cloud.models import NotificationEvent
+        except ImportError:
+            return {"count": 0}
+
+        count = session.query(NotificationEvent).filter(
+            NotificationEvent.user_id == current_user.user_id,
+            NotificationEvent.acknowledged_at.is_(None),
+            NotificationEvent.dismissed_at.is_(None),
+            NotificationEvent.delivery_action != "drop"
+        ).count()
+
+        return {"count": count}
+
+
+@router.post("/notifications/{event_id}/acknowledge")
+def acknowledge_notification(
+    event_id: str,
+    current_user: models.User = Depends(get_current_user)
+):
+    """Mark a notification as read/acknowledged."""
+    if not IS_CLOUD:
+        raise HTTPException(status_code=404, detail="Notifications are only available in Cloud edition.")
+
+    with compair.Session() as session:
+        try:
+            from compair_cloud.models import NotificationEvent
+        except ImportError:
+            raise HTTPException(status_code=501, detail="Notification system not available.")
+
+        notification = session.query(NotificationEvent).filter(
+            NotificationEvent.event_id == event_id,
+            NotificationEvent.user_id == current_user.user_id
+        ).first()
+
+        if not notification:
+            raise HTTPException(status_code=404, detail="Notification not found.")
+
+        notification.acknowledged_at = datetime.now(timezone.utc)
+        session.commit()
+
+        return {"message": "Notification acknowledged."}
+
+
+@router.post("/notifications/{event_id}/dismiss")
+def dismiss_notification(
+    event_id: str,
+    current_user: models.User = Depends(get_current_user)
+):
+    """Dismiss a notification (won't show in UI anymore)."""
+    if not IS_CLOUD:
+        raise HTTPException(status_code=404, detail="Notifications are only available in Cloud edition.")
+
+    with compair.Session() as session:
+        try:
+            from compair_cloud.models import NotificationEvent
+        except ImportError:
+            raise HTTPException(status_code=501, detail="Notification system not available.")
+
+        notification = session.query(NotificationEvent).filter(
+            NotificationEvent.event_id == event_id,
+            NotificationEvent.user_id == current_user.user_id
+        ).first()
+
+        if not notification:
+            raise HTTPException(status_code=404, detail="Notification not found.")
+
+        notification.dismissed_at = datetime.now(timezone.utc)
+        session.commit()
+
+        return {"message": "Notification dismissed."}
+
+
+@router.post("/notifications/mark_all_read")
+def mark_all_notifications_read(current_user: models.User = Depends(get_current_user)):
+    """Mark all unread notifications as acknowledged."""
+    if not IS_CLOUD:
+        raise HTTPException(status_code=404, detail="Notifications are only available in Cloud edition.")
+
+    with compair.Session() as session:
+        try:
+            from compair_cloud.models import NotificationEvent
+        except ImportError:
+            raise HTTPException(status_code=501, detail="Notification system not available.")
+
+        now = datetime.now(timezone.utc)
+        updated_count = session.query(NotificationEvent).filter(
+            NotificationEvent.user_id == current_user.user_id,
+            NotificationEvent.acknowledged_at.is_(None),
+            NotificationEvent.dismissed_at.is_(None)
+        ).update({"acknowledged_at": now})
+
+        session.commit()
+
+        return {"message": f"Marked {updated_count} notifications as read."}
+
+
+@router.get("/notification_preferences")
+def get_notification_preferences(current_user: models.User = Depends(get_current_user)):
+    """Get user's notification preferences."""
+    if not IS_CLOUD:
+        raise HTTPException(status_code=404, detail="Notification preferences are only available in Cloud edition.")
+
+    with compair.Session() as session:
+        try:
+            from compair_cloud.models import NotificationPreferences
+        except ImportError:
+            raise HTTPException(status_code=501, detail="Notification preferences not available.")
+
+        prefs = session.query(NotificationPreferences).filter(
+            NotificationPreferences.user_id == current_user.user_id
+        ).first()
+
+        # Create default preferences if they don't exist
+        if not prefs:
+            prefs = NotificationPreferences(
+                user_id=current_user.user_id,
+                email_digest_enabled=False,
+                email_digest_frequency="never",
+                push_notifications_enabled=True,
+                digest_buckets_enabled=None,  # null means all buckets
+                quiet_hours_start=None,
+                quiet_hours_end=None,
+                max_daily_push_emails=1,
+            )
+            session.add(prefs)
+            session.commit()
+            session.refresh(prefs)
+
+        return {
+            "preferences_id": prefs.preferences_id,
+            "email_digest_enabled": prefs.email_digest_enabled,
+            "email_digest_frequency": prefs.email_digest_frequency,
+            "push_notifications_enabled": prefs.push_notifications_enabled,
+            "digest_buckets_enabled": prefs.digest_buckets_enabled or ["conflicts", "updates", "overlaps", "validation"],
+            "quiet_hours_start": prefs.quiet_hours_start,
+            "quiet_hours_end": prefs.quiet_hours_end,
+            "max_daily_push_emails": prefs.max_daily_push_emails,
+        }
+
+
+@router.post("/notification_preferences")
+def update_notification_preferences(
+    email_digest_enabled: Optional[bool] = None,
+    email_digest_frequency: Optional[str] = None,
+    push_notifications_enabled: Optional[bool] = None,
+    digest_buckets_enabled: Optional[list[str]] = None,
+    quiet_hours_start: Optional[str] = None,
+    quiet_hours_end: Optional[str] = None,
+    max_daily_push_emails: Optional[int] = None,
+    current_user: models.User = Depends(get_current_user)
+):
+    """Update user's notification preferences."""
+    if not IS_CLOUD:
+        raise HTTPException(status_code=404, detail="Notification preferences are only available in Cloud edition.")
+
+    with compair.Session() as session:
+        try:
+            from compair_cloud.models import NotificationPreferences
+        except ImportError:
+            raise HTTPException(status_code=501, detail="Notification preferences not available.")
+
+        prefs = session.query(NotificationPreferences).filter(
+            NotificationPreferences.user_id == current_user.user_id
+        ).first()
+
+        # Create if doesn't exist
+        if not prefs:
+            prefs = NotificationPreferences(user_id=current_user.user_id)
+            session.add(prefs)
+
+        # Update fields if provided
+        if email_digest_enabled is not None:
+            prefs.email_digest_enabled = email_digest_enabled
+        if email_digest_frequency is not None:
+            if email_digest_frequency not in ["daily", "weekly", "never"]:
+                raise HTTPException(status_code=400, detail="Invalid frequency. Must be daily, weekly, or never.")
+            prefs.email_digest_frequency = email_digest_frequency
+        if push_notifications_enabled is not None:
+            prefs.push_notifications_enabled = push_notifications_enabled
+        if digest_buckets_enabled is not None:
+            prefs.digest_buckets_enabled = digest_buckets_enabled
+        if quiet_hours_start is not None:
+            prefs.quiet_hours_start = quiet_hours_start
+        if quiet_hours_end is not None:
+            prefs.quiet_hours_end = quiet_hours_end
+        if max_daily_push_emails is not None:
+            if max_daily_push_emails < 0 or max_daily_push_emails > 10:
+                raise HTTPException(status_code=400, detail="Max daily emails must be between 0 and 10.")
+            prefs.max_daily_push_emails = max_daily_push_emails
+
+        prefs.updated_at = datetime.now(timezone.utc)
+        session.commit()
+
+        return {"message": "Preferences updated successfully."}
 
 
 CORE_PATHS: set[str] = {
