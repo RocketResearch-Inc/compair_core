@@ -145,3 +145,7 @@ class InviteMemberRequest(BaseModel):
 class RemoveMemberRequest(BaseModel):
     group_id: str
     user_id: str
+
+
+class LeaveGroupRequest(BaseModel):
+    group_id: str

@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import re
 import requests
@@ -2460,6 +2461,119 @@ def remove_member(
 
         return {"message": f"User {user.name} has been removed from the group"}
 
+
+@router.post("/groups/leave")
+def leave_group(
+    request: schema.LeaveGroupRequest,
+    current_user: models.User = Depends(get_current_user)
+):
+    """Allow the authenticated user to leave a group they belong to."""
+    with compair.Session() as session:
+        group = (
+            session.query(models.Group)
+            .options(
+                joinedload(models.Group.users),
+                joinedload(models.Group.admins),
+                joinedload(models.Group.documents),
+            )
+            .filter(models.Group.group_id == request.group_id)
+            .first()
+        )
+        if not group:
+            raise HTTPException(status_code=404, detail="Group not found")
+
+        user = session.query(models.User).filter(models.User.user_id == current_user.user_id).first()
+        if not user or user not in group.users:
+            raise HTTPException(status_code=404, detail="You are not a member of this group")
+
+        remaining_users = [u for u in group.users if u.user_id != user.user_id]
+        user_admin = next((admin for admin in group.admins if admin.user_id == user.user_id), None)
+        promoted_admin_user_id: str | None = None
+
+        # If this user is the final member/admin, delete the empty group to avoid orphaned groups.
+        if not remaining_users:
+            if not user_admin:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot leave the last-member group because you are not an admin.",
+                )
+            group_id = group.group_id
+            group_name = group.name
+            docs_to_delete = [d for d in group.documents if len(d.groups) == 1]
+            for doc in docs_to_delete:
+                session.delete(doc)
+            session.delete(group)
+            session.commit()
+            try:
+                log_activity(
+                    session=session,
+                    user_id=current_user.user_id,
+                    group_id=group_id,
+                    action="delete",
+                    object_id=group_id,
+                    object_name=group_name,
+                    object_type="group",
+                )
+            except Exception:
+                pass
+            return {
+                "message": "Left group and deleted empty group",
+                "group_deleted": True,
+                "promoted_admin_user_id": None,
+            }
+
+        # If user is the only admin and other members remain, promote one member before leaving.
+        if user_admin:
+            remaining_admins = [admin for admin in group.admins if admin.user_id != user.user_id]
+            if not remaining_admins:
+                promoted_user = sorted(
+                    remaining_users,
+                    key=lambda candidate: (
+                        candidate.datetime_registered or datetime(1970, 1, 1, tzinfo=timezone.utc),
+                        candidate.user_id,
+                    ),
+                )[0]
+                promoted_admin = (
+                    session.query(models.Administrator)
+                    .filter(models.Administrator.user_id == promoted_user.user_id)
+                    .first()
+                )
+                if not promoted_admin:
+                    promoted_admin = models.Administrator(user_id=promoted_user.user_id)
+                    session.add(promoted_admin)
+                    session.flush()
+                if not any(admin.user_id == promoted_user.user_id for admin in group.admins):
+                    group.admins.append(promoted_admin)
+                promoted_admin_user_id = promoted_user.user_id
+
+            for admin in list(group.admins):
+                if admin.user_id == user.user_id:
+                    group.admins.remove(admin)
+                    break
+
+        group.users.remove(user)
+        session.query(models.JoinRequest).filter(
+            models.JoinRequest.group_id == group.group_id,
+            models.JoinRequest.user_id == user.user_id,
+        ).delete(synchronize_session=False)
+        session.commit()
+
+        log_activity(
+            session=session,
+            user_id=current_user.user_id,
+            group_id=group.group_id,
+            action="leave",
+            object_id=group.group_id,
+            object_name=group.name,
+            object_type="group",
+        )
+
+        return {
+            "message": "Left group successfully",
+            "group_deleted": False,
+            "promoted_admin_user_id": promoted_admin_user_id,
+        }
+
 @router.get("/accept_group_invitation")
 def accept_group_invitation(
     token: str, 
@@ -2595,6 +2709,146 @@ def _serialize_notification_event(event: Any, group_name: Optional[str] = None) 
         "delivered_at": event.delivered_at,
         "acknowledged_at": event.acknowledged_at,
         "dismissed_at": getattr(event, "dismissed_at", None),
+    }
+
+
+def _coerce_client_metric_payload(raw_payload: Any) -> dict[str, Any]:
+    if isinstance(raw_payload, dict):
+        payload = raw_payload
+    elif raw_payload is None:
+        payload = {}
+    else:
+        payload = {"value": raw_payload}
+    try:
+        encoded = json.dumps(payload, ensure_ascii=False)
+    except Exception:
+        return {"value": str(raw_payload)}
+    if len(encoded) <= 16_384:
+        return payload
+    return {
+        "_truncated": True,
+        "_size": len(encoded),
+        "preview": encoded[:16_000],
+    }
+
+
+def _coerce_client_metric_ts(raw_ts: Any) -> Optional[datetime]:
+    if raw_ts is None:
+        return None
+    try:
+        ts = float(raw_ts)
+    except Exception:
+        return None
+    if ts <= 0:
+        return None
+    # Support both unix seconds and milliseconds.
+    if ts > 1_000_000_000_000:
+        ts = ts / 1000.0
+    try:
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    except Exception:
+        return None
+
+
+@router.post("/desktop-metrics/batch")
+def upload_desktop_metrics_batch(
+    request_payload: Mapping[str, Any],
+    current_user: models.User = Depends(get_current_user),
+):
+    require_cloud("Desktop analytics")
+
+    metric_model = getattr(models, "DesktopMetricEvent", None)
+    if metric_model is None:
+        raise HTTPException(status_code=501, detail="Desktop analytics storage is not configured.")
+
+    raw_events = request_payload.get("events")
+    if not isinstance(raw_events, list):
+        raise HTTPException(status_code=400, detail="'events' must be a list.")
+    if len(raw_events) > 500:
+        raise HTTPException(status_code=400, detail="At most 500 events are allowed per request.")
+
+    now = datetime.now(timezone.utc)
+    sanitized: list[dict[str, Any]] = []
+    rejected = 0
+    seen_ids: set[str] = set()
+    for item in raw_events:
+        if not isinstance(item, Mapping):
+            rejected += 1
+            continue
+        client_event_id = _clean_text(str(item.get("client_event_id") or ""), 128)
+        event_name = _clean_text(str(item.get("event") or ""), 128)
+        if not client_event_id or not event_name:
+            rejected += 1
+            continue
+        if client_event_id in seen_ids:
+            continue
+        seen_ids.add(client_event_id)
+        kind_raw = str(item.get("kind") or "usage").strip().lower()
+        kind = "issue" if kind_raw in {"issue", "error", "diagnostic"} else "usage"
+        app_version = _clean_text(str(item.get("app_version") or ""), 64)
+        source = _clean_text(str(item.get("source") or "desktop"), 32) or "desktop"
+        payload = _coerce_client_metric_payload(item.get("payload"))
+        client_ts = _coerce_client_metric_ts(item.get("ts")) or now
+        sanitized.append(
+            {
+                "client_event_id": client_event_id,
+                "event_name": event_name,
+                "kind": kind,
+                "payload": payload,
+                "app_version": app_version,
+                "source": source,
+                "client_ts": client_ts,
+            }
+        )
+
+    if not sanitized:
+        return {
+            "received": len(raw_events),
+            "accepted": 0,
+            "inserted": 0,
+            "duplicates": 0,
+            "rejected": rejected,
+        }
+
+    incoming_ids = [row["client_event_id"] for row in sanitized]
+    with compair.Session() as session:
+        existing_ids = set(
+            session.scalars(
+                select(metric_model.client_event_id).where(
+                    metric_model.user_id == current_user.user_id,
+                    metric_model.client_event_id.in_(incoming_ids),
+                )
+            ).all()
+        )
+        duplicates = len(existing_ids)
+        inserts: list[Any] = []
+        for row in sanitized:
+            if row["client_event_id"] in existing_ids:
+                continue
+            inserts.append(
+                metric_model(
+                    user_id=current_user.user_id,
+                    client_event_id=row["client_event_id"],
+                    kind=row["kind"],
+                    event_name=row["event_name"],
+                    payload=row["payload"],
+                    app_version=row["app_version"],
+                    source=row["source"],
+                    client_ts=row["client_ts"],
+                    created_at=now,
+                )
+            )
+        if inserts:
+            session.add_all(inserts)
+            session.commit()
+        inserted = len(inserts)
+
+    return {
+        "received": len(raw_events),
+        "accepted": len(sanitized),
+        "inserted": inserted,
+        "duplicates": duplicates,
+        "rejected": rejected,
     }
 
 
@@ -4290,6 +4544,7 @@ CORE_PATHS: set[str] = {
     "/load_group",
     "/create_group",
     "/join_group",
+    "/groups/leave",
     "/load_group_users",
     "/delete_group",
     "/load_documents",
