@@ -18,8 +18,10 @@ def capabilities(settings: Settings = Depends(get_settings)) -> dict[str, object
         "auth": {
             "device_flow": edition == "cloud",
             "password_login": require_auth,
+            "password_reset": require_auth,
             "required": require_auth,
             "single_user": not require_auth,
+            "google_oauth": False,
         },
         "inputs": {
             "text": True,

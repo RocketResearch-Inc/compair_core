@@ -9,6 +9,7 @@ ACCOUNT_VERIFY_TEMPLATE = """
 
 PASSWORD_RESET_TEMPLATE = """
 <p>We received a request to reset your password.</p>
+<p><a href="{{reset_link}}">Reset your password</a></p>
 <p>Your password reset code is: <strong>{{reset_code}}</strong></p>
 """.strip()
 

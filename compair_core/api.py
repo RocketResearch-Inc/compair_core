@@ -112,6 +112,18 @@ def _purge_notification_events_for_docs(session: Session, doc_ids: list[str]) ->
 def _request_source(request: Request) -> Optional[str]:
     return request.headers.get("referer") or request.headers.get("origin")
 
+
+def _public_web_base_url() -> str:
+    raw = (WEB_URL or "").strip()
+    if not raw:
+        return "https://app.compair.sh"
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw.rstrip("/")
+    host = raw.lower()
+    if host.startswith("localhost") or host.startswith("127.0.0.1") or host.startswith("[::1]"):
+        return f"http://{raw}".rstrip("/")
+    return f"https://{raw}".rstrip("/")
+
 router = APIRouter()
 core_router = APIRouter()
 WEB_URL = os.environ.get("WEB_URL")
@@ -855,8 +867,12 @@ def delete_user(
     if not settings.require_authentication:
         raise HTTPException(status_code=403, detail="Deleting the local user is not supported when authentication is disabled.")
     with compair.Session() as session:
-        current_user.delete()
+        db_user = session.query(models.User).filter(models.User.user_id == current_user.user_id).first()
+        if not db_user:
+            raise HTTPException(status_code=404, detail="User not found")
+        session.delete(db_user)
         session.commit()
+        return {"message": "User deleted"}
 
 
 @router.get("/load_connections")
@@ -2019,15 +2035,18 @@ def load_references(
 def verify_email(token: str):
     settings = get_settings_dependency()
     if not settings.require_authentication:
-        raise HTTPException(status_code=403, detail="Email verification is disabled when authentication is disabled.")
+        raise HTTPException(
+            status_code=403,
+            detail="Email verification is disabled because authentication is off. Set COMPAIR_REQUIRE_AUTHENTICATION=true to enable account flows.",
+        )
     with compair.Session() as session:
         print(token)
         user = session.query(models.User).filter(models.User.verification_token == token).first()
         print(user)
-        print(user.token_expiration)
-        print(datetime.now(timezone.utc))
         if not user:
             raise HTTPException(status_code=400, detail="Invalid or expired token")
+        print(user.token_expiration)
+        print(datetime.now(timezone.utc))
         if user.token_expiration < datetime.now(timezone.utc):
             raise HTTPException(status_code=400, detail="Token has expired")
         _activate_user_account(session, user, send_group_invites=True)
@@ -2060,7 +2079,10 @@ def sign_up(
 ) -> dict:
     settings = get_settings_dependency()
     if not settings.require_authentication:
-        raise HTTPException(status_code=403, detail="Sign-up is disabled when authentication is disabled.")
+        raise HTTPException(
+            status_code=403,
+            detail="Sign-up is disabled because authentication is off. Set COMPAIR_REQUIRE_AUTHENTICATION=true to enable account flows.",
+        )
     print('1')
     if not is_valid_email(request.username):
         raise HTTPException(status_code=400, detail="Invalid email address")
@@ -2078,7 +2100,8 @@ def sign_up(
         )
         print('Passed create_user')
         if settings.require_email_verification:
-            verification_link = f"http://{WEB_URL}/verify-email?token={user.verification_token}"
+            web_base = _public_web_base_url()
+            verification_link = f"{web_base}/verify-email?token={user.verification_token}"
             print('3?')
             emailer.connect()
             print('4??')
@@ -2089,6 +2112,7 @@ def sign_up(
                 html=_render_email(
                     ACCOUNT_VERIFY_TEMPLATE,
                     verification_link=verification_link,
+                    verify_link=verification_link,
                     user_name=user.name or user.username or "there",
                 ),
             )
@@ -2101,7 +2125,10 @@ def sign_up(
 def forgot_password(request: schema.ForgotPasswordRequest) -> dict:
     settings = get_settings_dependency()
     if not settings.require_authentication:
-        raise HTTPException(status_code=403, detail="Password resets are disabled when authentication is disabled.")
+        raise HTTPException(
+            status_code=403,
+            detail="Password resets are disabled because authentication is off. Set COMPAIR_REQUIRE_AUTHENTICATION=true to enable account flows.",
+        )
     print('1')
     with compair.Session() as session:
         print('2')
@@ -2120,7 +2147,8 @@ def forgot_password(request: schema.ForgotPasswordRequest) -> dict:
         
         print('3')
         # Send email with reset link
-        reset_link = f"http://{WEB_URL}/reset-password?token={token}"
+        web_base = _public_web_base_url()
+        reset_link = f"{web_base}/reset-password?token={token}"
         emailer.connect()
         print('4')
         emailer.send(
@@ -2130,6 +2158,7 @@ def forgot_password(request: schema.ForgotPasswordRequest) -> dict:
             html=_render_email(
                 PASSWORD_RESET_TEMPLATE,
                 reset_link=reset_link,
+                reset_code=token,
                 user_name=user.name or user.username or "",
             ),
         )
@@ -2140,13 +2169,17 @@ def forgot_password(request: schema.ForgotPasswordRequest) -> dict:
 def reset_password(request: schema.ResetPasswordRequest) -> dict:
     settings = get_settings_dependency()
     if not settings.require_authentication:
-        raise HTTPException(status_code=403, detail="Password resets are disabled when authentication is disabled.")
+        raise HTTPException(
+            status_code=403,
+            detail="Password resets are disabled because authentication is off. Set COMPAIR_REQUIRE_AUTHENTICATION=true to enable account flows.",
+        )
     with compair.Session() as session:
         print('1')
-        print(request.token)
-        user = session.query(models.User).filter(models.User.reset_token == request.token).first()
+        submitted_token = (request.token or "").strip().lower()
+        print(submitted_token)
+        user = session.query(models.User).filter(models.User.reset_token == submitted_token).first()
         print(user)
-        if not user or user.token_expiration < datetime.now(timezone.utc):
+        if not user or not user.token_expiration or user.token_expiration < datetime.now(timezone.utc):
             raise HTTPException(status_code=400, detail="Invalid or expired token")
         
         # Update the password
@@ -3526,7 +3559,7 @@ def generate_referral_link(referral_code: str) -> str:
     Generate a referral link using the user's referral code.
     """
     require_cloud("Referral program")
-    base_url = f"http://{WEB_URL}/login"
+    base_url = f"{_public_web_base_url()}/login"
     return f"{base_url}?ref={referral_code}"
 
 @router.post("/send-invite")

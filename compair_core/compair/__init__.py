@@ -54,8 +54,28 @@ def _ensure_topic_tags_column() -> None:
         print(f"[compair_core] topic_tags migration skipped: {exc}", file=sys.stderr)
 
 
+def _ensure_user_retrial_count_default() -> None:
+    """Keep core inserts compatible with Cloud-shaped user tables."""
+    try:
+        from sqlalchemy import inspect, text
+
+        insp = inspect(engine)
+        if "user" not in insp.get_table_names():
+            return
+        cols = {c["name"] for c in insp.get_columns("user")}
+        if "retrial_count" not in cols:
+            return
+        with engine.begin() as conn:
+            conn.execute(text('UPDATE "user" SET retrial_count = 0 WHERE retrial_count IS NULL'))
+            if conn.dialect.name == "postgresql":
+                conn.execute(text('ALTER TABLE "user" ALTER COLUMN retrial_count SET DEFAULT 0'))
+    except Exception as exc:
+        print(f"[compair_core] retrial_count migration skipped: {exc}", file=sys.stderr)
+
+
 def initialize_database() -> None:
     models.Base.metadata.create_all(engine)
+    _ensure_user_retrial_count_default()
     if edition == "core":
         _ensure_topic_tags_column()
     if initialize_database_override:
