@@ -3714,9 +3714,11 @@ def get_profile_image(
     current_user: models.User = Depends(get_current_user)
 ) -> Mapping[str, str]:
     with compair.Session() as session:
-        image_id = current_user.profile_image
+        image_id = (current_user.profile_image or "").strip()
         if not image_id:
             raise HTTPException(status_code=400, detail="No profile image found")
+        if image_id.startswith("http://") or image_id.startswith("https://"):
+            return {"url": image_id}
         image_url = f"{CLOUDFLARE_IMAGES_BASE_URL}/{image_id}/{variant}"
     return {"url": image_url}
 
