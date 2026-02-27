@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     stripe_cancel_url: str = "https://compair.sh/home"
     ga4_measurement_id: str | None = None
     ga4_api_secret: str | None = None
+    google_oauth_enabled: bool = False
+    google_oauth_client_id: str | None = None
+    google_oauth_client_secret: str | None = None
+    google_oauth_redirect_uri: str | None = None
+    google_oauth_state_secret: str | None = None
+    google_oauth_web_success_url: str | None = None
+    google_oauth_web_error_url: str | None = None
+    google_oauth_device_ttl_sec: int = 600
 
     # Local model endpoints
     local_model_url: str = "http://127.0.0.1:9000"

@@ -49,6 +49,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     if edition == "cloud":
         app.include_router(legacy_router)
+        try:
+            from compair_cloud.api.billing_routes import router as cloud_billing_router
+            from compair_cloud.api.google_oauth_routes import router as cloud_google_oauth_router
+        except ImportError as exc:  # pragma: no cover - only triggered in misconfigured builds
+            raise RuntimeError(
+                "Cloud edition requires the private 'compair_cloud' package to be installed."
+            ) from exc
+        app.include_router(cloud_billing_router)
+        app.include_router(cloud_google_oauth_router)
     else:
         if resolved_settings.include_legacy_routes:
             app.include_router(legacy_router)

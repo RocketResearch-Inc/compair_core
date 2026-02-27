@@ -14,6 +14,13 @@ router = APIRouter(tags=["meta"])
 def capabilities(settings: Settings = Depends(get_settings)) -> dict[str, object]:
     edition = settings.edition.lower()
     require_auth = settings.require_authentication
+    google_oauth_configured = (
+        settings.google_oauth_enabled
+        and bool((settings.google_oauth_client_id or "").strip())
+        and bool((settings.google_oauth_client_secret or "").strip())
+        and bool((settings.google_oauth_redirect_uri or "").strip())
+        and edition == "cloud"
+    )
     return {
         "auth": {
             "device_flow": edition == "cloud",
@@ -21,7 +28,7 @@ def capabilities(settings: Settings = Depends(get_settings)) -> dict[str, object
             "password_reset": require_auth,
             "required": require_auth,
             "single_user": not require_auth,
-            "google_oauth": False,
+            "google_oauth": google_oauth_configured,
         },
         "inputs": {
             "text": True,
