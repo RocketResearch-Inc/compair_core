@@ -3,6 +3,8 @@ import json
 import os
 import re
 import requests
+import base64
+import binascii
 import secrets
 import threading
 import time
@@ -303,6 +305,16 @@ HAS_REDIS = redis_client is not None
 def require_feature(flag: bool, feature: str) -> None:
     if not flag and not IS_CLOUD:
         raise HTTPException(status_code=501, detail=f"{feature} is only available in the Compair Cloud edition.")
+
+
+def _decode_optional_base64(value: str | None, field_name: str) -> str | None:
+    if value is None:
+        return None
+    try:
+        decoded = base64.b64decode(value.encode("utf-8"), validate=True)
+        return decoded.decode("utf-8")
+    except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 payload for {field_name}") from exc
 
 def get_current_user(auth_token: str | None = Header(None)):
     settings = get_settings_dependency()
@@ -1509,6 +1521,7 @@ def create_doc(
     document_title: str = Form(None),
     document_type: str = Form(None),
     document_content: str = Form(""),
+    document_content_b64: str | None = Form(None),
     groups: str = Form(None), # TODO: Fix how these get submitted; current comma-separated list string
     is_published: bool = Form(False),
     current_user: models.User = Depends(get_current_user),
@@ -1555,6 +1568,10 @@ def create_doc(
 
         if not authorid:
             authorid = current_user.user_id
+
+        decoded_content = _decode_optional_base64(document_content_b64, "document_content_b64")
+        if decoded_content is not None:
+            document_content = decoded_content
 
         document = models.Document(
             user_id=current_user.user_id,
@@ -1704,12 +1721,19 @@ def delete_doc(
 @router.post("/process_doc")
 async def process_doc(
     doc_id: str = Form(...),
-    doc_text: str = Form(...),
+    doc_text: str | None = Form(None),
+    doc_text_b64: str | None = Form(None),
     generate_feedback: bool = Form(True),
     chunk_mode: Optional[str] = Form(None),
     current_user: models.User = Depends(get_current_user),
     analytics: Analytics = Depends(get_analytics),
 ) -> Mapping[str, str | None]:
+    decoded_doc_text = _decode_optional_base64(doc_text_b64, "doc_text_b64")
+    if decoded_doc_text is not None:
+        doc_text = decoded_doc_text
+    if doc_text is None:
+        raise HTTPException(status_code=422, detail="doc_text or doc_text_b64 is required")
+
     with compair.Session() as session:
         doc = session.query(models.Document).filter(models.Document.document_id == doc_id).first()
         if not doc:
