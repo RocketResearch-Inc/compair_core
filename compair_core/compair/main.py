@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Mapping, Optional
 
@@ -30,6 +31,66 @@ from .utils import (
     log_activity,
     stable_chunk_hash,
 )
+
+
+_CODE_REPO_DOC_TYPE = "code-repo"
+_HIGH_SIGNAL_PATH_HINTS = (
+    "/api/",
+    "/auth/",
+    "/route",
+    "/router",
+    "/server/",
+    "/settings",
+    "/config",
+    "/billing",
+    "/payment",
+    "/notification",
+    "/sync",
+    "/main.",
+    "/app.",
+)
+
+
+def is_code_review_document(doc: Document, chunk_mode: Optional[str]) -> bool:
+    doc_type = (getattr(doc, "doc_type", "") or "").strip().lower()
+    mode = (chunk_mode or "").strip().lower()
+    return doc_type == _CODE_REPO_DOC_TYPE or mode in {"client", "preserve", "prechunked"}
+
+
+def _extract_snapshot_file_path(chunk: str) -> str:
+    match = re.search(r"^### File:\s+([^\n(]+)", chunk, re.MULTILINE)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def _chunk_priority_key(chunk: str, idx: int, code_focus: bool) -> tuple[int, int, int, int, int]:
+    if not code_focus:
+        return (0, 0, 0, -len(chunk), idx)
+
+    stripped = chunk.lstrip()
+    path = _extract_snapshot_file_path(chunk).lower()
+    has_file_header = bool(path)
+    has_code_fence = "```" in chunk
+
+    if stripped.startswith("# Compair baseline snapshot") and not has_file_header:
+        category = 3
+    elif stripped.startswith("## Snapshot limits") and not has_file_header:
+        category = 2
+    elif has_file_header:
+        category = 0
+    else:
+        category = 1
+
+    path_rank = 2
+    if path:
+        if any(hint in path for hint in _HIGH_SIGNAL_PATH_HINTS):
+            path_rank = 0
+        else:
+            path_rank = 1
+
+    fence_rank = 0 if has_code_fence else 1
+    return (category, path_rank, fence_rank, -count_tokens(chunk), idx)
 
 
 def process_document(
@@ -70,7 +131,11 @@ def process_document(
 
     prioritized_chunk_indices: list[int] = []
     if generate_feedback:
-        prioritized_chunk_indices = detect_significant_edits(prev_chunks=prev_chunks, new_chunks=new_chunks)
+        prioritized_chunk_indices = detect_significant_edits(
+            prev_chunks=prev_chunks,
+            new_chunks=new_chunks,
+            code_focus=is_code_review_document(doc, chunk_mode),
+        )
 
     feedback_min_tokens = int(os.getenv("COMPAIR_FEEDBACK_MIN_TOKENS", "120"))
     feedback_fallback_min = int(os.getenv("COMPAIR_FEEDBACK_MIN_TOKENS_FALLBACK", "20"))
@@ -126,11 +191,12 @@ def detect_significant_edits(
     prev_chunks: list[str],
     new_chunks: list[str],
     threshold: float = 0.5,
+    code_focus: bool = False,
 ) -> list[int]:
     if not new_chunks:
         return []
     if not prev_chunks:
-        return list(range(len(new_chunks)))
+        return prioritize_chunks(list(range(len(new_chunks))), new_chunks, code_focus=code_focus)
     candidate_indices: list[int] = []
     for idx, new_chunk in enumerate(new_chunks):
         if new_chunk in prev_chunks:
@@ -138,8 +204,24 @@ def detect_significant_edits(
         best_match = max((Levenshtein.ratio(new_chunk, prev_chunk) for prev_chunk in prev_chunks), default=0.0)
         if best_match < threshold:
             candidate_indices.append(idx)
-    candidate_indices.sort(key=lambda i: (-len(new_chunks[i]), i))
-    return candidate_indices
+    return prioritize_chunks(candidate_indices, new_chunks, code_focus=code_focus)
+
+
+def prioritize_chunks(
+    indices: list[int],
+    chunks: list[str],
+    limit: int = 10,
+    code_focus: bool = False,
+) -> list[int]:
+    if not indices:
+        return []
+    if code_focus:
+        try:
+            limit = int(os.getenv("COMPAIR_CODE_REPO_FEEDBACK_CANDIDATES", str(limit)))
+        except ValueError:
+            pass
+    indices.sort(key=lambda i: _chunk_priority_key(chunks[i], i, code_focus))
+    return indices[:limit]
 
 
 def process_text(

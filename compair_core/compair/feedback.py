@@ -22,6 +22,7 @@ except (ImportError, ModuleNotFoundError):
 
 
 _REASONING_PREFIXES = ("gpt-5", "o1", "o2", "o3", "o4")
+_CODE_REVIEW_DOC_TYPE = "code-repo"
 
 
 def _is_reasoning_model_name(model_name: str | None) -> bool:
@@ -40,6 +41,13 @@ def _get_field(source: Any, key: str) -> Any:
     return getattr(source, key, None)
 
 
+def _is_code_review_document(doc: Document, text: str) -> bool:
+    doc_type = (getattr(doc, "doc_type", "") or "").strip().lower()
+    if doc_type == _CODE_REVIEW_DOC_TYPE:
+        return True
+    return "### File:" in (text or "") and "```" in (text or "")
+
+
 class Reviewer:
     """Edition-aware wrapper that selects a feedback provider based on configuration."""
 
@@ -55,6 +63,7 @@ class Reviewer:
         self._cloud_impl = None
         self._openai_client = None
         self.openai_model = os.getenv("COMPAIR_OPENAI_MODEL", "gpt-5-nano")
+        self.code_openai_model = os.getenv("COMPAIR_OPENAI_CODE_MODEL", self.openai_model)
         self.openai_reasoning_effort = os.getenv("COMPAIR_OPENAI_REASONING_EFFORT", "minimal")
         self.uses_reasoning_model = _is_reasoning_model_name(self.openai_model)
         self.custom_endpoint = os.getenv("COMPAIR_GENERATION_ENDPOINT")
@@ -155,7 +164,31 @@ def _openai_feedback(
         return None
     instruction = reviewer.length_map.get(user.preferred_feedback_length, "1–2 short sentences")
     ref_text = "\n\n".join(_reference_snippets(references, limit=3))
-    system_prompt = """# Identity
+    is_code_review = _is_code_review_document(doc, text)
+    if is_code_review:
+        system_prompt = """# Identity
+You are a code review assistant inside Compair. You compare chunks from repository snapshots and surface concrete implementation mismatches, integration risks, or non-obvious overlaps between repos.
+
+# Purpose
+Your goal is to identify specific, evidence-backed code issues that matter across repositories: API drift, route/query mismatches, schema/config/env divergence, duplicated-but-divergent logic, missing downstream updates, or meaningful hidden overlap.
+
+# Instructions
+
+- Prioritize concrete implementation issues over broad architectural summaries.
+- Mention specific file paths, endpoints, env vars, settings, or interfaces when the evidence supports it.
+- Do not suggest direct package dependencies across decoupled services unless the evidence clearly shows that is intended.
+- Ignore weak signals like repo descriptions, version numbers, or stack recaps unless they imply a real compatibility issue.
+- If there is no concrete, code-focused issue, respond with: **NONE**.
+
+# Output Format
+- If no meaningful code-focused issue stands out: **NONE**
+        """
+        user_prompt = (
+            f"Repository chunk:\n{text}\n\nRelated repository chunks:\n{ref_text or 'None provided'}\n\n"
+            f"Respond with {instruction}. Prefer one concrete issue."
+        )
+    else:
+        system_prompt = """# Identity
 You are a collaborative team member on Compair, a platform designed to help teammates uncover connections, share insights, and accelerate collective learning by comparing user documents with relevant references.
 
 # Purpose
@@ -177,10 +210,10 @@ Your goal is to quickly surface **meaningful** connections or useful contrasts b
 - Offer generic praise or vague observations.
 - Use overly technical or robotic language.
     """
-    user_prompt = (
-        f"Document:\n{text}\n\nRelevant reference excerpts:\n{ref_text or 'None provided'}\n\n"
-        f"Respond with {instruction}."
-    )
+        user_prompt = (
+            f"Document:\n{text}\n\nRelevant reference excerpts:\n{ref_text or 'None provided'}\n\n"
+            f"Respond with {instruction}."
+        )
 
     def _extract_response_text(response: Any, reasoning_mode: bool) -> str | None:
         if response is None:
@@ -229,9 +262,10 @@ Your goal is to quickly surface **meaningful** connections or useful contrasts b
 
         content: str | None = None
         uses_reasoning = reviewer.uses_reasoning_model
+        model_name = reviewer.code_openai_model if is_code_review else reviewer.openai_model
         if client is not None and hasattr(client, "responses"):
             request_kwargs: dict[str, Any] = {
-                "model": reviewer.openai_model,
+                "model": model_name,
             }
             if uses_reasoning:
                 request_kwargs["input"] = [
@@ -249,7 +283,7 @@ Your goal is to quickly surface **meaningful** connections or useful contrasts b
             content = _extract_response_text(response, reasoning_mode=uses_reasoning)
         elif client is not None and hasattr(client, "chat") and hasattr(client.chat, "completions"):
             response = client.chat.completions.create(
-                model=reviewer.openai_model,
+                model=model_name,
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
                 temperature=0.3,
                 max_tokens=256,
@@ -265,7 +299,7 @@ Your goal is to quickly surface **meaningful** connections or useful contrasts b
                     content = content.strip()
         elif hasattr(openai, "ChatCompletion"):
             chat_response = openai.ChatCompletion.create(  # type: ignore[attr-defined]
-                model=reviewer.openai_model,
+                model=model_name,
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
                 temperature=0.3,
                 max_tokens=256,
