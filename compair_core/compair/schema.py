@@ -38,6 +38,7 @@ class User(BaseModel):
     groups: Optional[list[Group]] = None
     profile_image: Optional[str] = None
     role: Optional[str] = None
+    include_own_documents_in_feedback: Optional[bool] = None
 
     model_config = {"from_attributes": True}
 

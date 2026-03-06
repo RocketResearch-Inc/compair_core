@@ -19,6 +19,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.routing import APIRoute
 from sqlalchemy import distinct, func, select, or_, cast
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import joinedload, Session
 
 from .server.deps import get_analytics, get_billing, get_ocr, get_settings_dependency, get_storage
@@ -871,6 +872,246 @@ def update_session_duration(
         session.commit()
 
 
+def _delete_note_records(session: Session, note_ids: list[str]) -> None:
+    if not note_ids:
+        return
+    chunk_model = getattr(models, "Chunk", None)
+    feedback_model = getattr(models, "Feedback", None)
+    reference_model = getattr(models, "Reference", None)
+    note_model = getattr(models, "Note", None)
+
+    chunk_ids: list[str] = []
+    if chunk_model is not None:
+        chunk_ids = [
+            row[0]
+            for row in session.query(chunk_model.chunk_id).filter(chunk_model.note_id.in_(note_ids)).all()
+        ]
+    if feedback_model is not None and chunk_ids:
+        session.query(feedback_model).filter(
+            feedback_model.source_chunk_id.in_(chunk_ids)
+        ).delete(synchronize_session=False)
+    if reference_model is not None:
+        if chunk_ids:
+            session.query(reference_model).filter(
+                reference_model.source_chunk_id.in_(chunk_ids)
+            ).delete(synchronize_session=False)
+        if hasattr(reference_model, "reference_note_id"):
+            session.query(reference_model).filter(
+                reference_model.reference_note_id.in_(note_ids)
+            ).delete(synchronize_session=False)
+    if chunk_model is not None and chunk_ids:
+        session.query(chunk_model).filter(
+            chunk_model.chunk_id.in_(chunk_ids)
+        ).delete(synchronize_session=False)
+    if note_model is not None:
+        session.query(note_model).filter(
+            note_model.note_id.in_(note_ids)
+        ).delete(synchronize_session=False)
+
+
+def _delete_document_records(session: Session, doc_ids: list[str]) -> None:
+    if not doc_ids:
+        return
+    document_model = getattr(models, "Document", None)
+    note_model = getattr(models, "Note", None)
+    chunk_model = getattr(models, "Chunk", None)
+    feedback_model = getattr(models, "Feedback", None)
+    reference_model = getattr(models, "Reference", None)
+    document_to_group_table = getattr(models, "document_to_group_table", None)
+
+    _purge_notification_events_for_docs(session, doc_ids)
+
+    if note_model is not None:
+        note_ids = [
+            row[0]
+            for row in session.query(note_model.note_id).filter(note_model.document_id.in_(doc_ids)).all()
+        ]
+        _delete_note_records(session, note_ids)
+
+    chunk_ids: list[str] = []
+    if chunk_model is not None:
+        chunk_ids = [
+            row[0]
+            for row in session.query(chunk_model.chunk_id).filter(chunk_model.document_id.in_(doc_ids)).all()
+        ]
+    if feedback_model is not None and chunk_ids:
+        session.query(feedback_model).filter(
+            feedback_model.source_chunk_id.in_(chunk_ids)
+        ).delete(synchronize_session=False)
+    if reference_model is not None:
+        if chunk_ids:
+            session.query(reference_model).filter(
+                reference_model.source_chunk_id.in_(chunk_ids)
+            ).delete(synchronize_session=False)
+        if hasattr(reference_model, "reference_document_id"):
+            session.query(reference_model).filter(
+                reference_model.reference_document_id.in_(doc_ids)
+            ).delete(synchronize_session=False)
+    if chunk_model is not None and chunk_ids:
+        session.query(chunk_model).filter(
+            chunk_model.chunk_id.in_(chunk_ids)
+        ).delete(synchronize_session=False)
+    if document_to_group_table is not None:
+        session.execute(
+            document_to_group_table.delete().where(
+                document_to_group_table.c.document_id.in_(doc_ids)
+            )
+        )
+    if document_model is not None:
+        session.query(document_model).filter(
+            document_model.document_id.in_(doc_ids)
+        ).delete(synchronize_session=False)
+
+
+def _cleanup_user_group_memberships(session: Session, db_user: models.User) -> None:
+    admin_model = getattr(models, "Administrator", None)
+    group_query = (
+        session.query(models.Group)
+        .options(
+            joinedload(models.Group.users),
+            joinedload(models.Group.admins),
+            joinedload(models.Group.documents),
+        )
+        .filter(models.Group.users.any(models.User.user_id == db_user.user_id))
+    )
+    for group in group_query.all():
+        remaining_users = [user for user in group.users if user.user_id != db_user.user_id]
+        current_admin = next((admin for admin in group.admins if admin.user_id == db_user.user_id), None)
+
+        if not remaining_users:
+            unique_doc_ids = [doc.document_id for doc in group.documents if len(doc.groups) <= 1]
+            _delete_document_records(session, unique_doc_ids)
+            session.delete(group)
+            continue
+
+        if current_admin and admin_model is not None:
+            remaining_admins = [admin for admin in group.admins if admin.user_id != db_user.user_id]
+            if not remaining_admins:
+                promoted_user = sorted(
+                    remaining_users,
+                    key=lambda candidate: (
+                        candidate.datetime_registered or datetime(1970, 1, 1, tzinfo=timezone.utc),
+                        candidate.user_id,
+                    ),
+                )[0]
+                promoted_admin = (
+                    session.query(admin_model)
+                    .filter(admin_model.user_id == promoted_user.user_id)
+                    .first()
+                )
+                if not promoted_admin:
+                    promoted_admin = admin_model(user_id=promoted_user.user_id)
+                    session.add(promoted_admin)
+                    session.flush()
+                if not any(admin.user_id == promoted_user.user_id for admin in group.admins):
+                    group.admins.append(promoted_admin)
+        for admin in list(group.admins):
+            if admin.user_id == db_user.user_id:
+                group.admins.remove(admin)
+        for user in list(group.users):
+            if user.user_id == db_user.user_id:
+                group.users.remove(user)
+
+    user_to_group_table = getattr(models, "user_to_group_table", None)
+    if user_to_group_table is not None:
+        session.execute(
+            user_to_group_table.delete().where(user_to_group_table.c.user_id == db_user.user_id)
+        )
+
+
+def _delete_user_related_rows(session: Session, user_id: str, username: str) -> None:
+    document_model = getattr(models, "Document", None)
+    note_model = getattr(models, "Note", None)
+
+    doc_ids: list[str] = []
+    if document_model is not None and hasattr(document_model, "user_id"):
+        doc_ids = [
+            row[0]
+            for row in session.query(document_model.document_id).filter(document_model.user_id == user_id).all()
+        ]
+    _delete_document_records(session, doc_ids)
+
+    note_ids: list[str] = []
+    if note_model is not None and hasattr(note_model, "author_id"):
+        note_ids = [
+            row[0]
+            for row in session.query(note_model.note_id).filter(note_model.author_id == user_id).all()
+        ]
+    _delete_note_records(session, note_ids)
+
+    delete_specs = [
+        ("Session", "user_id", user_id),
+        ("JoinRequest", "user_id", user_id),
+        ("Administrator", "user_id", user_id),
+        ("TeamOwnership", "owner_id", user_id),
+        ("Activity", "user_id", user_id),
+        ("HelpRequest", "user_id", user_id),
+        ("DeactivateRequest", "user_id", user_id),
+        ("NotificationEvent", "user_id", user_id),
+        ("NotificationPreferences", "user_id", user_id),
+        ("DesktopMetricEvent", "user_id", user_id),
+    ]
+    for model_name, field_name, value in delete_specs:
+        model = getattr(models, model_name, None)
+        if model is None or not hasattr(model, field_name):
+            continue
+        session.query(model).filter(getattr(model, field_name) == value).delete(synchronize_session=False)
+
+    group_invitation_model = getattr(models, "GroupInvitation", None)
+    if group_invitation_model is not None:
+        clauses = []
+        if hasattr(group_invitation_model, "inviter_id"):
+            clauses.append(group_invitation_model.inviter_id == user_id)
+        if hasattr(group_invitation_model, "email") and username:
+            clauses.append(func.lower(group_invitation_model.email) == username.lower())
+        if clauses:
+            session.query(group_invitation_model).filter(or_(*clauses)).delete(synchronize_session=False)
+
+    team_invitation_model = getattr(models, "TeamInvitation", None)
+    if team_invitation_model is not None:
+        clauses = []
+        if hasattr(team_invitation_model, "inviter_id"):
+            clauses.append(team_invitation_model.inviter_id == user_id)
+        if hasattr(team_invitation_model, "email") and username:
+            clauses.append(func.lower(team_invitation_model.email) == username.lower())
+        if clauses:
+            session.query(team_invitation_model).filter(or_(*clauses)).delete(synchronize_session=False)
+
+
+def _scrub_deleted_user(session: Session, db_user: models.User) -> None:
+    db_user.username = f"deleted+{db_user.user_id}@deleted.compair.invalid"[:128]
+    db_user.name = "Deleted User"
+    db_user.role = None
+    if hasattr(db_user, "profile_image"):
+        db_user.profile_image = None
+    if hasattr(db_user, "verification_token"):
+        db_user.verification_token = None
+    if hasattr(db_user, "reset_token"):
+        db_user.reset_token = None
+    if hasattr(db_user, "token_expiration"):
+        db_user.token_expiration = None
+    if hasattr(db_user, "team_id"):
+        db_user.team_id = None
+    if hasattr(db_user, "stripe_customer_id"):
+        db_user.stripe_customer_id = None
+    if hasattr(db_user, "checkout_session"):
+        db_user.checkout_session = None
+    if hasattr(db_user, "referral_code"):
+        db_user.referral_code = f"deleted-{db_user.user_id.replace('-', '')[:24]}"
+    if hasattr(db_user, "referred_by"):
+        db_user.referred_by = None
+    if hasattr(db_user, "payment_fingerprint"):
+        db_user.payment_fingerprint = None
+    if hasattr(db_user, "last_payment_date"):
+        db_user.last_payment_date = None
+    if hasattr(db_user, "last_retrial_date"):
+        db_user.last_retrial_date = None
+    if hasattr(db_user, "status"):
+        db_user.status = "inactive"
+    db_user.set_password(secrets.token_urlsafe(24))
+    session.add(db_user)
+
+
 @router.get("/delete_user")
 def delete_user(
     current_user: models.User = Depends(get_current_user)
@@ -882,9 +1123,23 @@ def delete_user(
         db_user = session.query(models.User).filter(models.User.user_id == current_user.user_id).first()
         if not db_user:
             raise HTTPException(status_code=404, detail="User not found")
-        session.delete(db_user)
-        session.commit()
-        return {"message": "User deleted"}
+        username = str(db_user.username or "").strip()
+        try:
+            _cleanup_user_group_memberships(session, db_user)
+            _delete_user_related_rows(session, db_user.user_id, username)
+            session.delete(db_user)
+            session.commit()
+            return {"message": "User deleted", "anonymized": False}
+        except IntegrityError:
+            session.rollback()
+            db_user = session.query(models.User).filter(models.User.user_id == current_user.user_id).first()
+            if not db_user:
+                return {"message": "User deleted", "anonymized": False}
+            _cleanup_user_group_memberships(session, db_user)
+            _delete_user_related_rows(session, db_user.user_id, str(db_user.username or "").strip())
+            _scrub_deleted_user(session, db_user)
+            session.commit()
+            return {"message": "User deleted", "anonymized": True}
 
 
 @router.get("/load_connections")
