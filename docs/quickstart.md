@@ -2,13 +2,23 @@
 
 This quickstart shows how to experience Compair's core feedback loop in a minute or less. You'll run the API locally in single-user mode, create a few documents, and generate feedback that reuses your published work as a reference.
 
-## Container quick start (optional)
+## Managed container quick start
 
-Prefer to try Compair inside a container? Run the prebuilt image, which already bundles the API, local model, and OCR sidecar:
+If you are trying Compair from the CLI, let the CLI manage the local Core container for you:
+
+```bash
+compair core up
+compair profile use local
+compair login
+```
+
+## Manual container quick start
+
+Prefer to run the prebuilt image yourself? The published container already bundles the API, local model, and OCR sidecar:
 
 ```bash
 docker run -d --name compair-core \
-  -p 8000:8000 -p 9000:9000 -p 9001:9001 \
+  -p 8000:8000 \
   -e COMPAIR_REQUIRE_AUTHENTICATION=false \
   compairsteven/compair-core
 ```
@@ -16,10 +26,34 @@ docker run -d --name compair-core \
 The container exposes:
 
 - `http://localhost:8000` – Compair Core API
-- `http://localhost:9000` – local embeddings + feedback service
-- `http://localhost:9001/ocr-file` – bundled Tesseract OCR endpoint
+- the bundled local model and OCR helpers stay internal to the container unless you choose to expose them separately
 
 You can override the OCR endpoint by setting `COMPAIR_OCR_ENDPOINT` when starting the container.
+
+### Use your own OpenAI key instead of the local model
+
+If you want Core to use your OpenAI account for both feedback generation and embeddings, the simplest CLI-managed path is:
+
+```bash
+compair core config set --provider openai --openai-api-key "$OPENAI_API_KEY"
+compair core up
+```
+
+Manual equivalent:
+
+```bash
+docker run -d --name compair-core-openai \
+  -p 8000:8000 \
+  -e COMPAIR_REQUIRE_AUTHENTICATION=false \
+  -e COMPAIR_GENERATION_PROVIDER=openai \
+  -e COMPAIR_EMBEDDING_PROVIDER=openai \
+  -e COMPAIR_OPENAI_API_KEY="$COMPAIR_OPENAI_API_KEY" \
+  -e COMPAIR_OPENAI_MODEL=gpt-5-nano \
+  -e COMPAIR_OPENAI_EMBED_MODEL=text-embedding-3-small \
+  compairsteven/compair-core
+```
+
+If you only want OpenAI for feedback, omit `COMPAIR_EMBEDDING_PROVIDER=openai` and keep the default local/hash embedding path.
 
 ## 1. Start the API locally
 

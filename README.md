@@ -48,6 +48,46 @@ Container definitions and build pipelines live outside this public package:
 - The **core** container lives alongside the private CI workflow in the `compair_cloud` repository (`Dockerfile.core`). It installs this package from PyPI and runs the FastAPI factory with SQLite defaults.
 - A **cloud** container (`Dockerfile.cloud`) is built from a private cloud extension that enables premium features. For more information, please visit [https://www.compair.sh/](https://www.compair.sh/).
 
+If you are evaluating Core locally with the CLI, the simplest path is:
+
+```bash
+compair core up
+compair profile use local
+compair login
+```
+
+If you want to run the published container image manually instead, use:
+
+```bash
+docker run -d --name compair-core \
+  -p 8000:8000 \
+  -e COMPAIR_REQUIRE_AUTHENTICATION=false \
+  compairsteven/compair-core
+```
+
+To use your own OpenAI credentials instead of the bundled local model runtime:
+
+```bash
+compair core config set --provider openai --openai-api-key "$OPENAI_API_KEY"
+compair core up
+```
+
+Or manually:
+
+```bash
+docker run -d --name compair-core-openai \
+  -p 8000:8000 \
+  -e COMPAIR_REQUIRE_AUTHENTICATION=false \
+  -e COMPAIR_GENERATION_PROVIDER=openai \
+  -e COMPAIR_EMBEDDING_PROVIDER=openai \
+  -e COMPAIR_OPENAI_API_KEY="$COMPAIR_OPENAI_API_KEY" \
+  -e COMPAIR_OPENAI_MODEL=gpt-5-nano \
+  -e COMPAIR_OPENAI_EMBED_MODEL=text-embedding-3-small \
+  compairsteven/compair-core
+```
+
+This path requires only your own OpenAI API key from the Compair side. OpenAI usage is billed by OpenAI.
+
 ## Configuration
 
 Key environment variables for the core edition:
