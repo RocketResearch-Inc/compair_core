@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Iterable, List
 
@@ -23,6 +24,7 @@ except (ImportError, ModuleNotFoundError):
 
 _REASONING_PREFIXES = ("gpt-5", "o1", "o2", "o3", "o4")
 _CODE_REVIEW_DOC_TYPE = "code-repo"
+logger = logging.getLogger(__name__)
 
 
 def _is_reasoning_model_name(model_name: str | None) -> bool:
@@ -48,6 +50,11 @@ def _is_code_review_document(doc: Document, text: str) -> bool:
     return "### File:" in (text or "") and "```" in (text or "")
 
 
+def _is_snapshot_metadata_chunk(text: str) -> bool:
+    stripped = (text or "").lstrip()
+    return stripped.startswith("# Compair baseline snapshot") or stripped.startswith("## Snapshot limits")
+
+
 class Reviewer:
     """Edition-aware wrapper that selects a feedback provider based on configuration."""
 
@@ -55,9 +62,9 @@ class Reviewer:
         self.edition = os.getenv("COMPAIR_EDITION", "core").lower()
         self.provider = os.getenv("COMPAIR_GENERATION_PROVIDER", "local").lower()
         self.length_map = {
-            "Brief": "1–2 short sentences",
-            "Detailed": "a couple short paragraphs",
-            "Verbose": "as thorough as reasonably possible without repeating information",
+            "Brief": "Respond in 1-2 short sentences focused on the single highest-signal issue.",
+            "Detailed": "Respond in 3-5 concise sentences covering the issue, why it matters, and what to verify next.",
+            "Verbose": "Respond in 6-8 concise sentences covering the strongest issues, likely impact, and concrete follow-up checks without repeating yourself.",
         }
 
         self._cloud_impl = None
@@ -165,8 +172,10 @@ def _openai_feedback(
     instruction = reviewer.length_map.get(user.preferred_feedback_length, "1–2 short sentences")
     ref_text = "\n\n".join(_reference_snippets(references, limit=3))
     is_code_review = _is_code_review_document(doc, text)
+    if is_code_review and _is_snapshot_metadata_chunk(text):
+        return "NONE"
     if is_code_review:
-        system_prompt = """# Identity
+        system_prompt = f"""# Identity
 You are a code review assistant inside Compair. You compare chunks from repository snapshots and surface concrete implementation mismatches, integration risks, or non-obvious overlaps between repos.
 
 # Purpose
@@ -178,6 +187,8 @@ Your goal is to identify specific, evidence-backed code issues that matter acros
 - Mention specific file paths, endpoints, env vars, settings, or interfaces when the evidence supports it.
 - Do not suggest direct package dependencies across decoupled services unless the evidence clearly shows that is intended.
 - Ignore weak signals like repo descriptions, version numbers, or stack recaps unless they imply a real compatibility issue.
+- Length: {instruction}
+- Structure: Use one compact paragraph, not bullet lists or headings.
 - If there is no concrete, code-focused issue, respond with: **NONE**.
 
 # Output Format
@@ -185,10 +196,10 @@ Your goal is to identify specific, evidence-backed code issues that matter acros
         """
         user_prompt = (
             f"Repository chunk:\n{text}\n\nRelated repository chunks:\n{ref_text or 'None provided'}\n\n"
-            f"Respond with {instruction}. Prefer one concrete issue."
+            f"{instruction} Prefer one concrete issue."
         )
     else:
-        system_prompt = """# Identity
+        system_prompt = f"""# Identity
 You are a collaborative team member on Compair, a platform designed to help teammates uncover connections, share insights, and accelerate collective learning by comparing user documents with relevant references.
 
 # Purpose
@@ -199,7 +210,8 @@ Your goal is to quickly surface **meaningful** connections or useful contrasts b
 - **Connect the Dots:** Highlight unique insights, similarities, differences, or answers between the main document and its references. Prioritize information that is truly meaningful or helpful to the author or team.
 - **Qualified Sharing:** Only point out connections that matter—avoid commenting on trivial or already-obvious overlapping details. If nothing significant stands out, respond with: **NONE**.
 - **Relay Messages:** If user documents or notes are being used to communicate with teammates, relay any important updates or questions to help foster further discussion or action.
-- **Be Conversational:** Respond in a friendly, direct tone—never formal or repetitive.
+- **Length:** {instruction}
+- **Style:** Use one compact paragraph in a friendly, direct tone—never formal or repetitive.
 - **Be Constructive:** Focus on actionable insights, especially those that could inform or inspire team decisions, workflow improvements, or new ideas.
 
 # Output Format
@@ -277,9 +289,22 @@ Your goal is to quickly surface **meaningful** connections or useful contrasts b
             else:
                 request_kwargs["instructions"] = system_prompt
                 request_kwargs["input"] = user_prompt
-            response = client.responses.create(
-                **request_kwargs,
-            )
+            attempts: list[dict[str, Any]] = [dict(request_kwargs)]
+            if "reasoning" in request_kwargs:
+                reduced = dict(request_kwargs)
+                reduced.pop("reasoning", None)
+                attempts.append(reduced)
+
+            response = None
+            last_exc: Exception | None = None
+            for attempt in attempts:
+                try:
+                    response = client.responses.create(**attempt)
+                    break
+                except Exception as exc:
+                    last_exc = exc
+            if response is None and last_exc is not None:
+                raise last_exc
             content = _extract_response_text(response, reasoning_mode=uses_reasoning)
         elif client is not None and hasattr(client, "chat") and hasattr(client.chat, "completions"):
             response = client.chat.completions.create(
@@ -309,6 +334,7 @@ Your goal is to quickly surface **meaningful** connections or useful contrasts b
             return content.strip()
     except Exception as exc:  # pragma: no cover - network/API failure
         log_event("openai_feedback_failed", error=str(exc))
+        logger.exception("OpenAI feedback generation failed")
     return None
 
 
@@ -336,6 +362,7 @@ def _local_feedback(
             return str(feedback).strip()
     except Exception as exc:  # pragma: no cover - network failures stay graceful
         log_event("local_feedback_failed", error=str(exc))
+        logger.exception("Local feedback generation failed")
 
     return None
 
@@ -367,6 +394,7 @@ def _http_feedback(
             return feedback
     except Exception as exc:  # pragma: no cover - network failures stay graceful
         log_event("custom_feedback_failed", error=str(exc))
+        logger.exception("Custom feedback generation failed")
     return None
 
 
@@ -377,6 +405,9 @@ def get_feedback(
     references: list[Any],
     user: User,
 ) -> str:
+    if _is_code_review_document(doc, text) and _is_snapshot_metadata_chunk(text):
+        return "NONE"
+
     if reviewer.is_cloud and cloud_get_feedback is not None:
         return cloud_get_feedback(reviewer._cloud_impl, doc, text, references, user)  # type: ignore[arg-type]
 
@@ -384,11 +415,15 @@ def get_feedback(
         feedback = _openai_feedback(reviewer, doc, text, references, user)
         if feedback:
             return feedback
+        if _is_code_review_document(doc, text):
+            return "NONE"
 
     if reviewer.provider == "http":
         feedback = _http_feedback(reviewer, text, references, user)
         if feedback:
             return feedback
+        if _is_code_review_document(doc, text):
+            return "NONE"
 
     if reviewer.provider == "local":
         feedback = _local_reference_feedback(reviewer, references, user)

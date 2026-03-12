@@ -849,9 +849,13 @@ def update_user(
         if default_publish is not None:
             current_user.default_publish = default_publish.lower() == "true"
         if preferred_feedback_length is not None:
-            # Lock to Brief for the time being
-            preferred_feedback_length = 'Brief'
-            current_user.preferred_feedback_length = preferred_feedback_length
+            normalized_length = preferred_feedback_length.strip().title()
+            if normalized_length not in {"Brief", "Detailed", "Verbose"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail="preferred_feedback_length must be one of: Brief, Detailed, Verbose",
+                )
+            current_user.preferred_feedback_length = normalized_length
         if hide_affiliations is not None:
             current_user.hide_affiliations = hide_affiliations.lower() == "true"
         session.add(current_user)

@@ -39,6 +39,7 @@ class User(BaseModel):
     profile_image: Optional[str] = None
     role: Optional[str] = None
     include_own_documents_in_feedback: Optional[bool] = None
+    preferred_feedback_length: Optional[str] = None
 
     model_config = {"from_attributes": True}
 

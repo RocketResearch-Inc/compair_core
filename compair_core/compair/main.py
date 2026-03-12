@@ -93,6 +93,11 @@ def _chunk_priority_key(chunk: str, idx: int, code_focus: bool) -> tuple[int, in
     return (category, path_rank, fence_rank, -count_tokens(chunk), idx)
 
 
+def _is_snapshot_metadata_chunk(chunk: str) -> bool:
+    stripped = (chunk or "").lstrip()
+    return stripped.startswith("# Compair baseline snapshot") or stripped.startswith("## Snapshot limits")
+
+
 def process_document(
     user: User,
     session: SASession,
@@ -131,11 +136,16 @@ def process_document(
 
     prioritized_chunk_indices: list[int] = []
     if generate_feedback:
+        code_focus = is_code_review_document(doc, chunk_mode)
         prioritized_chunk_indices = detect_significant_edits(
             prev_chunks=prev_chunks,
             new_chunks=new_chunks,
-            code_focus=is_code_review_document(doc, chunk_mode),
+            code_focus=code_focus,
         )
+        if code_focus:
+            prioritized_chunk_indices = [
+                i for i in prioritized_chunk_indices if not _is_snapshot_metadata_chunk(new_chunks[i])
+            ]
 
     feedback_min_tokens = int(os.getenv("COMPAIR_FEEDBACK_MIN_TOKENS", "120"))
     feedback_fallback_min = int(os.getenv("COMPAIR_FEEDBACK_MIN_TOKENS_FALLBACK", "20"))
@@ -216,6 +226,9 @@ def prioritize_chunks(
     if not indices:
         return []
     if code_focus:
+        indices = [i for i in indices if not _is_snapshot_metadata_chunk(chunks[i])]
+        if not indices:
+            return []
         try:
             limit = int(os.getenv("COMPAIR_CODE_REPO_FEEDBACK_CANDIDATES", str(limit)))
         except ValueError:
