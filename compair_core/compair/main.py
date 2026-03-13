@@ -49,6 +49,38 @@ _HIGH_SIGNAL_PATH_HINTS = (
     "/main.",
     "/app.",
 )
+_REFERENCE_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+_REFERENCE_TOKEN_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "that",
+    "this",
+    "from",
+    "into",
+    "return",
+    "returns",
+    "class",
+    "function",
+    "const",
+    "true",
+    "false",
+    "none",
+    "null",
+    "json",
+    "text",
+    "type",
+    "value",
+    "data",
+    "item",
+    "items",
+    "file",
+    "path",
+    "chunk",
+    "document",
+    "note",
+}
 
 
 def is_code_review_document(doc: Document, chunk_mode: Optional[str]) -> bool:
@@ -96,6 +128,149 @@ def _chunk_priority_key(chunk: str, idx: int, code_focus: bool) -> tuple[int, in
 def _is_snapshot_metadata_chunk(chunk: str) -> bool:
     stripped = (chunk or "").lstrip()
     return stripped.startswith("# Compair baseline snapshot") or stripped.startswith("## Snapshot limits")
+
+
+def _is_code_review_chunk(doc: Document, text: str) -> bool:
+    doc_type = (getattr(doc, "doc_type", "") or "").strip().lower()
+    if doc_type == _CODE_REPO_DOC_TYPE:
+        return True
+    return "### File:" in (text or "") and "```" in (text or "")
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _reference_selection_config(code_focus: bool) -> tuple[int, int, int]:
+    if code_focus:
+        return (
+            _int_env("COMPAIR_CODE_REPO_REFERENCE_CANDIDATES", 10),
+            _int_env("COMPAIR_CODE_REPO_REFERENCE_LIMIT", 4),
+            _int_env("COMPAIR_REFERENCE_MAX_PER_SOURCE", 2),
+        )
+    return (
+        _int_env("COMPAIR_REFERENCE_CANDIDATES", 6),
+        _int_env("COMPAIR_REFERENCE_LIMIT", 3),
+        _int_env("COMPAIR_REFERENCE_MAX_PER_SOURCE", 2),
+    )
+
+
+def _identifier_tokens(text: str, limit: int = 64) -> set[str]:
+    tokens: set[str] = set()
+    for raw in _REFERENCE_TOKEN_RE.findall(text or ""):
+        token = raw.lower()
+        if token in _REFERENCE_TOKEN_STOPWORDS:
+            continue
+        tokens.add(token)
+        if len(tokens) >= limit:
+            break
+    return tokens
+
+
+def _path_token_set(path: str) -> set[str]:
+    return {
+        token
+        for token in re.split(r"[/._:-]+", (path or "").lower())
+        if len(token) >= 2 and token not in _REFERENCE_TOKEN_STOPWORDS
+    }
+
+
+def _path_overlap_score(target_path: str, candidate_path: str) -> float:
+    if not target_path or not candidate_path:
+        return 0.0
+    target_norm = target_path.strip().lower()
+    candidate_norm = candidate_path.strip().lower()
+    if not target_norm or not candidate_norm:
+        return 0.0
+    score = 0.0
+    if target_norm == candidate_norm:
+        score += 3.0
+    elif os.path.basename(target_norm) == os.path.basename(candidate_norm):
+        score += 1.5
+    shared = _path_token_set(target_norm) & _path_token_set(candidate_norm)
+    if shared:
+        score += min(2.0, 0.5 * len(shared))
+    return score
+
+
+def _token_overlap_ratio(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / float(max(1, min(len(left), len(right))))
+
+
+def _reference_source_key(chunk: Chunk) -> str:
+    if getattr(chunk, "document_id", None):
+        return f"document:{chunk.document_id}"
+    if getattr(chunk, "note_id", None):
+        return f"note:{chunk.note_id}"
+    return f"chunk:{getattr(chunk, 'chunk_id', '')}"
+
+
+def _rerank_reference_chunks(target_text: str, candidates: list[Chunk], code_focus: bool) -> list[Chunk]:
+    candidate_limit, final_limit, max_per_source = _reference_selection_config(code_focus)
+    if not candidates:
+        return []
+
+    trimmed = candidates[:candidate_limit]
+    if not code_focus:
+        return trimmed[:final_limit]
+
+    target_path = _extract_snapshot_file_path(target_text)
+    target_tokens = _identifier_tokens(target_text)
+    used_indices: set[int] = set()
+    source_counts: dict[str, int] = {}
+    selected: list[Chunk] = []
+    selected_tokens: list[set[str]] = []
+
+    while len(selected) < final_limit:
+        best_index = -1
+        best_score = float("-inf")
+        best_tokens: set[str] | None = None
+        for idx, candidate in enumerate(trimmed):
+            if idx in used_indices:
+                continue
+            if getattr(candidate, "chunk_type", "") != "document":
+                continue
+            content = getattr(candidate, "content", "") or ""
+            if _is_snapshot_metadata_chunk(content):
+                continue
+            source_key = _reference_source_key(candidate)
+            if source_counts.get(source_key, 0) >= max_per_source:
+                continue
+
+            candidate_tokens = _identifier_tokens(content)
+            base_score = float(len(trimmed) - idx) / float(max(1, len(trimmed)))
+            lexical_score = _token_overlap_ratio(target_tokens, candidate_tokens)
+            path_score = _path_overlap_score(target_path, _extract_snapshot_file_path(content))
+            code_bonus = 0.4 if "```" in content else 0.0
+            diversity_penalty = 0.0
+            if selected_tokens:
+                diversity_penalty = max(_token_overlap_ratio(candidate_tokens, prev) for prev in selected_tokens)
+            source_penalty = 0.75 * float(source_counts.get(source_key, 0))
+            score = (base_score * 3.0) + (lexical_score * 4.0) + path_score + code_bonus - (diversity_penalty * 2.5) - source_penalty
+            if score > best_score:
+                best_score = score
+                best_index = idx
+                best_tokens = candidate_tokens
+
+        if best_index < 0:
+            break
+
+        chosen = trimmed[best_index]
+        used_indices.add(best_index)
+        source_key = _reference_source_key(chosen)
+        source_counts[source_key] = source_counts.get(source_key, 0) + 1
+        selected.append(chosen)
+        selected_tokens.append(best_tokens or set())
+
+    if selected:
+        return selected
+    return trimmed[:final_limit]
 
 
 def process_document(
@@ -292,6 +467,8 @@ def process_text(
     if generate_feedback and existing_chunk:
         doc_group_ids = [g.group_id for g in doc.groups]
         target_embedding = existing_chunk.embedding
+        code_focus = _is_code_review_chunk(doc, text)
+        candidate_limit, _, _ = _reference_selection_config(code_focus)
 
         if target_embedding is not None:
             base_query = (
@@ -307,22 +484,23 @@ def process_text(
             )
 
             if VECTOR_BACKEND == "pgvector":
-                references = (
+                candidates = (
                     base_query.order_by(
                         Chunk.embedding.cosine_distance(existing_chunk.embedding)
                     )
-                    .limit(3)
+                    .limit(candidate_limit)
                     .all()
                 )
             else:
-                candidates = base_query.all()
+                all_candidates = base_query.all()
                 scored: list[tuple[float, Chunk]] = []
-                for candidate in candidates:
+                for candidate in all_candidates:
                     score = cosine_similarity(candidate.embedding, target_embedding)
                     if score is not None:
                         scored.append((score, candidate))
                 scored.sort(key=lambda item: item[0], reverse=True)
-                references = [chunk for _, chunk in scored[:3]]
+                candidates = [chunk for _, chunk in scored[:candidate_limit]]
+            references = _rerank_reference_chunks(text, candidates, code_focus=code_focus)
 
         sql_references: list[Reference] = []
         for ref_chunk in references:

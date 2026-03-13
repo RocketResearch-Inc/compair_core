@@ -113,7 +113,7 @@ class Reviewer:
         return self._cloud_impl is not None
 
 
-def _reference_snippets(references: Iterable[Any], limit: int = 3) -> List[str]:
+def _reference_snippets(references: Iterable[Any], limit: int = 4) -> List[str]:
     snippets: List[str] = []
     for ref in references:
         snippet = getattr(ref, "content", "") or ""
@@ -142,7 +142,7 @@ def _local_reference_feedback(
     if not references:
         return None
     summaries: list[str] = []
-    for ref in references[:3]:
+    for ref in references[:4]:
         doc = getattr(ref, "document", None)
         title = getattr(doc, "title", None) or "a related document"
         snippet = getattr(ref, "content", "") or getattr(ref, "text", "")
@@ -170,7 +170,7 @@ def _openai_feedback(
     if openai is None:
         return None
     instruction = reviewer.length_map.get(user.preferred_feedback_length, "1–2 short sentences")
-    ref_text = "\n\n".join(_reference_snippets(references, limit=3))
+    ref_text = "\n\n".join(_reference_snippets(references, limit=4))
     is_code_review = _is_code_review_document(doc, text)
     if is_code_review and _is_snapshot_metadata_chunk(text):
         return "NONE"
@@ -185,6 +185,7 @@ Your goal is to identify specific, evidence-backed code issues that matter acros
 
 - Prioritize concrete implementation issues over broad architectural summaries.
 - Mention specific file paths, endpoints, env vars, settings, or interfaces when the evidence supports it.
+- Stay grounded: only make claims that are directly supported by the provided chunk and references. If evidence is partial, say what to verify next instead of asserting it as fact.
 - Do not suggest direct package dependencies across decoupled services unless the evidence clearly shows that is intended.
 - Ignore weak signals like repo descriptions, version numbers, or stack recaps unless they imply a real compatibility issue.
 - Length: {instruction}

@@ -4,15 +4,6 @@ Compair Core is the open-source foundation of the Compair platform. It bundles t
 
 The premium cloud offering (available at [https://www.compair.sh/](https://www.compair.sh/)) layers on premium services (premium models, OCR, storage,  etc.). Core gracefully falls back to local behaviour when those packages are not present.
 
-## Repository Layout
-
-| Path | Purpose |
-| --- | --- |
-| `compair/` | Core runtime (ORM models, tasks, embeddings, feedback). |
-| `server/` | FastAPI app factory and dependency providers used by both editions. |
-| `compair_email/` | Console mailer + minimal templates for account verification and password reset. |
-| `docs/` | Additional documentation (see `docs/editions.md` for an overview of the two editions). |
-
 ## Installing
 
 ```bash
@@ -40,6 +31,15 @@ pip install -e ".[dev]"
 ```
 
 > 🔧 The optional OCR stack relies on the Tesseract CLI. When running outside the container image, install Tesseract separately (for example, `brew install tesseract` on macOS or `apt-get install tesseract-ocr` on Debian/Ubuntu) so pytesseract can invoke it.
+
+## Repository Layout
+
+| Path | Purpose |
+| --- | --- |
+| `compair/` | Core runtime (ORM models, tasks, embeddings, feedback). |
+| `server/` | FastAPI app factory and dependency providers used by both editions. |
+| `compair_email/` | Console mailer + minimal templates for account verification and password reset. |
+| `docs/` | Additional documentation (see `docs/editions.md` for an overview of the two editions). |
 
 ## Containers
 
@@ -88,6 +88,8 @@ docker run -d --name compair-core-openai \
 
 This path requires only your own OpenAI API key from the Compair side. OpenAI usage is billed by OpenAI.
 
+For a fuller self-hosted walkthrough, see `docs/quickstart.md` and `docs/user-guide.md`.
+
 ## Configuration
 
 Key environment variables for the core edition:
@@ -125,6 +127,15 @@ uvicorn compair_core.server.app:create_app --factory --reload
 ```
 
 The API will be available at http://127.0.0.1:8000 and supports the Swagger UI at `/docs`.
+
+## Core vs. Cloud
+
+Core and Cloud share the same document, group, feedback, and authentication foundations, but they do not expose the same product surface.
+
+- `compair_core` is the self-hosted/open-core runtime.
+- `compair_cloud` adds the hosted-only layers: Google OAuth, billing, richer analytics, and ranked notification events / triage.
+
+In particular, the notification ranking workflow used by the hosted web app, desktop app, and CLI report ordering is a Cloud feature. Core still supports the shared feedback pipeline, but `/notification_events` returns `501` outside the Cloud edition.
 
 ## Tests / Linting
 

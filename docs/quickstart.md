@@ -2,6 +2,8 @@
 
 This quickstart shows how to experience Compair's core feedback loop in a minute or less. You'll run the API locally in single-user mode, create a few documents, and generate feedback that reuses your published work as a reference.
 
+Compair Core intentionally stops at the shared feedback/document workflow. The hosted Cloud notification ranking and triage workflow is not part of the Core quickstart.
+
 ## Managed container quick start
 
 If you are trying Compair from the CLI, let the CLI manage the local Core container for you:

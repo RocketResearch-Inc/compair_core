@@ -2,6 +2,8 @@
 
 This guide walks a new Compair Core user through the end-to-end experience: configuring the runtime, creating an account, collaborating in groups, working with documents, requesting automated feedback, and managing supporting workflows. Examples assume a FastAPI server running locally at `http://127.0.0.1:8000` and use the `requests` library in Python.
 
+This guide covers the Core edition only. Hosted-only features such as Google OAuth, billing, and ranked notification events belong to `compair_cloud` and are not expected in a pure Core deployment.
+
 ## 0. Initial Setup & Configuration
 
 Before hitting the API, configure the deployment with environment variables. The following values cover the common scenarios for a local or self-hosted deployment:
