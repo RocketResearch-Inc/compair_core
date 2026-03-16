@@ -347,6 +347,7 @@ def process_document(
     doc: Document,
     generate_feedback: bool = True,
     chunk_mode: Optional[str] = None,
+    reanalyze_existing: bool = False,
 ) -> Mapping[str, int]:
     new = False
 
@@ -376,6 +377,7 @@ def process_document(
     new_chunks = [c for c in chunks if c not in prev_set]
 
     prioritized_chunk_indices: list[int] = []
+    code_focus = False
     if generate_feedback:
         code_focus = is_code_review_document(doc, chunk_mode)
         prioritized_chunk_indices = detect_significant_edits(
@@ -408,6 +410,22 @@ def process_document(
         num_chunks_can_generate_feedback = max((feedback_limit - recent_feedback_count), 0)
         indices_to_generate_feedback = prioritized_chunk_indices[:num_chunks_can_generate_feedback]
 
+    existing_indices_to_generate_feedback: list[int] = []
+    if generate_feedback and reanalyze_existing and not new_chunks:
+        existing_indices = _existing_feedback_candidate_indices(
+            session=session,
+            doc=doc,
+            chunks=chunks,
+            code_focus=code_focus,
+            feedback_min_tokens=feedback_min_tokens,
+            feedback_fallback_min=feedback_fallback_min,
+        )
+        if feedback_limit is None:
+            existing_indices_to_generate_feedback = existing_indices
+        else:
+            remaining_slots = max((feedback_limit - recent_feedback_count - len(indices_to_generate_feedback)), 0)
+            existing_indices_to_generate_feedback = existing_indices[:remaining_slots]
+
     for i, chunk in enumerate(new_chunks):
         should_generate_feedback = i in indices_to_generate_feedback
         process_text(
@@ -417,6 +435,16 @@ def process_document(
             doc=doc,
             text=chunk,
             generate_feedback=should_generate_feedback,
+        )
+
+    for idx in existing_indices_to_generate_feedback:
+        process_text(
+            session=session,
+            embedder=embedder,
+            reviewer=reviewer,
+            doc=doc,
+            text=chunks[idx],
+            generate_feedback=True,
         )
 
     removed = [c for c in prev_chunks if c not in set(chunks)]
@@ -523,6 +551,65 @@ def prioritize_chunks(
         return selected
     indices.sort(key=lambda i: _chunk_priority_key(chunks[i], i, code_focus))
     return indices[:limit]
+
+
+def _existing_feedback_candidate_indices(
+    session: SASession,
+    doc: Document,
+    chunks: list[str],
+    code_focus: bool,
+    feedback_min_tokens: int,
+    feedback_fallback_min: int,
+) -> list[int]:
+    if not chunks:
+        return []
+
+    chunk_set = set(chunks)
+    content_to_chunk_id: dict[str, str] = {}
+    existing_rows = session.query(Chunk.chunk_id, Chunk.content).filter(
+        Chunk.document_id == doc.document_id,
+        Chunk.chunk_type == "document",
+    ).all()
+    for chunk_id, content in existing_rows:
+        if content in chunk_set and content not in content_to_chunk_id:
+            content_to_chunk_id[content] = chunk_id
+    if not content_to_chunk_id:
+        return []
+
+    feedback_chunk_ids = {
+        source_chunk_id
+        for (source_chunk_id,) in session.query(Feedback.source_chunk_id).filter(
+            Feedback.source_chunk_id.in_(list(content_to_chunk_id.values()))
+        ).distinct().all()
+    }
+
+    candidate_indices = [
+        idx
+        for idx, chunk in enumerate(chunks)
+        if content_to_chunk_id.get(chunk) and content_to_chunk_id[chunk] not in feedback_chunk_ids
+    ]
+    if code_focus:
+        candidate_indices = [idx for idx in candidate_indices if not _is_snapshot_metadata_chunk(chunks[idx])]
+    if not candidate_indices:
+        return []
+
+    token_lens = {idx: count_tokens(chunks[idx]) for idx in candidate_indices}
+    if feedback_min_tokens > 0:
+        eligible = [idx for idx in candidate_indices if token_lens[idx] >= feedback_min_tokens]
+        if eligible:
+            candidate_indices = eligible
+        else:
+            fallback_idx = max(candidate_indices, key=lambda idx: token_lens[idx])
+            if token_lens[fallback_idx] < feedback_fallback_min:
+                return []
+            candidate_indices = [fallback_idx]
+
+    return prioritize_chunks(
+        candidate_indices,
+        chunks,
+        code_focus=code_focus,
+        novelty_scores={idx: 1.0 for idx in candidate_indices},
+    )
 
 
 def process_text(

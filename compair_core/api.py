@@ -160,17 +160,24 @@ def _dispatch_process_document_task(
     doc_text: str,
     generate_feedback: bool,
     chunk_mode: Optional[str] = None,
+    reanalyze_existing: bool = False,
 ):
     task_callable = getattr(process_document_celery, "delay", None)
     if callable(task_callable):
         try:
-            return task_callable(user_id, doc_id, doc_text, generate_feedback, chunk_mode)
+            return task_callable(user_id, doc_id, doc_text, generate_feedback, chunk_mode, reanalyze_existing)
         except TypeError:
-            return task_callable(user_id, doc_id, doc_text, generate_feedback)
+            try:
+                return task_callable(user_id, doc_id, doc_text, generate_feedback, chunk_mode)
+            except TypeError:
+                return task_callable(user_id, doc_id, doc_text, generate_feedback)
     try:
-        return process_document_celery(user_id, doc_id, doc_text, generate_feedback, chunk_mode)
+        return process_document_celery(user_id, doc_id, doc_text, generate_feedback, chunk_mode, reanalyze_existing)
     except TypeError:
-        return process_document_celery(user_id, doc_id, doc_text, generate_feedback)
+        try:
+            return process_document_celery(user_id, doc_id, doc_text, generate_feedback, chunk_mode)
+        except TypeError:
+            return process_document_celery(user_id, doc_id, doc_text, generate_feedback)
 
 
 def _ensure_single_user(session: Session, settings: Settings) -> models.User:
@@ -1984,6 +1991,7 @@ async def process_doc(
     doc_text_b64: str | None = Form(None),
     generate_feedback: bool = Form(True),
     chunk_mode: Optional[str] = Form(None),
+    reanalyze_existing: bool = Form(False),
     current_user: models.User = Depends(get_current_user),
     analytics: Analytics = Depends(get_analytics),
 ) -> Mapping[str, str | None]:
@@ -2010,6 +2018,7 @@ async def process_doc(
         doc_text=doc_text,
         generate_feedback=generate_feedback,
         chunk_mode=chunk_mode,
+        reanalyze_existing=reanalyze_existing,
     )
     task_id = getattr(task_result, "id", None)
 
