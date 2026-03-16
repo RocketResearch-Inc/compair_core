@@ -203,6 +203,72 @@ def _token_overlap_ratio(left: set[str], right: set[str]) -> float:
     return len(left & right) / float(max(1, min(len(left), len(right))))
 
 
+def _is_doc_like_path(path: str) -> bool:
+    normalized = (path or "").strip().lower().replace("\\", "/")
+    if not normalized:
+        return False
+    base = os.path.basename(normalized)
+    doc_basenames = {
+        "readme",
+        "readme.md",
+        "readme.rst",
+        "readme.txt",
+        "changelog",
+        "changelog.md",
+        "changelog.rst",
+        "changelog.txt",
+        "security",
+        "security.md",
+        "security.rst",
+        "security.txt",
+        "contributing",
+        "contributing.md",
+        "contributing.rst",
+        "contributing.txt",
+        "architecture",
+        "architecture.md",
+        "architecture.rst",
+        "architecture.txt",
+    }
+    return base in doc_basenames or "/docs/" in normalized or "/doc/" in normalized
+
+
+def _chunk_relevance_score(
+    chunk: str,
+    idx: int,
+    code_focus: bool,
+    novelty_score: float,
+) -> float:
+    token_score = min(float(count_tokens(chunk)) / 240.0, 2.0)
+    relevance = max(0.0, novelty_score) * 2.4
+    if not code_focus:
+        return relevance + token_score - (0.01 * float(min(idx, 50)))
+
+    category, path_rank, _, _, _ = _chunk_priority_key(chunk, idx, code_focus)
+    path = _extract_snapshot_file_path(chunk)
+    relevance += token_score
+    relevance += max(0.0, 1.2 - (0.4 * float(category)))
+    relevance += max(0.0, 0.7 - (0.35 * float(path_rank)))
+    if "```" in chunk:
+        relevance += 0.4
+    if "diff --git" in chunk or "@@" in chunk or "+++ b/" in chunk:
+        relevance += 0.45
+    if _is_doc_like_path(path):
+        relevance -= 0.8
+    return relevance - (0.015 * float(min(idx, 50)))
+
+
+def _chunk_redundancy_score(left: str, right: str, code_focus: bool) -> float:
+    lexical = _token_overlap_ratio(_identifier_tokens(left), _identifier_tokens(right))
+    if not code_focus:
+        return lexical
+    path_score = min(
+        _path_overlap_score(_extract_snapshot_file_path(left), _extract_snapshot_file_path(right)) / 3.0,
+        1.0,
+    )
+    return lexical + (0.35 * path_score)
+
+
 def _reference_source_key(chunk: Chunk) -> str:
     if getattr(chunk, "document_id", None):
         return f"document:{chunk.document_id}"
@@ -381,15 +447,28 @@ def detect_significant_edits(
     if not new_chunks:
         return []
     if not prev_chunks:
-        return prioritize_chunks(list(range(len(new_chunks))), new_chunks, code_focus=code_focus)
+        novelty_scores = {i: 1.0 for i in range(len(new_chunks))}
+        return prioritize_chunks(
+            list(range(len(new_chunks))),
+            new_chunks,
+            code_focus=code_focus,
+            novelty_scores=novelty_scores,
+        )
     candidate_indices: list[int] = []
+    novelty_scores: dict[int, float] = {}
     for idx, new_chunk in enumerate(new_chunks):
         if new_chunk in prev_chunks:
             continue
         best_match = max((Levenshtein.ratio(new_chunk, prev_chunk) for prev_chunk in prev_chunks), default=0.0)
+        novelty_scores[idx] = max(0.0, 1.0 - best_match)
         if best_match < threshold:
             candidate_indices.append(idx)
-    return prioritize_chunks(candidate_indices, new_chunks, code_focus=code_focus)
+    return prioritize_chunks(
+        candidate_indices,
+        new_chunks,
+        code_focus=code_focus,
+        novelty_scores=novelty_scores,
+    )
 
 
 def prioritize_chunks(
@@ -397,6 +476,7 @@ def prioritize_chunks(
     chunks: list[str],
     limit: int = 10,
     code_focus: bool = False,
+    novelty_scores: Mapping[int, float] | None = None,
 ) -> list[int]:
     if not indices:
         return []
@@ -408,6 +488,39 @@ def prioritize_chunks(
             limit = int(os.getenv("COMPAIR_CODE_REPO_FEEDBACK_CANDIDATES", str(limit)))
         except ValueError:
             pass
+    else:
+        indices.sort(key=lambda i: _chunk_priority_key(chunks[i], i, code_focus))
+        return indices[:limit]
+
+    if novelty_scores is None:
+        novelty_scores = {}
+
+    remaining = list(indices)
+    selected: list[int] = []
+    while remaining and len(selected) < limit:
+        best_idx = -1
+        best_score = float("-inf")
+        for idx in remaining:
+            relevance = _chunk_relevance_score(chunks[idx], idx, code_focus, novelty_scores.get(idx, 1.0))
+            redundancy = 0.0
+            if selected:
+                redundancy = max(
+                    _chunk_redundancy_score(chunks[idx], chunks[chosen_idx], code_focus)
+                    for chosen_idx in selected
+                )
+            score = relevance - (2.6 * redundancy)
+            if best_idx < 0 or score > best_score:
+                best_idx = idx
+                best_score = score
+        if best_idx < 0:
+            break
+        if selected and best_score < 1.8:
+            break
+        selected.append(best_idx)
+        remaining = [idx for idx in remaining if idx != best_idx]
+
+    if selected:
+        return selected
     indices.sort(key=lambda i: _chunk_priority_key(chunks[i], i, code_focus))
     return indices[:limit]
 

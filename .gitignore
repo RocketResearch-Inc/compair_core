@@ -5,4 +5,8 @@ compair_core/server/__pycache__/*
 compair_core/server/local_model/__pycache__/*
 compair_core/server/providers/__pycache__/*
 compair_core/server/routers/__pycache__/*
+compair_core.egg-info/
+.env
+.devcontainer/
+.vscode/
 `

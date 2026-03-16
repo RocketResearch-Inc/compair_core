@@ -62,9 +62,9 @@ class Reviewer:
         self.edition = os.getenv("COMPAIR_EDITION", "core").lower()
         self.provider = os.getenv("COMPAIR_GENERATION_PROVIDER", "local").lower()
         self.length_map = {
-            "Brief": "Respond in 1-2 short sentences focused on the single highest-signal issue.",
-            "Detailed": "Respond in 3-5 concise sentences covering the issue, why it matters, and what to verify next.",
-            "Verbose": "Respond in 6-8 concise sentences covering the strongest issues, likely impact, and concrete follow-up checks without repeating yourself.",
+            "Brief": "Respond in 1-2 short sentences focused on the single highest-signal observation.",
+            "Detailed": "Respond in 3-5 concise sentences covering the strongest observation, why it matters, and what to verify or consider next.",
+            "Verbose": "Respond in 6-8 concise sentences covering the strongest observations, likely impact, and concrete follow-up checks without repeating yourself.",
         }
 
         self._cloud_impl = None
@@ -176,28 +176,29 @@ def _openai_feedback(
         return "NONE"
     if is_code_review:
         system_prompt = f"""# Identity
-You are a code review assistant inside Compair. You compare chunks from repository snapshots and surface concrete implementation mismatches, integration risks, or non-obvious overlaps between repos.
+You are a code review assistant inside Compair. You compare chunks from repository snapshots and surface concrete implementation mismatches, integration risks, information gaps, or non-obvious overlaps between repos.
 
 # Purpose
-Your goal is to identify specific, evidence-backed code issues that matter across repositories: API drift, route/query mismatches, schema/config/env divergence, duplicated-but-divergent logic, missing downstream updates, or meaningful hidden overlap.
+Your goal is to identify specific, evidence-backed code observations that matter across repositories: API drift, route/query mismatches, schema/config/env divergence, duplicated-but-divergent logic, missing downstream updates, meaningful hidden overlap, or a key information gap that only becomes visible across repos.
 
 # Instructions
 
-- Prioritize concrete implementation issues over broad architectural summaries.
+- Prioritize concrete implementation observations over broad architectural summaries.
 - Mention specific file paths, endpoints, env vars, settings, or interfaces when the evidence supports it.
+- When the evidence points to hidden overlap, reinforcement, or an information gap rather than a conflict, say that plainly instead of forcing issue/fix framing.
 - Stay grounded: only make claims that are directly supported by the provided chunk and references. If evidence is partial, say what to verify next instead of asserting it as fact.
 - Do not suggest direct package dependencies across decoupled services unless the evidence clearly shows that is intended.
 - Ignore weak signals like repo descriptions, version numbers, or stack recaps unless they imply a real compatibility issue.
 - Length: {instruction}
 - Structure: Use one compact paragraph, not bullet lists or headings.
-- If there is no concrete, code-focused issue, respond with: **NONE**.
+- If there is no concrete, code-focused observation, respond with: **NONE**.
 
 # Output Format
-- If no meaningful code-focused issue stands out: **NONE**
+- If no meaningful code-focused observation stands out: **NONE**
         """
         user_prompt = (
             f"Repository chunk:\n{text}\n\nRelated repository chunks:\n{ref_text or 'None provided'}\n\n"
-            f"{instruction} Prefer one concrete issue."
+            f"{instruction} Prefer one concrete observation."
         )
     else:
         system_prompt = f"""# Identity
