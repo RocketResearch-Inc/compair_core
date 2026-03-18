@@ -20,6 +20,9 @@ Before hitting the API, configure the deployment with environment variables. The
 | `COMPAIR_LOCAL_MODEL_URL` | Base URL of the bundled/local text generation + embedding service used when `COMPAIR_GENERATION_PROVIDER=local`. | `http://127.0.0.1:9000` |
 | `COMPAIR_OCR_ENDPOINT` | HTTP endpoint used for OCR uploads. When set, OCR auto-enables for core deployments. | `http://127.0.0.1:9001/ocr-file` |
 | `COMPAIR_EMAIL_BACKEND` | Controls how verification/reset emails are sent. | `console` (logs to stdout) |
+| `COMPAIR_TELEMETRY_ENABLED` | Enables an anonymous daily heartbeat back to Compair Cloud for self-hosted usage analytics. | `false` |
+| `COMPAIR_TELEMETRY_BASE_URL` | Base URL for the anonymous telemetry collector when telemetry is enabled. | `https://app.compair.sh/api` |
+| `COMPAIR_TELEMETRY_INSTALL_ID` | Optional fixed install identifier. Leave unset to auto-generate one locally. | Leave unset |
 
 > 💡 Export these variables in your shell or drop them into a `.env` file loaded by your process manager (e.g., `uvicorn`, `docker-compose`, `systemd`).
 
@@ -28,6 +31,17 @@ When both `COMPAIR_REQUIRE_AUTHENTICATION=true` and `COMPAIR_REQUIRE_EMAIL_VERIF
 When `COMPAIR_OCR_ENDPOINT` is defined (for example, pointing at the bundled Tesseract service on port `9001`), the server automatically reports OCR capability and allows `/upload/ocr-file`. If the endpoint is missing or unreachable, OCR stays disabled and the API returns `501 Not Implemented`.
 
 Install optional extras as needed: `pip install "compair-core[ocr]"` adds Pillow, pytesseract, and pypdf for in-process OCR support. When running outside the container, install the Tesseract CLI separately (e.g., `brew install tesseract` on macOS or `apt-get install tesseract-ocr` on Debian/Ubuntu) so pytesseract can find the binary.
+
+### Optional anonymous telemetry
+
+If you want a self-hosted Core deployment to contribute basic adoption metrics back to Compair Cloud, set:
+
+```bash
+export COMPAIR_TELEMETRY_ENABLED=true
+export COMPAIR_TELEMETRY_BASE_URL="https://app.compair.sh/api"
+```
+
+When enabled, Core sends at most one anonymous heartbeat per day on startup. The payload includes a locally generated install ID, Core version, OS, architecture, and edition. It does **not** include document contents, auth tokens, usernames, or feedback text.
 
 ### Local embeddings and generation
 

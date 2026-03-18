@@ -15,6 +15,7 @@ from .deps import (
 from .providers.local_storage import LocalStorage
 from .routers.capabilities import router as capabilities_router
 from .settings import Settings, get_settings
+from .telemetry import start_usage_telemetry
 
 
 def _normalize_edition(value: str) -> str:
@@ -136,6 +137,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             base_url=resolved_settings.local_upload_base_url,
         )
         app.dependency_overrides[get_storage] = lambda sp=storage_provider: sp
+        start_usage_telemetry(resolved_settings)
 
     return app
 

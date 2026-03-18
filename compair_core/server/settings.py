@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     stripe_cancel_url: str = "https://compair.sh/home"
     ga4_measurement_id: str | None = None
     ga4_api_secret: str | None = None
+    telemetry_enabled: bool = False
+    telemetry_base_url: str = "https://app.compair.sh/api"
+    telemetry_install_id: str | None = None
     google_oauth_enabled: bool = False
     google_oauth_client_id: str | None = None
     google_oauth_client_secret: str | None = None

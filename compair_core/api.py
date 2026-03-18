@@ -3075,6 +3075,17 @@ def _coerce_client_metric_ts(raw_ts: Any) -> Optional[datetime]:
         return None
 
 
+def _get_cloud_metric_model(name: str) -> Any | None:
+    model = getattr(models, name, None)
+    if model is not None:
+        return model
+    try:
+        from compair_cloud import models as cloud_models  # type: ignore
+    except Exception:
+        return None
+    return getattr(cloud_models, name, None)
+
+
 @router.post("/desktop-metrics/batch")
 def upload_desktop_metrics_batch(
     request_payload: Mapping[str, Any],
@@ -3082,7 +3093,7 @@ def upload_desktop_metrics_batch(
 ):
     require_cloud("Desktop analytics")
 
-    metric_model = getattr(models, "DesktopMetricEvent", None)
+    metric_model = _get_cloud_metric_model("DesktopMetricEvent")
     if metric_model is None:
         raise HTTPException(status_code=501, detail="Desktop analytics storage is not configured.")
 
@@ -3175,6 +3186,254 @@ def upload_desktop_metrics_batch(
         "duplicates": duplicates,
         "rejected": rejected,
     }
+
+
+@router.post("/client-metrics/anonymous")
+def upload_anonymous_client_metrics_batch(
+    request_payload: Mapping[str, Any],
+):
+    require_cloud("Anonymous telemetry")
+
+    metric_model = _get_cloud_metric_model("AnonymousClientMetricEvent")
+    if metric_model is None:
+        raise HTTPException(status_code=501, detail="Anonymous telemetry storage is not configured.")
+
+    raw_events = request_payload.get("events")
+    if not isinstance(raw_events, list):
+        raise HTTPException(status_code=400, detail="'events' must be a list.")
+    if len(raw_events) > 200:
+        raise HTTPException(status_code=400, detail="At most 200 events are allowed per request.")
+
+    fallback_source = _clean_text(str(request_payload.get("client") or "unknown"), 32) or "unknown"
+    fallback_install_id = _clean_text(str(request_payload.get("install_id") or ""), 128)
+    now = datetime.now(timezone.utc)
+    sanitized: list[dict[str, Any]] = []
+    rejected = 0
+    seen_keys: set[tuple[str, str]] = set()
+    for item in raw_events:
+        if not isinstance(item, Mapping):
+            rejected += 1
+            continue
+        install_id = _clean_text(str(item.get("install_id") or fallback_install_id or ""), 128)
+        client_event_id = _clean_text(str(item.get("client_event_id") or ""), 128)
+        event_name = _clean_text(str(item.get("event") or ""), 128)
+        if not install_id or not client_event_id or not event_name:
+            rejected += 1
+            continue
+        dedupe_key = (install_id, client_event_id)
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+        kind_raw = str(item.get("kind") or "usage").strip().lower()
+        kind = "issue" if kind_raw in {"issue", "error", "diagnostic"} else "usage"
+        source = _clean_text(str(item.get("source") or fallback_source), 32) or fallback_source
+        app_version = _clean_text(str(item.get("app_version") or ""), 64)
+        os_name = _clean_text(str(item.get("os") or item.get("os_name") or ""), 32)
+        arch = _clean_text(str(item.get("arch") or ""), 32)
+        payload = _coerce_client_metric_payload(item.get("payload"))
+        client_ts = _coerce_client_metric_ts(item.get("ts")) or now
+        sanitized.append(
+            {
+                "install_id": install_id,
+                "client_event_id": client_event_id,
+                "event_name": event_name,
+                "kind": kind,
+                "source": source,
+                "app_version": app_version,
+                "os_name": os_name,
+                "arch": arch,
+                "payload": payload,
+                "client_ts": client_ts,
+            }
+        )
+
+    if not sanitized:
+        return {
+            "received": len(raw_events),
+            "accepted": 0,
+            "inserted": 0,
+            "duplicates": 0,
+            "rejected": rejected,
+        }
+
+    install_ids = sorted({row["install_id"] for row in sanitized})
+    event_ids = sorted({row["client_event_id"] for row in sanitized})
+    with compair.Session() as session:
+        existing_pairs = set(
+            session.execute(
+                select(metric_model.install_id, metric_model.client_event_id).where(
+                    metric_model.install_id.in_(install_ids),
+                    metric_model.client_event_id.in_(event_ids),
+                )
+            ).all()
+        )
+        duplicates = len(existing_pairs)
+        inserts: list[Any] = []
+        for row in sanitized:
+            dedupe_key = (row["install_id"], row["client_event_id"])
+            if dedupe_key in existing_pairs:
+                continue
+            inserts.append(
+                metric_model(
+                    install_id=row["install_id"],
+                    client_event_id=row["client_event_id"],
+                    event_name=row["event_name"],
+                    kind=row["kind"],
+                    source=row["source"],
+                    app_version=row["app_version"],
+                    os_name=row["os_name"],
+                    arch=row["arch"],
+                    payload=row["payload"],
+                    client_ts=row["client_ts"],
+                    created_at=now,
+                )
+            )
+        if inserts:
+            session.add_all(inserts)
+            session.commit()
+        inserted = len(inserts)
+
+    return {
+        "received": len(raw_events),
+        "accepted": len(sanitized),
+        "inserted": inserted,
+        "duplicates": duplicates,
+        "rejected": rejected,
+    }
+
+
+@router.get("/admin/client_metrics_summary")
+def get_client_metrics_summary(
+    days: int = Query(default=30, ge=1, le=365),
+    admin_key: str = Header(None),
+):
+    require_cloud("Client telemetry summary")
+    if admin_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid or missing admin key")
+
+    desktop_model = _get_cloud_metric_model("DesktopMetricEvent")
+    anonymous_model = _get_cloud_metric_model("AnonymousClientMetricEvent")
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    def _bucket(rows: list[tuple[Any, ...]], actor_label: str) -> dict[str, Any]:
+        by_source: dict[str, dict[str, Any]] = {}
+        all_events: dict[str, int] = {}
+        actors: set[str] = set()
+        total_events = 0
+        latest_seen: Optional[datetime] = None
+        for source, event_name, actor_id, app_version, client_ts, created_at in rows:
+            when = client_ts or created_at
+            if when is not None and when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            total_events += 1
+            if actor_id:
+                actors.add(str(actor_id))
+            source_key = str(source or "unknown")
+            bucket = by_source.setdefault(
+                source_key,
+                {
+                    "source": source_key,
+                    "events": 0,
+                    actor_label: 0,
+                    "event_names": {},
+                    "versions": {},
+                    "last_seen_at": None,
+                },
+            )
+            bucket["events"] += 1
+            if actor_id:
+                ids = bucket.setdefault(f"_{actor_label}_ids", set())
+                ids.add(str(actor_id))
+            if event_name:
+                event_key = str(event_name)
+                bucket["event_names"][event_key] = bucket["event_names"].get(event_key, 0) + 1
+                all_events[event_key] = all_events.get(event_key, 0) + 1
+            if app_version:
+                version_key = str(app_version)
+                bucket["versions"][version_key] = bucket["versions"].get(version_key, 0) + 1
+            if when and (bucket["last_seen_at"] is None or when > bucket["last_seen_at"]):
+                bucket["last_seen_at"] = when
+            if when and (latest_seen is None or when > latest_seen):
+                latest_seen = when
+
+        normalized_sources: list[dict[str, Any]] = []
+        for value in by_source.values():
+            actor_ids = value.pop(f"_{actor_label}_ids", set())
+            value[actor_label] = len(actor_ids)
+            last_seen = value.get("last_seen_at")
+            if isinstance(last_seen, datetime):
+                value["last_seen_at"] = last_seen.isoformat()
+            normalized_sources.append(value)
+        normalized_sources.sort(key=lambda item: (-int(item["events"]), item["source"]))
+
+        top_events = [
+            {"event": name, "count": count}
+            for name, count in sorted(all_events.items(), key=lambda item: (-item[1], item[0]))[:10]
+        ]
+        return {
+            "total_events": total_events,
+            actor_label: len(actors),
+            "last_seen_at": latest_seen.isoformat() if latest_seen else None,
+            "by_source": normalized_sources,
+            "top_events": top_events,
+        }
+
+    summary: dict[str, Any] = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "days": days,
+        "anonymous": {
+            "total_events": 0,
+            "unique_installs": 0,
+            "last_seen_at": None,
+            "by_source": [],
+            "top_events": [],
+        },
+        "desktop": {
+            "total_events": 0,
+            "unique_users": 0,
+            "last_seen_at": None,
+            "by_source": [],
+            "top_events": [],
+        },
+    }
+
+    with compair.Session() as session:
+        if anonymous_model is not None:
+            anon_rows = session.execute(
+                select(
+                    anonymous_model.source,
+                    anonymous_model.event_name,
+                    anonymous_model.install_id,
+                    anonymous_model.app_version,
+                    anonymous_model.client_ts,
+                    anonymous_model.created_at,
+                ).where(
+                    or_(
+                        anonymous_model.client_ts >= cutoff,
+                        anonymous_model.created_at >= cutoff,
+                    )
+                )
+            ).all()
+            summary["anonymous"] = _bucket(list(anon_rows), "unique_installs")
+        if desktop_model is not None:
+            desktop_rows = session.execute(
+                select(
+                    desktop_model.source,
+                    desktop_model.event_name,
+                    desktop_model.user_id,
+                    desktop_model.app_version,
+                    desktop_model.client_ts,
+                    desktop_model.created_at,
+                ).where(
+                    or_(
+                        desktop_model.client_ts >= cutoff,
+                        desktop_model.created_at >= cutoff,
+                    )
+                )
+            ).all()
+            summary["desktop"] = _bucket(list(desktop_rows), "unique_users")
+
+    return summary
 
 
 @router.get("/notification_events")
