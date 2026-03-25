@@ -1,8 +1,10 @@
 import hashlib
+import math
 import os
 from typing import Any, List, Optional
 
 import requests
+import tiktoken
 
 from .logger import log_event
 
@@ -81,6 +83,59 @@ def _hash_embedding(text: str, dimension: int) -> List[float]:
     return vector
 
 
+def _embed_max_tokens() -> int:
+    raw = os.getenv("COMPAIR_OPENAI_EMBED_MAX_TOKENS", "8000")
+    try:
+        value = int(raw)
+    except ValueError:
+        return 8000
+    return value if value > 0 else 8000
+
+
+def _embed_encoding(model_name: str):
+    try:
+        return tiktoken.encoding_for_model(model_name)
+    except Exception:
+        return tiktoken.get_encoding("cl100k_base")
+
+
+def _token_count(text: str, model_name: str) -> int:
+    return len(_embed_encoding(model_name).encode(text or " "))
+
+
+def _split_text_for_embedding(text: str, model_name: str, max_tokens: int) -> list[tuple[str, int]]:
+    encoding = _embed_encoding(model_name)
+    tokens = encoding.encode(text or " ")
+    if len(tokens) <= max_tokens:
+        return [(text or " ", len(tokens))]
+    segments: list[tuple[str, int]] = []
+    for start in range(0, len(tokens), max_tokens):
+        token_chunk = tokens[start : start + max_tokens]
+        segment = encoding.decode(token_chunk)
+        if segment.strip():
+            segments.append((segment, len(token_chunk)))
+    return segments or [(" ", 1)]
+
+
+def _combine_embeddings(vectors: list[list[float]], weights: list[int]) -> list[float]:
+    if not vectors:
+        return []
+    if len(vectors) == 1:
+        return vectors[0]
+    dim = len(vectors[0])
+    total_weight = float(sum(max(1, weight) for weight in weights))
+    combined = [0.0] * dim
+    for vector, weight in zip(vectors, weights):
+        scale = float(max(1, weight))
+        for idx, value in enumerate(vector):
+            combined[idx] += float(value) * scale
+    combined = [value / total_weight for value in combined]
+    norm = math.sqrt(sum(value * value for value in combined))
+    if norm > 0:
+        combined = [value / norm for value in combined]
+    return combined
+
+
 def create_embedding(embedder: Embedder, text: str, user=None) -> list[float]:
     if embedder.is_cloud and cloud_create_embedding is not None:
         return cloud_create_embedding(embedder._cloud_impl, text, user=user)
@@ -124,26 +179,38 @@ def create_embeddings(embedder: Embedder, texts: list[str], user=None) -> list[l
                 client = openai.OpenAI()
             embedder._openai_client = client  # type: ignore[attr-defined]
         try:
+            vectors: list[list[float] | None] = [None] * len(texts)
+            regular: list[tuple[int, str]] = []
+            max_tokens = _embed_max_tokens()
+            for idx, text in enumerate(texts):
+                if _token_count(text, embedder.openai_embed_model) > max_tokens:
+                    vectors[idx] = create_embedding(embedder, text, user=user)
+                else:
+                    regular.append((idx, text))
             if client is not None and hasattr(client, "embeddings"):
-                response = client.embeddings.create(
-                    model=embedder.openai_embed_model,
-                    input=texts,
-                )
-                ordered = sorted(
-                    list(getattr(response, "data", []) or []),
-                    key=lambda row: getattr(row, "index", 0),
-                )
-                vectors = [getattr(row, "embedding", None) for row in ordered]
-                if len(vectors) == len(texts) and all(isinstance(vector, list) for vector in vectors):
+                if regular:
+                    response = client.embeddings.create(
+                        model=embedder.openai_embed_model,
+                        input=[text for _, text in regular],
+                    )
+                    ordered = sorted(
+                        list(getattr(response, "data", []) or []),
+                        key=lambda row: getattr(row, "index", 0),
+                    )
+                    for (item_idx, _), row in zip(regular, ordered):
+                        vectors[item_idx] = getattr(row, "embedding", None)
+                if all(isinstance(vector, list) for vector in vectors):
                     return vectors  # type: ignore[return-value]
             elif hasattr(openai, "Embedding"):
-                response = openai.Embedding.create(  # type: ignore[attr-defined]
-                    model=embedder.openai_embed_model,
-                    input=texts,
-                )
-                data = sorted(response["data"], key=lambda row: row.get("index", 0))  # type: ignore[index]
-                vectors = [row.get("embedding") for row in data]
-                if len(vectors) == len(texts) and all(isinstance(vector, list) for vector in vectors):
+                if regular:
+                    response = openai.Embedding.create(  # type: ignore[attr-defined]
+                        model=embedder.openai_embed_model,
+                        input=[text for _, text in regular],
+                    )
+                    data = sorted(response["data"], key=lambda row: row.get("index", 0))  # type: ignore[index]
+                    for (item_idx, _), row in zip(regular, data):
+                        vectors[item_idx] = row.get("embedding")
+                if all(isinstance(vector, list) for vector in vectors):
                     return vectors  # type: ignore[return-value]
         except Exception as exc:  # pragma: no cover - network/API failure
             log_event("openai_embedding_batch_failed", error=str(exc))
@@ -164,6 +231,27 @@ def _openai_embedding(embedder: Embedder, text: str) -> list[float] | None:
         embedder._openai_client = client  # type: ignore[attr-defined]
 
     try:
+        token_count = _token_count(text, embedder.openai_embed_model)
+        if token_count > _embed_max_tokens():
+            parts = _split_text_for_embedding(text, embedder.openai_embed_model, _embed_max_tokens())
+            if client is not None and hasattr(client, "embeddings"):
+                response = client.embeddings.create(
+                    model=embedder.openai_embed_model,
+                    input=[part for part, _ in parts],
+                )
+                data = sorted(list(getattr(response, "data", []) or []), key=lambda row: getattr(row, "index", 0))
+                vectors = [getattr(row, "embedding", None) for row in data]
+            elif hasattr(openai, "Embedding"):
+                response = openai.Embedding.create(  # type: ignore[attr-defined]
+                    model=embedder.openai_embed_model,
+                    input=[part for part, _ in parts],
+                )
+                data = sorted(response["data"], key=lambda row: row.get("index", 0))  # type: ignore[index]
+                vectors = [row.get("embedding") for row in data]
+            else:
+                vectors = None
+            if vectors and all(isinstance(vector, list) for vector in vectors):
+                return _combine_embeddings(vectors, [weight for _, weight in parts])  # type: ignore[arg-type]
         if client is not None and hasattr(client, "embeddings"):
             response = client.embeddings.create(
                 model=embedder.openai_embed_model,
