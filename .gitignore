@@ -10,4 +10,5 @@ compair_core.egg-info/
 .release.env*
 .devcontainer/
 .vscode/
+.compair/
 dist/

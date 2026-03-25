@@ -112,6 +112,116 @@ def _purge_notification_events_for_docs(session: Session, doc_ids: list[str]) ->
     return deleted
 
 
+def _member_group_ids(
+    session: Session,
+    user_id: str | None,
+    *,
+    exclude_compair: bool = False,
+) -> set[str]:
+    user_to_group_table = getattr(models, "user_to_group_table", None)
+    if user_to_group_table is None or not user_id:
+        return set()
+    stmt = (
+        select(models.Group.group_id)
+        .select_from(models.Group)
+        .join(user_to_group_table, models.Group.group_id == user_to_group_table.c.group_id)
+        .where(user_to_group_table.c.user_id == user_id)
+    )
+    if exclude_compair:
+        stmt = stmt.where(models.Group.category != "Compair")
+    return {
+        group_id
+        for group_id in session.execute(stmt).scalars().all()
+        if group_id
+    }
+
+
+def _invited_group_ids(session: Session, email: str | None) -> set[str]:
+    if not email:
+        return set()
+    stmt = select(models.GroupInvitation.group_id).where(
+        models.GroupInvitation.email == email,
+        models.GroupInvitation.status == "sent",
+    )
+    return {
+        group_id
+        for group_id in session.execute(stmt).scalars().all()
+        if group_id
+    }
+
+
+def _group_user_counts(session: Session, group_ids: list[str]) -> dict[str, int]:
+    user_to_group_table = getattr(models, "user_to_group_table", None)
+    if user_to_group_table is None or not group_ids:
+        return {}
+    stmt = (
+        select(
+            user_to_group_table.c.group_id,
+            func.count(user_to_group_table.c.user_id),
+        )
+        .where(user_to_group_table.c.group_id.in_(group_ids))
+        .group_by(user_to_group_table.c.group_id)
+    )
+    return {group_id: int(count or 0) for group_id, count in session.execute(stmt).all()}
+
+
+def _group_document_counts(session: Session, group_ids: list[str]) -> dict[str, int]:
+    document_to_group_table = getattr(models, "document_to_group_table", None)
+    if document_to_group_table is None or not group_ids:
+        return {}
+    stmt = (
+        select(
+            document_to_group_table.c.group_id,
+            func.count(document_to_group_table.c.document_id),
+        )
+        .where(document_to_group_table.c.group_id.in_(group_ids))
+        .group_by(document_to_group_table.c.group_id)
+    )
+    return {group_id: int(count or 0) for group_id, count in session.execute(stmt).all()}
+
+
+def _group_first_three_profile_images(session: Session, group_ids: list[str]) -> dict[str, list[str | None]]:
+    user_to_group_table = getattr(models, "user_to_group_table", None)
+    if user_to_group_table is None or not group_ids:
+        return {}
+
+    out: dict[str, list[str | None]] = {}
+    try:
+        ranked = (
+            select(
+                user_to_group_table.c.group_id.label("group_id"),
+                models.User.profile_image.label("profile_image"),
+                func.row_number().over(
+                    partition_by=user_to_group_table.c.group_id,
+                    order_by=models.User.user_id,
+                ).label("rn"),
+            )
+            .select_from(user_to_group_table)
+            .join(models.User, models.User.user_id == user_to_group_table.c.user_id)
+            .where(user_to_group_table.c.group_id.in_(group_ids))
+            .subquery()
+        )
+        rows = session.execute(
+            select(ranked.c.group_id, ranked.c.profile_image)
+            .where(ranked.c.rn <= 3)
+            .order_by(ranked.c.group_id.asc(), ranked.c.rn.asc())
+        ).all()
+    except Exception:
+        rows = session.execute(
+            select(user_to_group_table.c.group_id, models.User.profile_image)
+            .select_from(user_to_group_table)
+            .join(models.User, models.User.user_id == user_to_group_table.c.user_id)
+            .where(user_to_group_table.c.group_id.in_(group_ids))
+            .order_by(user_to_group_table.c.group_id.asc(), models.User.user_id.asc())
+        ).all()
+
+    for group_id, profile_image in rows:
+        bucket = out.setdefault(group_id, [])
+        if len(bucket) < 3:
+            bucket.append(profile_image)
+    return out
+
+
 def _request_source(request: Request) -> Optional[str]:
     return request.headers.get("referer") or request.headers.get("origin")
 
@@ -1249,28 +1359,12 @@ def load_groups(
     with compair.Session() as session:
         # --- User-based group selection ---
         if user_id is None:
-            q = session.query(models.Group).options(
-                joinedload(models.Group.users),
-                joinedload(models.Group.documents)
-            ).filter(
+            q = session.query(models.Group).filter(
                 models.Group.visibility != 'private'
             )
         else:
-            user = session.query(models.User).options(
-                joinedload(models.User.groups).joinedload(models.Group.users),
-                joinedload(models.User.groups).joinedload(models.Group.documents)
-            ).filter(
-                models.User.user_id == current_user.user_id
-            ).first()
-            user_group_ids = [g.group_id for g in user.groups if g.category!='Compair']
-
-            invited_group_ids = set()
-            invitations = session.query(models.GroupInvitation).filter(
-                models.GroupInvitation.email == user.username,
-                models.GroupInvitation.status == "sent"
-            ).all()
-            invited_group_ids.update([i.group_id for i in invitations])
-
+            user_group_ids = _member_group_ids(session, current_user.user_id, exclude_compair=True)
+            invited_group_ids = _invited_group_ids(session, current_user.username)
             accessible_group_ids = set(user_group_ids) | invited_group_ids
 
             if own_groups_only:
@@ -1320,7 +1414,11 @@ def load_groups(
         total_count = q.count()
         offset = (page - 1) * page_size
         groups = q.offset(offset).limit(page_size).all()
-            
+        group_ids = [group.group_id for group in groups if group.group_id]
+        user_counts = _group_user_counts(session, group_ids)
+        document_counts = _group_document_counts(session, group_ids)
+        profile_images = _group_first_three_profile_images(session, group_ids)
+
         result = [
             {
                 "group_id": group.group_id,
@@ -1330,9 +1428,9 @@ def load_groups(
                 "category": group.category,
                 "description": group.description,
                 "visibility": group.visibility,
-                "document_count": group.document_count,
-                "user_count": group.user_count,
-                "first_three_user_profile_images": group.first_three_user_profile_images
+                "document_count": document_counts.get(group.group_id, 0),
+                "user_count": user_counts.get(group.group_id, 0),
+                "first_three_user_profile_images": profile_images.get(group.group_id, []),
             }
             for group in groups
         ]
@@ -1856,9 +1954,25 @@ def create_doc(
         if target_group_ids:
             q = select(models.Group).filter(models.Group.group_id.in_(target_group_ids))
             resolved_groups = session.execute(q).scalars().all()
-            if not resolved_groups:
+            resolved_by_id = {group.group_id: group for group in resolved_groups}
+            if not resolved_by_id:
                 raise HTTPException(status_code=404, detail="No matching groups found for provided IDs.")
-            document.groups = resolved_groups
+            missing_group_ids = [group_id for group_id in target_group_ids if group_id not in resolved_by_id]
+            if missing_group_ids:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No matching groups found for provided IDs.",
+                )
+
+            member_group_ids = _member_group_ids(session, current_user.user_id, exclude_compair=True)
+            denied_group_ids = [group_id for group_id in target_group_ids if group_id not in member_group_ids]
+            if denied_group_ids:
+                raise HTTPException(
+                    status_code=403,
+                    detail="You do not belong to one or more requested groups.",
+                )
+
+            document.groups = [resolved_by_id[group_id] for group_id in target_group_ids]
         else:
             q = select(models.Group).filter(models.Group.name == current_user.username)
             default_group = session.execute(q).scalars().first()
