@@ -14,9 +14,11 @@ except ImportError:  # pragma: no cover - optional dependency
 try:
     from compair_cloud.embeddings import Embedder as CloudEmbedder  # type: ignore
     from compair_cloud.embeddings import create_embedding as cloud_create_embedding  # type: ignore
+    from compair_cloud.embeddings import create_embeddings as cloud_create_embeddings  # type: ignore
 except (ImportError, ModuleNotFoundError):
     CloudEmbedder = None
     cloud_create_embedding = None
+    cloud_create_embeddings = None
 
 
 class Embedder:
@@ -103,6 +105,50 @@ def create_embedding(embedder: Embedder, text: str, user=None) -> list[float]:
             log_event("local_embedding_failed", error=str(exc))
 
     return _hash_embedding(text, embedder.dimension)
+
+
+def create_embeddings(embedder: Embedder, texts: list[str], user=None) -> list[list[float]]:
+    if not texts:
+        return []
+    if embedder.is_cloud and cloud_create_embeddings is not None:
+        return cloud_create_embeddings(embedder._cloud_impl, texts, user=user)
+
+    provider = getattr(embedder, "provider", "local")
+    if provider == "openai" and openai is not None:
+        client = getattr(embedder, "_openai_client", None)
+        if client is None and hasattr(openai, "OpenAI"):
+            api_key = os.getenv("COMPAIR_OPENAI_API_KEY")
+            try:  # pragma: no cover - optional client differences
+                client = openai.OpenAI(api_key=api_key) if api_key else openai.OpenAI()  # type: ignore[attr-defined]
+            except TypeError:
+                client = openai.OpenAI()
+            embedder._openai_client = client  # type: ignore[attr-defined]
+        try:
+            if client is not None and hasattr(client, "embeddings"):
+                response = client.embeddings.create(
+                    model=embedder.openai_embed_model,
+                    input=texts,
+                )
+                ordered = sorted(
+                    list(getattr(response, "data", []) or []),
+                    key=lambda row: getattr(row, "index", 0),
+                )
+                vectors = [getattr(row, "embedding", None) for row in ordered]
+                if len(vectors) == len(texts) and all(isinstance(vector, list) for vector in vectors):
+                    return vectors  # type: ignore[return-value]
+            elif hasattr(openai, "Embedding"):
+                response = openai.Embedding.create(  # type: ignore[attr-defined]
+                    model=embedder.openai_embed_model,
+                    input=texts,
+                )
+                data = sorted(response["data"], key=lambda row: row.get("index", 0))  # type: ignore[index]
+                vectors = [row.get("embedding") for row in data]
+                if len(vectors) == len(texts) and all(isinstance(vector, list) for vector in vectors):
+                    return vectors  # type: ignore[return-value]
+        except Exception as exc:  # pragma: no cover - network/API failure
+            log_event("openai_embedding_batch_failed", error=str(exc))
+
+    return [create_embedding(embedder, text, user=user) for text in texts]
 
 
 def _openai_embedding(embedder: Embedder, text: str) -> list[float] | None:

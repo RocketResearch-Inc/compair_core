@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm.attributes import get_history
 from sqlalchemy.orm import Session as SASession
 
-from .embeddings import create_embedding, Embedder
+from .embeddings import create_embedding, create_embeddings, Embedder
 from .feedback import get_feedback, Reviewer
 from .models import (
     Chunk,
@@ -426,6 +426,7 @@ def process_document(
             remaining_slots = max((feedback_limit - recent_feedback_count - len(indices_to_generate_feedback)), 0)
             existing_indices_to_generate_feedback = existing_indices[:remaining_slots]
 
+    new_chunk_embeddings = create_embeddings(embedder, new_chunks, user=user) if new_chunks else []
     for i, chunk in enumerate(new_chunks):
         should_generate_feedback = i in indices_to_generate_feedback
         process_text(
@@ -435,6 +436,7 @@ def process_document(
             doc=doc,
             text=chunk,
             generate_feedback=should_generate_feedback,
+            precomputed_embedding=new_chunk_embeddings[i],
         )
 
     for idx in existing_indices_to_generate_feedback:
@@ -620,6 +622,7 @@ def process_text(
     text: str,
     generate_feedback: bool = True,
     note: Note | None = None,
+    precomputed_embedding: list[float] | None = None,
 ) -> None:
     logger = logging.getLogger(__name__)
     chunk_hash = stable_chunk_hash(text)
@@ -635,13 +638,21 @@ def process_text(
     )
 
     user = session.query(User).filter(User.user_id == doc.author_id).first()
-    if existing_chunks.first():
-        for chunk in existing_chunks:
+    existing_rows = existing_chunks.all()
+    existing_chunk = existing_rows[0] if existing_rows else None
+
+    embedding = precomputed_embedding
+    if existing_rows:
+        for chunk in existing_rows:
             if chunk.hash != chunk_hash:
                 chunk.hash = chunk_hash
+            if embedding is None and chunk.embedding is not None:
+                embedding = chunk.embedding
+        if embedding is None:
+            embedding = create_embedding(embedder, text, user=user)
+        for chunk in existing_rows:
             if chunk.embedding is None:
-                embedding = create_embedding(embedder, text, user=user)
-                existing_chunks.update({"embedding": embedding})
+                chunk.embedding = embedding
         session.commit()
     else:
         chunk = Chunk(
@@ -651,17 +662,19 @@ def process_text(
             chunk_type=chunk_type,
             content=text,
         )
-        embedding = create_embedding(embedder, text, user=user)
+        if embedding is None:
+            embedding = create_embedding(embedder, text, user=user)
         chunk.embedding = embedding
         session.add(chunk)
         session.commit()
         existing_chunk = chunk
-    existing_chunk = session.query(Chunk).filter(
-        Chunk.document_id == doc.document_id,
-        Chunk.chunk_type == chunk_type,
-        Chunk.note_id == note_id,
-        Chunk.content == text,
-    ).first()
+    if existing_chunk is None:
+        existing_chunk = session.query(Chunk).filter(
+            Chunk.document_id == doc.document_id,
+            Chunk.chunk_type == chunk_type,
+            Chunk.note_id == note_id,
+            Chunk.content == text,
+        ).first()
 
     references: list[Chunk] = []
     if generate_feedback and existing_chunk:
