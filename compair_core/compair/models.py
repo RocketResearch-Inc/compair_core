@@ -391,7 +391,7 @@ class Feedback(Base):
     source_chunk_id: Mapped[str] = mapped_column(ForeignKey("chunk.chunk_id", ondelete="CASCADE"), index=True)
     feedback: Mapped[str] = mapped_column(Text)
     model: Mapped[str] = mapped_column(Text)
-    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.now(timezone.utc))
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     user_feedback: Mapped[str | None] = mapped_column(String(16), nullable=True, default=None)
     is_hidden: Mapped[bool] = mapped_column(Boolean, default=False)
 

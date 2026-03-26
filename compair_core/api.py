@@ -290,6 +290,18 @@ def _dispatch_process_document_task(
             return process_document_celery(user_id, doc_id, doc_text, generate_feedback)
 
 
+def _json_safe_task_meta(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe_task_meta(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_task_meta(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
 def _ensure_single_user(session: Session, settings: Settings) -> models.User:
     """Create or fetch the singleton user used when authentication is disabled."""
     changed = False
@@ -2201,15 +2213,25 @@ async def get_process_status(
     task_id: str
 ):
     task_result = AsyncResult(task_id)
-    print(task_result)
-    print(task_result.status)
-    if task_result.status == "SUCCESS":
+    status = task_result.status
+    info = task_result.info
+    if status == "SUCCESS":
         result = task_result.result
-    elif task_result.status == "PENDING":
+    elif status in {"FAILURE", "FAILED", "REVOKED"}:
+        result = "Task failed."
+    elif status == "PENDING":
         result = "Task is still processing."
     else:
-        result = "Task failed."
-    return {"task_id": task_id, "status": task_result.status, "result": result}
+        result = "Task is running."
+
+    payload = {"task_id": task_id, "status": status, "result": result}
+    if isinstance(info, Mapping):
+        payload["meta"] = _json_safe_task_meta(info)
+        if "message" in info and isinstance(info["message"], str):
+            payload["message"] = info["message"]
+    elif info not in (None, result):
+        payload["message"] = str(info)
+    return payload
 
 
 @router.get("/trial_status")
