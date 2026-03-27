@@ -741,6 +741,65 @@ def process_text(
             )
             session.add(sql_feedback)
             session.commit()
+            try:
+                from .notifications.service import (
+                    NotificationCandidate,
+                    PeerCandidate,
+                    is_scoring_enabled,
+                    score_and_route_candidate,
+                )
+
+                if is_scoring_enabled() and doc.groups:
+                    peer_candidates: list[PeerCandidate] = []
+                    for ref_chunk in references:
+                        ref_doc = ref_chunk.document
+                        ref_user = ref_doc.user if ref_doc else None
+                        peer_candidates.append(
+                            PeerCandidate(
+                                doc_id=ref_doc.document_id if ref_doc else "",
+                                doc_title=ref_doc.title if ref_doc else "",
+                                chunk_id=ref_chunk.chunk_id,
+                                chunk_text=ref_chunk.content,
+                                doc_type=ref_doc.doc_type if ref_doc else "",
+                                author_role=ref_user.role if ref_user and ref_user.role else "",
+                                author_team="",
+                                last_modified_utc=(
+                                    ref_doc.datetime_modified.isoformat()
+                                    if ref_doc and ref_doc.datetime_modified
+                                    else None
+                                ),
+                                similarity=None,
+                            )
+                        )
+                    if peer_candidates:
+                        candidate = NotificationCandidate(
+                            user_id=user.user_id if user else doc.user_id,
+                            group_id=doc.groups[0].group_id,
+                            target_doc_id=doc.document_id,
+                            target_chunk_id=existing_chunk.chunk_id,
+                            target_text=text,
+                            target_doc_title=doc.title or "",
+                            target_doc_type=doc.doc_type or "",
+                            target_last_modified_utc=(
+                                doc.datetime_modified.isoformat() if doc.datetime_modified else None
+                            ),
+                            user_role=user.role if user and user.role else "",
+                            user_team="",
+                            user_is_doc_author=True,
+                            user_is_group_admin=False,
+                            peer_candidates=tuple(peer_candidates),
+                            generated_feedback={"summary": feedback},
+                            run_id=f"feedback_{sql_feedback.feedback_id}",
+                            now_utc=datetime.now(timezone.utc),
+                        )
+                        score_and_route_candidate(
+                            session,
+                            candidate,
+                            commit=True,
+                            delivery_channel="inbox_only",
+                        )
+            except Exception as exc:
+                logger.warning("Notification scoring failed: %s", exc)
 
 
 def remove_text(session: SASession, text: str, document_id: str) -> None:

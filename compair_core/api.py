@@ -30,13 +30,20 @@ from . import compair
 from .compair import models, schema
 from .compair.embeddings import create_embedding, Embedder
 from .compair.logger import log_event 
-from .compair.utils import chunk_text, generate_verification_token, log_activity
+from .compair.utils import (
+    chunk_text,
+    generate_verification_token,
+    log_activity,
+    sign_compact_payload,
+    verify_compact_payload,
+)
 from .compair_email.email import emailer, EMAIL_USER
 from .compair_email.templates import (
     ACCOUNT_VERIFY_TEMPLATE, 
     GROUP_INVITATION_TEMPLATE, 
     GROUP_JOIN_TEMPLATE, 
     INDIVIDUAL_INVITATION_TEMPLATE, 
+    NOTIFICATION_DELIVERY_VERIFY_TEMPLATE,
     PASSWORD_RESET_TEMPLATE, 
     REFERRAL_CREDIT_TEMPLATE
 )
@@ -69,6 +76,8 @@ redis_client = redis.Redis.from_url(redis_url) if (redis and redis_url) else Non
 #from compair.main import process_document
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+DEFAULT_NOTIFICATION_DIGEST_FREQUENCY = "daily"
+DEFAULT_NOTIFICATION_BUCKETS = ["conflicts", "updates", "overlaps", "validation"]
 
 
 def _clean_text(value: Optional[str], max_len: int) -> Optional[str]:
@@ -87,6 +96,171 @@ def _clean_email(value: Optional[str]) -> Optional[str]:
     if not _EMAIL_RE.match(cleaned):
         return None
     return cleaned
+
+
+def _notification_pref_payload_value(payload: Optional[dict[str, Any]], key: str, fallback: Any) -> Any:
+    if isinstance(payload, dict) and key in payload:
+        return payload[key]
+    return fallback
+
+
+def _is_legacy_notification_pref_defaults(prefs: models.NotificationPreferences) -> bool:
+    created_at = getattr(prefs, "created_at", None)
+    updated_at = getattr(prefs, "updated_at", None)
+    untouched = False
+    if created_at and updated_at:
+        try:
+            untouched = abs((updated_at - created_at).total_seconds()) < 1
+        except Exception:
+            untouched = False
+    if not untouched:
+        return False
+    return (
+        not prefs.email_digest_enabled
+        and (prefs.email_digest_frequency or "").strip().lower() == "never"
+        and prefs.push_notifications_enabled
+        and prefs.digest_buckets_enabled is None
+        and not prefs.quiet_hours_start
+        and not prefs.quiet_hours_end
+        and prefs.max_daily_push_emails == 1
+    )
+
+
+def _notification_unsubscribe_secret(settings: Settings) -> Optional[str]:
+    secret = (settings.notification_unsubscribe_secret or settings.google_oauth_state_secret or "").strip()
+    return secret or None
+
+
+def _notification_link_secret(settings: Settings) -> Optional[str]:
+    return _notification_unsubscribe_secret(settings)
+
+
+def _notification_unsubscribe_response(title: str, message: str) -> HTMLResponse:
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>{title}</title>
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                background: #f6f7fb;
+                color: #1f2937;
+                margin: 0;
+                padding: 32px 16px;
+            }}
+            .card {{
+                max-width: 560px;
+                margin: 0 auto;
+                background: #ffffff;
+                border-radius: 12px;
+                padding: 28px 24px;
+                box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+            }}
+            h1 {{
+                margin-top: 0;
+                font-size: 24px;
+            }}
+            p {{
+                line-height: 1.6;
+                margin-bottom: 0;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>{title}</h1>
+            <p>{message}</p>
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
+
+def _normalize_notification_delivery_email(value: Optional[str]) -> str:
+    return (value or "").strip().lower()
+
+
+def _notification_delivery_verified(prefs: models.NotificationPreferences) -> bool:
+    return bool(
+        _normalize_notification_delivery_email(getattr(prefs, "notification_delivery_email", None))
+        and getattr(prefs, "notification_delivery_email_verified_at", None)
+    )
+
+
+def _notification_delivery_effective_email(
+    current_user: models.User,
+    prefs: models.NotificationPreferences,
+) -> str:
+    if _notification_delivery_verified(prefs):
+        return _normalize_notification_delivery_email(prefs.notification_delivery_email)
+    return _normalize_notification_delivery_email(current_user.username)
+
+
+def _serialize_notification_preferences(
+    current_user: models.User,
+    prefs: models.NotificationPreferences,
+) -> dict[str, Any]:
+    verified = _notification_delivery_verified(prefs)
+    verified_email = _normalize_notification_delivery_email(prefs.notification_delivery_email) if verified else None
+    pending_email = _normalize_notification_delivery_email(prefs.notification_delivery_email_pending) or None
+    return {
+        "preferences_id": prefs.preferences_id,
+        "email_digest_enabled": prefs.email_digest_enabled,
+        "email_digest_frequency": prefs.email_digest_frequency,
+        "push_notifications_enabled": prefs.push_notifications_enabled,
+        "digest_buckets_enabled": prefs.digest_buckets_enabled or DEFAULT_NOTIFICATION_BUCKETS,
+        "quiet_hours_start": prefs.quiet_hours_start,
+        "quiet_hours_end": prefs.quiet_hours_end,
+        "max_daily_push_emails": prefs.max_daily_push_emails,
+        "account_email": _normalize_notification_delivery_email(current_user.username),
+        "notification_delivery_email": verified_email,
+        "notification_delivery_email_pending": pending_email,
+        "notification_delivery_email_verified": verified,
+        "notification_delivery_email_verified_at": (
+            prefs.notification_delivery_email_verified_at.isoformat()
+            if prefs.notification_delivery_email_verified_at
+            else None
+        ),
+        "notification_delivery_email_effective": _notification_delivery_effective_email(current_user, prefs),
+        "notification_delivery_email_source": "alternate" if verified else "account",
+    }
+
+
+def _get_or_create_notification_preferences(
+    session: Session,
+    current_user: models.User,
+) -> models.NotificationPreferences:
+    prefs = session.query(models.NotificationPreferences).filter(
+        models.NotificationPreferences.user_id == current_user.user_id
+    ).first()
+    if not prefs:
+        prefs = models.NotificationPreferences(
+            user_id=current_user.user_id,
+            email_digest_enabled=False,
+            email_digest_frequency=DEFAULT_NOTIFICATION_DIGEST_FREQUENCY,
+            push_notifications_enabled=False,
+            digest_buckets_enabled=None,
+            quiet_hours_start=None,
+            quiet_hours_end=None,
+            max_daily_push_emails=1,
+            notification_delivery_email=None,
+            notification_delivery_email_pending=None,
+            notification_delivery_email_verified_at=None,
+        )
+        session.add(prefs)
+        session.commit()
+        session.refresh(prefs)
+    elif _is_legacy_notification_pref_defaults(prefs):
+        prefs.email_digest_frequency = DEFAULT_NOTIFICATION_DIGEST_FREQUENCY
+        prefs.push_notifications_enabled = False
+        prefs.updated_at = datetime.now(timezone.utc)
+        session.commit()
+        session.refresh(prefs)
+    return prefs
 
 
 def _purge_notification_events_for_docs(session: Session, doc_ids: list[str]) -> int:
@@ -3101,8 +3275,6 @@ def get_activity_feed(
 ):
     """Retrieve recent activities for a user's groups."""
     require_feature(HAS_ACTIVITY, "Activity feed")
-    if not IS_CLOUD:
-        raise HTTPException(status_code=501, detail="Activity feed is only available in the Compair Cloud edition.")
     with compair.Session() as session:
         # Default to current user if none provided
         user_id = user_id or current_user.user_id
@@ -3573,6 +3745,7 @@ def get_client_metrics_summary(
 
 
 @router.get("/notification_events")
+@core_router.get("/notification_events")
 def get_notification_events(
     group_id: Optional[str] = None,
     page: int = 1,
@@ -3581,8 +3754,6 @@ def get_notification_events(
     include_dismissed: bool = False,
     current_user: models.User = Depends(get_current_user),
 ):
-    if not IS_CLOUD:
-        raise HTTPException(status_code=501, detail="Notifications are only available in the Compair Cloud edition.")
     with compair.Session() as session:
         group_ids = [g.group_id for g in current_user.groups]
         q = session.query(models.NotificationEvent).filter(
@@ -3617,12 +3788,11 @@ def get_notification_events(
 
 
 @router.post("/notification_events/{event_id}/acknowledge")
+@core_router.post("/notification_events/{event_id}/acknowledge")
 def acknowledge_notification_event(
     event_id: str,
     current_user: models.User = Depends(get_current_user),
 ):
-    if not IS_CLOUD:
-        raise HTTPException(status_code=501, detail="Notifications are only available in the Compair Cloud edition.")
     with compair.Session() as session:
         event = (
             session.query(models.NotificationEvent)
@@ -3646,12 +3816,11 @@ def acknowledge_notification_event(
 
 
 @router.post("/notification_events/{event_id}/dismiss")
+@core_router.post("/notification_events/{event_id}/dismiss")
 def dismiss_notification_event(
     event_id: str,
     current_user: models.User = Depends(get_current_user),
 ):
-    if not IS_CLOUD:
-        raise HTTPException(status_code=501, detail="Notifications are only available in the Compair Cloud edition.")
     with compair.Session() as session:
         event = (
             session.query(models.NotificationEvent)
@@ -3679,13 +3848,12 @@ def dismiss_notification_event(
 
 
 @router.post("/notification_events/{event_id}/share")
+@core_router.post("/notification_events/{event_id}/share")
 def share_notification_event(
     event_id: str,
     note: Optional[str] = Body(default=None, embed=True),
     current_user: models.User = Depends(get_current_user),
 ):
-    if not IS_CLOUD:
-        raise HTTPException(status_code=501, detail="Notifications are only available in the Compair Cloud edition.")
     with compair.Session() as session:
         event = (
             session.query(models.NotificationEvent)
@@ -4977,9 +5145,10 @@ def submit_deactivate_request(
         return {"message": f"We've received your request and will delete your account and data shortly. If you change your mind, reach out within 24 hours at {EMAIL_USER}."}
 
 
-# ===== Notification Endpoints (Cloud only) =====
+# ===== Notification Endpoints =====
 
 @router.get("/notifications")
+@core_router.get("/notifications")
 def get_notifications(
     page: int = 1,
     page_size: int = 20,
@@ -4987,30 +5156,22 @@ def get_notifications(
     current_user: models.User = Depends(get_current_user)
 ):
     """Fetch user's notifications with pagination and filtering."""
-    if not IS_CLOUD:
-        raise HTTPException(status_code=404, detail="Notifications are only available in Cloud edition.")
-
     with compair.Session() as session:
-        try:
-            from compair_cloud.models import NotificationEvent
-        except ImportError:
-            raise HTTPException(status_code=501, detail="Notification system not available.")
-
-        query = session.query(NotificationEvent).filter(
-            NotificationEvent.user_id == current_user.user_id
+        query = session.query(models.NotificationEvent).filter(
+            models.NotificationEvent.user_id == current_user.user_id
         )
 
         # Apply filters
         if filter_type == "unread":
-            query = query.filter(NotificationEvent.acknowledged_at.is_(None))
+            query = query.filter(models.NotificationEvent.acknowledged_at.is_(None))
         elif filter_type in ["conflicts", "updates", "overlaps", "validation"]:
-            query = query.filter(NotificationEvent.digest_bucket == filter_type)
+            query = query.filter(models.NotificationEvent.digest_bucket == filter_type)
 
         # Don't show dropped notifications
-        query = query.filter(NotificationEvent.delivery_action != "drop")
+        query = query.filter(models.NotificationEvent.delivery_action != "drop")
 
         # Order by priority (desc) then created_at (desc)
-        query = query.order_by(NotificationEvent.created_at.desc())
+        query = query.order_by(models.NotificationEvent.created_at.desc())
 
         # Count total
         total_count = query.count()
@@ -5051,45 +5212,31 @@ def get_notifications(
 
 
 @router.get("/notifications/unread_count")
+@core_router.get("/notifications/unread_count")
 def get_unread_count(current_user: models.User = Depends(get_current_user)):
     """Get count of unread notifications for badge display."""
-    if not IS_CLOUD:
-        return {"count": 0}
-
     with compair.Session() as session:
-        try:
-            from compair_cloud.models import NotificationEvent
-        except ImportError:
-            return {"count": 0}
-
-        count = session.query(NotificationEvent).filter(
-            NotificationEvent.user_id == current_user.user_id,
-            NotificationEvent.acknowledged_at.is_(None),
-            NotificationEvent.dismissed_at.is_(None),
-            NotificationEvent.delivery_action != "drop"
+        count = session.query(models.NotificationEvent).filter(
+            models.NotificationEvent.user_id == current_user.user_id,
+            models.NotificationEvent.acknowledged_at.is_(None),
+            models.NotificationEvent.dismissed_at.is_(None),
+            models.NotificationEvent.delivery_action != "drop"
         ).count()
 
         return {"count": count}
 
 
 @router.post("/notifications/{event_id}/acknowledge")
+@core_router.post("/notifications/{event_id}/acknowledge")
 def acknowledge_notification(
     event_id: str,
     current_user: models.User = Depends(get_current_user)
 ):
     """Mark a notification as read/acknowledged."""
-    if not IS_CLOUD:
-        raise HTTPException(status_code=404, detail="Notifications are only available in Cloud edition.")
-
     with compair.Session() as session:
-        try:
-            from compair_cloud.models import NotificationEvent
-        except ImportError:
-            raise HTTPException(status_code=501, detail="Notification system not available.")
-
-        notification = session.query(NotificationEvent).filter(
-            NotificationEvent.event_id == event_id,
-            NotificationEvent.user_id == current_user.user_id
+        notification = session.query(models.NotificationEvent).filter(
+            models.NotificationEvent.event_id == event_id,
+            models.NotificationEvent.user_id == current_user.user_id
         ).first()
 
         if not notification:
@@ -5102,23 +5249,16 @@ def acknowledge_notification(
 
 
 @router.post("/notifications/{event_id}/dismiss")
+@core_router.post("/notifications/{event_id}/dismiss")
 def dismiss_notification(
     event_id: str,
     current_user: models.User = Depends(get_current_user)
 ):
     """Dismiss a notification (won't show in UI anymore)."""
-    if not IS_CLOUD:
-        raise HTTPException(status_code=404, detail="Notifications are only available in Cloud edition.")
-
     with compair.Session() as session:
-        try:
-            from compair_cloud.models import NotificationEvent
-        except ImportError:
-            raise HTTPException(status_code=501, detail="Notification system not available.")
-
-        notification = session.query(NotificationEvent).filter(
-            NotificationEvent.event_id == event_id,
-            NotificationEvent.user_id == current_user.user_id
+        notification = session.query(models.NotificationEvent).filter(
+            models.NotificationEvent.event_id == event_id,
+            models.NotificationEvent.user_id == current_user.user_id
         ).first()
 
         if not notification:
@@ -5131,22 +5271,15 @@ def dismiss_notification(
 
 
 @router.post("/notifications/mark_all_read")
+@core_router.post("/notifications/mark_all_read")
 def mark_all_notifications_read(current_user: models.User = Depends(get_current_user)):
     """Mark all unread notifications as acknowledged."""
-    if not IS_CLOUD:
-        raise HTTPException(status_code=404, detail="Notifications are only available in Cloud edition.")
-
     with compair.Session() as session:
-        try:
-            from compair_cloud.models import NotificationEvent
-        except ImportError:
-            raise HTTPException(status_code=501, detail="Notification system not available.")
-
         now = datetime.now(timezone.utc)
-        updated_count = session.query(NotificationEvent).filter(
-            NotificationEvent.user_id == current_user.user_id,
-            NotificationEvent.acknowledged_at.is_(None),
-            NotificationEvent.dismissed_at.is_(None)
+        updated_count = session.query(models.NotificationEvent).filter(
+            models.NotificationEvent.user_id == current_user.user_id,
+            models.NotificationEvent.acknowledged_at.is_(None),
+            models.NotificationEvent.dismissed_at.is_(None)
         ).update({"acknowledged_at": now})
 
         session.commit()
@@ -5154,52 +5287,155 @@ def mark_all_notifications_read(current_user: models.User = Depends(get_current_
         return {"message": f"Marked {updated_count} notifications as read."}
 
 
-@router.get("/notification_preferences")
-def get_notification_preferences(current_user: models.User = Depends(get_current_user)):
-    """Get user's notification preferences."""
-    if not IS_CLOUD:
-        raise HTTPException(status_code=404, detail="Notification preferences are only available in Cloud edition.")
+@router.get("/notifications/unsubscribe", response_class=HTMLResponse)
+@core_router.get("/notifications/unsubscribe", response_class=HTMLResponse)
+def unsubscribe_notification_delivery(
+    token: str,
+    settings: Settings = Depends(get_settings_dependency),
+):
+    secret = _notification_unsubscribe_secret(settings)
+    if not secret:
+        return _notification_unsubscribe_response(
+            "Unsubscribe Unavailable",
+            "This server is not configured for one-click unsubscribe links. Please open your notification settings and update preferences there.",
+        )
+
+    try:
+        payload = verify_compact_payload(token, secret)
+        user_id = str(payload.get("user_id") or "").strip()
+        kind = str(payload.get("kind") or "").strip().lower()
+        exp = int(payload.get("exp") or 0)
+    except Exception:
+        return _notification_unsubscribe_response(
+            "Link Invalid",
+            "This unsubscribe link is invalid or malformed. Please request a new notification email or update preferences from the app settings page.",
+        )
+
+    if not user_id or kind not in {"push", "digest", "all"}:
+        return _notification_unsubscribe_response(
+            "Link Invalid",
+            "This unsubscribe link is missing required information. Please request a new notification email or update preferences from the app settings page.",
+        )
+    if exp and datetime.now(timezone.utc).timestamp() > exp:
+        return _notification_unsubscribe_response(
+            "Link Expired",
+            "This unsubscribe link has expired. Please request a new notification email or update preferences from the app settings page.",
+        )
 
     with compair.Session() as session:
-        try:
-            from compair_cloud.models import NotificationPreferences
-        except ImportError:
-            raise HTTPException(status_code=501, detail="Notification preferences not available.")
-
-        prefs = session.query(NotificationPreferences).filter(
-            NotificationPreferences.user_id == current_user.user_id
+        prefs = session.query(models.NotificationPreferences).filter(
+            models.NotificationPreferences.user_id == user_id
         ).first()
-
-        # Create default preferences if they don't exist
         if not prefs:
-            prefs = NotificationPreferences(
-                user_id=current_user.user_id,
+            prefs = models.NotificationPreferences(
+                user_id=user_id,
                 email_digest_enabled=False,
-                email_digest_frequency="never",
-                push_notifications_enabled=True,
-                digest_buckets_enabled=None,  # null means all buckets
-                quiet_hours_start=None,
-                quiet_hours_end=None,
-                max_daily_push_emails=1,
+                email_digest_frequency=DEFAULT_NOTIFICATION_DIGEST_FREQUENCY,
+                push_notifications_enabled=False,
             )
             session.add(prefs)
-            session.commit()
-            session.refresh(prefs)
 
-        return {
-            "preferences_id": prefs.preferences_id,
-            "email_digest_enabled": prefs.email_digest_enabled,
-            "email_digest_frequency": prefs.email_digest_frequency,
-            "push_notifications_enabled": prefs.push_notifications_enabled,
-            "digest_buckets_enabled": prefs.digest_buckets_enabled or ["conflicts", "updates", "overlaps", "validation"],
-            "quiet_hours_start": prefs.quiet_hours_start,
-            "quiet_hours_end": prefs.quiet_hours_end,
-            "max_daily_push_emails": prefs.max_daily_push_emails,
-        }
+        if kind in {"push", "all"}:
+            prefs.push_notifications_enabled = False
+        if kind in {"digest", "all"}:
+            prefs.email_digest_enabled = False
+
+        prefs.updated_at = datetime.now(timezone.utc)
+        session.commit()
+
+    message = {
+        "push": "Instant email alerts are now turned off for this account.",
+        "digest": "Digest emails are now turned off for this account.",
+        "all": "All hosted email notifications are now turned off for this account.",
+    }[kind]
+    return _notification_unsubscribe_response("Preferences Updated", message)
+
+
+@router.get("/notifications/verify-delivery-email", response_class=HTMLResponse)
+@core_router.get("/notifications/verify-delivery-email", response_class=HTMLResponse)
+def verify_notification_delivery_email(
+    token: str,
+    settings: Settings = Depends(get_settings_dependency),
+):
+    secret = _notification_link_secret(settings)
+    if not secret:
+        return _notification_unsubscribe_response(
+            "Verification Unavailable",
+            "This server is not configured for notification delivery verification links. Please contact your administrator or use your existing account email instead.",
+        )
+
+    try:
+        payload = verify_compact_payload(token, secret)
+        user_id = str(payload.get("user_id") or "").strip()
+        email = _normalize_notification_delivery_email(payload.get("email"))
+        purpose = str(payload.get("purpose") or "").strip().lower()
+        exp = int(payload.get("exp") or 0)
+    except Exception:
+        return _notification_unsubscribe_response(
+            "Link Invalid",
+            "This delivery verification link is invalid or malformed. Please request a fresh verification email from your notification settings.",
+        )
+
+    if purpose != "notification_delivery_email" or not user_id or not email:
+        return _notification_unsubscribe_response(
+            "Link Invalid",
+            "This delivery verification link is missing required information. Please request a fresh verification email from your notification settings.",
+        )
+    if exp and datetime.now(timezone.utc).timestamp() > exp:
+        return _notification_unsubscribe_response(
+            "Link Expired",
+            "This delivery verification link has expired. Please request a fresh verification email from your notification settings.",
+        )
+
+    with compair.Session() as session:
+        prefs = session.query(models.NotificationPreferences).filter(
+            models.NotificationPreferences.user_id == user_id
+        ).first()
+        if not prefs:
+            return _notification_unsubscribe_response(
+                "Link Invalid",
+                "No notification preferences were found for this account. Please request a fresh verification email from your notification settings.",
+            )
+
+        verified_email = _normalize_notification_delivery_email(prefs.notification_delivery_email)
+        pending_email = _normalize_notification_delivery_email(prefs.notification_delivery_email_pending)
+        if verified_email == email and prefs.notification_delivery_email_verified_at and not pending_email:
+            return _notification_unsubscribe_response(
+                "Already Verified",
+                f"Compair is already using {email} for notification email delivery.",
+            )
+        if pending_email != email:
+            return _notification_unsubscribe_response(
+                "Link Invalid",
+                "This delivery verification link no longer matches the pending address on file. Please request a fresh verification email from your notification settings.",
+            )
+
+        now = datetime.now(timezone.utc)
+        prefs.notification_delivery_email = email
+        prefs.notification_delivery_email_pending = None
+        prefs.notification_delivery_email_verified_at = now
+        prefs.updated_at = now
+        session.commit()
+
+    return _notification_unsubscribe_response(
+        "Delivery Address Verified",
+        f"Compair will now send notification emails to {email}.",
+    )
+
+
+@router.get("/notification_preferences")
+@core_router.get("/notification_preferences")
+def get_notification_preferences(current_user: models.User = Depends(get_current_user)):
+    """Get user's notification preferences."""
+    with compair.Session() as session:
+        prefs = _get_or_create_notification_preferences(session, current_user)
+        return _serialize_notification_preferences(current_user, prefs)
 
 
 @router.post("/notification_preferences")
+@core_router.post("/notification_preferences")
 def update_notification_preferences(
+    payload: Optional[dict[str, Any]] = Body(default=None),
     email_digest_enabled: Optional[bool] = None,
     email_digest_frequency: Optional[str] = None,
     push_notifications_enabled: Optional[bool] = None,
@@ -5210,23 +5446,20 @@ def update_notification_preferences(
     current_user: models.User = Depends(get_current_user)
 ):
     """Update user's notification preferences."""
-    if not IS_CLOUD:
-        raise HTTPException(status_code=404, detail="Notification preferences are only available in Cloud edition.")
-
     with compair.Session() as session:
-        try:
-            from compair_cloud.models import NotificationPreferences
-        except ImportError:
-            raise HTTPException(status_code=501, detail="Notification preferences not available.")
+        email_digest_enabled = _notification_pref_payload_value(payload, "email_digest_enabled", email_digest_enabled)
+        email_digest_frequency = _notification_pref_payload_value(payload, "email_digest_frequency", email_digest_frequency)
+        push_notifications_enabled = _notification_pref_payload_value(payload, "push_notifications_enabled", push_notifications_enabled)
+        digest_buckets_enabled = _notification_pref_payload_value(payload, "digest_buckets_enabled", digest_buckets_enabled)
+        quiet_hours_start = _notification_pref_payload_value(payload, "quiet_hours_start", quiet_hours_start)
+        quiet_hours_end = _notification_pref_payload_value(payload, "quiet_hours_end", quiet_hours_end)
+        max_daily_push_emails = _notification_pref_payload_value(payload, "max_daily_push_emails", max_daily_push_emails)
+        frequency_explicit = (
+            email_digest_frequency is not None
+            or (isinstance(payload, dict) and "email_digest_frequency" in payload)
+        )
 
-        prefs = session.query(NotificationPreferences).filter(
-            NotificationPreferences.user_id == current_user.user_id
-        ).first()
-
-        # Create if doesn't exist
-        if not prefs:
-            prefs = NotificationPreferences(user_id=current_user.user_id)
-            session.add(prefs)
+        prefs = _get_or_create_notification_preferences(session, current_user)
 
         # Update fields if provided
         if email_digest_enabled is not None:
@@ -5247,11 +5480,105 @@ def update_notification_preferences(
             if max_daily_push_emails < 0 or max_daily_push_emails > 10:
                 raise HTTPException(status_code=400, detail="Max daily emails must be between 0 and 10.")
             prefs.max_daily_push_emails = max_daily_push_emails
+        if prefs.email_digest_enabled and not frequency_explicit:
+            current_frequency = (prefs.email_digest_frequency or "").strip().lower()
+            if current_frequency in {"", "never"}:
+                prefs.email_digest_frequency = DEFAULT_NOTIFICATION_DIGEST_FREQUENCY
 
         prefs.updated_at = datetime.now(timezone.utc)
         session.commit()
 
         return {"message": "Preferences updated successfully."}
+
+
+@router.post("/notification_preferences/delivery_email")
+@core_router.post("/notification_preferences/delivery_email")
+def request_notification_delivery_email(
+    payload: Optional[dict[str, Any]] = Body(default=None),
+    current_user: models.User = Depends(get_current_user),
+):
+    raw_email = ""
+    if isinstance(payload, dict):
+        raw_email = str(payload.get("email") or "")
+    email = _normalize_notification_delivery_email(raw_email)
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required.")
+    if not is_valid_email(email):
+        raise HTTPException(status_code=400, detail="Invalid email address.")
+    if email == _normalize_notification_delivery_email(current_user.username):
+        raise HTTPException(
+            status_code=400,
+            detail="That is already your account email. Clear the alternate delivery address instead.",
+        )
+
+    settings = get_settings_dependency()
+    secret = _notification_link_secret(settings)
+    if not secret:
+        raise HTTPException(
+            status_code=503,
+            detail="Notification email verification links are not configured on this server.",
+        )
+
+    with compair.Session() as session:
+        prefs = _get_or_create_notification_preferences(session, current_user)
+        prefs.notification_delivery_email_pending = email
+        prefs.updated_at = datetime.now(timezone.utc)
+        session.commit()
+
+    payload = {
+        "user_id": current_user.user_id,
+        "email": email,
+        "purpose": "notification_delivery_email",
+        "exp": int((datetime.now(timezone.utc) + timedelta(days=7)).timestamp()),
+    }
+    token = sign_compact_payload(payload, secret)
+    verify_link = f"{_public_web_base_url()}/notifications/verify-delivery-email?token={token}"
+
+    try:
+        emailer.connect()
+        emailer.send(
+            subject="Verify your Compair notification delivery address",
+            sender=EMAIL_USER,
+            receivers=[email],
+            html=_render_email(
+                NOTIFICATION_DELIVERY_VERIFY_TEMPLATE,
+                user_name=current_user.name or current_user.username or "there",
+                delivery_email=email,
+                verify_link=verify_link,
+            ),
+        )
+    except Exception as exc:
+        with compair.Session() as session:
+            prefs = session.query(models.NotificationPreferences).filter(
+                models.NotificationPreferences.user_id == current_user.user_id
+            ).first()
+            if prefs and _normalize_notification_delivery_email(prefs.notification_delivery_email_pending) == email:
+                prefs.notification_delivery_email_pending = None
+                prefs.updated_at = datetime.now(timezone.utc)
+                session.commit()
+        raise HTTPException(status_code=503, detail=f"Failed to send verification email: {exc}")
+    return {
+        "message": f"Verification email sent to {email}. Delivery will switch after you confirm it.",
+        "pending_email": email,
+    }
+
+
+@router.post("/notification_preferences/delivery_email/clear")
+@core_router.post("/notification_preferences/delivery_email/clear")
+def clear_notification_delivery_email(
+    current_user: models.User = Depends(get_current_user),
+):
+    with compair.Session() as session:
+        prefs = _get_or_create_notification_preferences(session, current_user)
+        prefs.notification_delivery_email = None
+        prefs.notification_delivery_email_pending = None
+        prefs.notification_delivery_email_verified_at = None
+        prefs.updated_at = datetime.now(timezone.utc)
+        session.commit()
+
+    return {
+        "message": "Compair will now send notification emails to your account email.",
+    }
 
 
 CORE_PATHS: set[str] = {

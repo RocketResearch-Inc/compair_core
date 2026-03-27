@@ -398,6 +398,68 @@ class Feedback(Base):
     chunk = relationship("Chunk", back_populates="feedbacks")
 
 
+class NotificationEvent(Base):
+    __tablename__ = "notification_event"
+
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True, init=False, default=lambda: str(uuid4()))
+    user_id: Mapped[str] = mapped_column(ForeignKey("user.user_id", ondelete="CASCADE"), index=True)
+    group_id: Mapped[str] = mapped_column(ForeignKey("group.group_id", ondelete="CASCADE"), index=True)
+    dedupe_key: Mapped[str] = mapped_column(String(512), index=True)
+    intent: Mapped[str] = mapped_column(String(64))
+    relevance: Mapped[str] = mapped_column(String(16))
+    novelty: Mapped[str] = mapped_column(String(16))
+    severity: Mapped[str] = mapped_column(String(16))
+    certainty: Mapped[str] = mapped_column(String(16))
+    parse_mode: Mapped[str] = mapped_column(String(32))
+    delivery_action: Mapped[str] = mapped_column(String(16))
+    target_doc_id: Mapped[str | None] = mapped_column(ForeignKey("document.document_id", ondelete="SET NULL"), nullable=True, default=None)
+    target_chunk_id: Mapped[str | None] = mapped_column(ForeignKey("chunk.chunk_id", ondelete="SET NULL"), nullable=True, default=None)
+    peer_doc_ids: Mapped[list[str] | None] = mapped_column(JSON, nullable=True, default=None)
+    channel: Mapped[str | None] = mapped_column(String(32), nullable=True, default=None)
+    model: Mapped[str | None] = mapped_column(String(64), nullable=True, default=None)
+    run_id: Mapped[str | None] = mapped_column(String(128), nullable=True, default=None)
+    digest_bucket: Mapped[str] = mapped_column(String(32), default="general")
+    rationale: Mapped[list[str] | None] = mapped_column(JSON, nullable=True, default=None)
+    evidence_target: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    evidence_peer: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        init=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+    dismissed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+
+
+class NotificationPreferences(Base):
+    __tablename__ = "notification_preferences"
+
+    preferences_id: Mapped[str] = mapped_column(String(36), primary_key=True, init=False, default=lambda: str(uuid4()))
+    user_id: Mapped[str] = mapped_column(ForeignKey("user.user_id", ondelete="CASCADE"), unique=True, index=True)
+    email_digest_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    email_digest_frequency: Mapped[str] = mapped_column(String(16), default="daily")
+    push_notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    digest_buckets_enabled: Mapped[list[str] | None] = mapped_column(JSON, nullable=True, default=None)
+    quiet_hours_start: Mapped[str | None] = mapped_column(String(8), nullable=True, default=None)
+    quiet_hours_end: Mapped[str | None] = mapped_column(String(8), nullable=True, default=None)
+    max_daily_push_emails: Mapped[int] = mapped_column(Integer, default=1)
+    notification_delivery_email: Mapped[str | None] = mapped_column(String(256), nullable=True, default=None)
+    notification_delivery_email_pending: Mapped[str | None] = mapped_column(String(256), nullable=True, default=None)
+    notification_delivery_email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        init=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        init=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
 class Activity(Base):
     __tablename__ = "activity"
 

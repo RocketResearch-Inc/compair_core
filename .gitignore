@@ -12,3 +12,4 @@ compair_core.egg-info/
 .vscode/
 .compair/
 dist/
+__pycache__/

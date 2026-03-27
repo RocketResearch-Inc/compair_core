@@ -2,7 +2,7 @@
 
 This guide walks a new Compair Core user through the end-to-end experience: configuring the runtime, creating an account, collaborating in groups, working with documents, requesting automated feedback, and managing supporting workflows. Examples assume a FastAPI server running locally at `http://127.0.0.1:8000` and use the `requests` library in Python.
 
-This guide covers the Core edition only. Hosted-only features such as Google OAuth, billing, and ranked notification events belong to `compair_cloud` and are not expected in a pure Core deployment.
+This guide covers the Core edition only. Hosted-only features such as Google OAuth, billing, and transactional notification delivery belong to `compair_cloud`. Core now includes ranked notification-event generation so local and self-hosted reviews can use the same gating/reporting semantics as Cloud.
 
 ## 0. Initial Setup & Configuration
 
@@ -18,6 +18,8 @@ Before hitting the API, configure the deployment with environment variables. The
 | `COMPAIR_VECTOR_BACKEND` | Chooses how embeddings are stored (`json` for SQLite, `pgvector` for PostgreSQL). | `json` |
 | `COMPAIR_GENERATION_PROVIDER` | Selects the feedback generator: `local`, `openai`, `http`, or `fallback`. | `local` |
 | `COMPAIR_LOCAL_MODEL_URL` | Base URL of the bundled/local text generation + embedding service used when `COMPAIR_GENERATION_PROVIDER=local`. | `http://127.0.0.1:9000` |
+| `COMPAIR_NOTIFICATION_SCORING_ENABLED` | Enables ranked notification-event scoring for feedback generated in Core. | `true` |
+| `COMPAIR_NOTIFICATION_SCORING_PROVIDER` | Chooses the notification scorer: `auto`, `heuristic`, or `openai`. | `auto` |
 | `COMPAIR_OCR_ENDPOINT` | HTTP endpoint used for OCR uploads. When set, OCR auto-enables for core deployments. | `http://127.0.0.1:9001/ocr-file` |
 | `COMPAIR_EMAIL_BACKEND` | Controls how verification/reset emails are sent. | `console` (logs to stdout) |
 | `COMPAIR_TELEMETRY_ENABLED` | Enables an anonymous daily heartbeat back to Compair Cloud for self-hosted usage analytics. | `false` |
@@ -51,6 +53,7 @@ Compair Core ships with helper services that let you run everything offline:
 2. **OpenAI embeddings** – Set `COMPAIR_EMBEDDING_PROVIDER=openai`, supply `COMPAIR_OPENAI_API_KEY`, and optionally override `COMPAIR_OPENAI_EMBED_MODEL` (defaults to `text-embedding-3-small`) to call the OpenAI Embeddings API while still using the local feedback provider.
 3. **Custom models** – Swap in your own container or script that exposes the same HTTP interface. Ensure the embedding dimensionality matches `COMPAIR_EMBEDDING_DIM` (defaults to 384). If you change the embedding size, update existing tables or recreate the database to avoid shape mismatches.
 4. **OpenAI or other feedback providers** – To call OpenAI for feedback, set `COMPAIR_GENERATION_PROVIDER=openai`, provide `COMPAIR_OPENAI_API_KEY`, and optionally override `COMPAIR_OPENAI_MODEL` (defaults to `gpt-5-nano`). For a bespoke hosted model, use `COMPAIR_GENERATION_PROVIDER=http` and point `COMPAIR_GENERATION_ENDPOINT` at your service.
+5. **Notification-event scoring** – Core can rank feedback into notification events locally. With `COMPAIR_NOTIFICATION_SCORING_PROVIDER=auto`, Core uses OpenAI when an API key is present and otherwise falls back to a deterministic heuristic scorer so the CLI and desktop still have ranked events in pure self-hosted deployments.
 
 If you do not run any model service, set `COMPAIR_GENERATION_PROVIDER=fallback` to skip generation while still storing document embeddings (useful for similarity-only scenarios).
 

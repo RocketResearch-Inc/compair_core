@@ -73,9 +73,34 @@ def _ensure_user_retrial_count_default() -> None:
         print(f"[compair_core] retrial_count migration skipped: {exc}", file=sys.stderr)
 
 
+def _ensure_notification_preferences_delivery_columns() -> None:
+    try:
+        from sqlalchemy import inspect, text
+
+        insp = inspect(engine)
+        if "notification_preferences" not in insp.get_table_names():
+            return
+        cols = {c["name"] for c in insp.get_columns("notification_preferences")}
+        statements: list[str] = []
+        if "notification_delivery_email" not in cols:
+            statements.append("ALTER TABLE notification_preferences ADD COLUMN notification_delivery_email VARCHAR(256)")
+        if "notification_delivery_email_pending" not in cols:
+            statements.append("ALTER TABLE notification_preferences ADD COLUMN notification_delivery_email_pending VARCHAR(256)")
+        if "notification_delivery_email_verified_at" not in cols:
+            statements.append("ALTER TABLE notification_preferences ADD COLUMN notification_delivery_email_verified_at DATETIME")
+        if not statements:
+            return
+        with engine.begin() as conn:
+            for statement in statements:
+                conn.execute(text(statement))
+    except Exception as exc:
+        print(f"[compair_core] notification delivery email migration skipped: {exc}", file=sys.stderr)
+
+
 def initialize_database() -> None:
     models.Base.metadata.create_all(engine)
     _ensure_user_retrial_count_default()
+    _ensure_notification_preferences_delivery_columns()
     if edition == "core":
         _ensure_topic_tags_column()
     if initialize_database_override:

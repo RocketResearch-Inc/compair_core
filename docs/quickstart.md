@@ -2,7 +2,7 @@
 
 This quickstart shows how to experience Compair's core feedback loop in a minute or less. You'll run the API locally in single-user mode, create a few documents, and generate feedback that reuses your published work as a reference.
 
-Compair Core intentionally stops at the shared feedback/document workflow. The hosted Cloud notification ranking and triage workflow is not part of the Core quickstart.
+Compair Core now includes local notification-event ranking so self-hosted reviews can use the same report/gating semantics as Cloud. Hosted delivery layers such as Google OAuth and transactional email remain Cloud-only.
 
 ## Managed container quick start
 

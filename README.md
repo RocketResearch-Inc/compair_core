@@ -110,6 +110,8 @@ Key environment variables for the core edition:
 - `COMPAIR_GENERATION_PROVIDER` (`local`) – choose how feedback is produced. Options: `local` (call the bundled FastAPI service), `openai` (use ChatGPT-compatible APIs with an API key), `http` (POST the request to a custom endpoint), or `fallback` (skip generation and surface similar references only).
 - `COMPAIR_OPENAI_API_KEY` / `COMPAIR_OPENAI_MODEL` – when using the OpenAI provider, supply your API key and optional model name (defaults to `gpt-5-nano`). The fallback kicks in automatically if the key or SDK is unavailable.
 - `COMPAIR_GENERATION_ENDPOINT` – HTTP endpoint invoked when `COMPAIR_GENERATION_PROVIDER=http`; the service receives a JSON payload (`document`, `references`, `length_instruction`) and should return `{"feedback": ...}`.
+- `COMPAIR_NOTIFICATION_SCORING_ENABLED` (`true`) – enable ranked notification-event scoring in Core. Set to `false` if you only want raw feedback without notification triage.
+- `COMPAIR_NOTIFICATION_SCORING_PROVIDER` (`auto`) – choose `auto`, `heuristic`, or `openai` for notification-event scoring. `auto` uses OpenAI when an API key is configured and otherwise falls back to a deterministic local heuristic.
 - `COMPAIR_OCR_ENDPOINT` – endpoint the backend calls for OCR uploads. Setting this (e.g., to the bundled Tesseract wrapper at `http://127.0.0.1:9001/ocr-file`) automatically enables OCR.
 - `COMPAIR_OCR_REQUEST_TIMEOUT` – timeout in seconds for HTTP OCR requests (default `30`).
 
@@ -133,9 +135,9 @@ The API will be available at http://127.0.0.1:8000 and supports the Swagger UI a
 Core and Cloud share the same document, group, feedback, and authentication foundations, but they do not expose the same product surface.
 
 - `compair_core` is the self-hosted/open-core runtime.
-- `compair_cloud` adds the hosted-only layers: Google OAuth, billing, richer analytics, and ranked notification events / triage.
+- `compair_cloud` adds the hosted-only layers: Google OAuth, billing, richer analytics, and hosted notification delivery.
 
-In particular, the notification ranking workflow used by the hosted web app, desktop app, and CLI report ordering is a Cloud feature. Core still supports the shared feedback pipeline, but `/notification_events` returns `501` outside the Cloud edition.
+Core now includes ranked notification-event generation, `/notification_events`, and `/get_activity_feed` so the CLI, desktop app, and self-hosted evaluations can use the same review semantics as Cloud. Hosted-only delivery layers such as Google OAuth, billing, and transactional notification delivery still belong to `compair_cloud`.
 
 ## Tests / Linting
 

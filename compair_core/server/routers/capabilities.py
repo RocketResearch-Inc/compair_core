@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
 
 from ..settings import Settings, get_settings
+from ...compair.notifications.service import is_scoring_enabled
 from ...db import engine
 
 router = APIRouter(tags=["meta"])
@@ -49,7 +50,11 @@ def capabilities(settings: Settings = Depends(get_settings)) -> dict[str, object
         },
         "features": {
             "ocr_upload": settings.ocr_enabled,
-            "activity_feed": edition == "cloud",
+            "activity_feed": True,
+            "notification_events": True,
+            "notification_scoring": is_scoring_enabled(),
+            "notification_preferences": True,
+            "notification_delivery": edition == "cloud",
         },
         "server": "Compair Cloud" if edition == "cloud" else "Compair Core",
         "version": settings.version,

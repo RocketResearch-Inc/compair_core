@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     google_oauth_client_secret: str | None = None
     google_oauth_redirect_uri: str | None = None
     google_oauth_state_secret: str | None = None
+    notification_unsubscribe_secret: str | None = None
     google_oauth_web_success_url: str | None = None
     google_oauth_web_error_url: str | None = None
     google_oauth_device_ttl_sec: int = 600
