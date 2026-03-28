@@ -50,6 +50,7 @@ _HIGH_SIGNAL_PATH_HINTS = (
     "/app.",
 )
 _REFERENCE_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+_REFERENCE_SUBTOKEN_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+")
 _REFERENCE_TOKEN_STOPWORDS = {
     "the",
     "and",
@@ -162,12 +163,19 @@ def _reference_selection_config(code_focus: bool) -> tuple[int, int, int]:
 def _identifier_tokens(text: str, limit: int = 64) -> set[str]:
     tokens: set[str] = set()
     for raw in _REFERENCE_TOKEN_RE.findall(text or ""):
-        token = raw.lower()
-        if token in _REFERENCE_TOKEN_STOPWORDS:
-            continue
-        tokens.add(token)
-        if len(tokens) >= limit:
-            break
+        parts = [raw]
+        parts.extend(
+            subtoken
+            for subtoken in _REFERENCE_SUBTOKEN_RE.findall(raw.replace("_", " "))
+            if subtoken
+        )
+        for part in parts:
+            token = part.lower()
+            if len(token) < 3 or token in _REFERENCE_TOKEN_STOPWORDS:
+                continue
+            tokens.add(token)
+            if len(tokens) >= limit:
+                return tokens
     return tokens
 
 
@@ -277,12 +285,75 @@ def _reference_source_key(chunk: Chunk) -> str:
     return f"chunk:{getattr(chunk, 'chunk_id', '')}"
 
 
+def _reference_chunk_key(chunk: Chunk) -> str:
+    chunk_id = getattr(chunk, "chunk_id", None)
+    if chunk_id:
+        return str(chunk_id)
+    source_key = _reference_source_key(chunk)
+    content = getattr(chunk, "content", "") or ""
+    return f"{source_key}:{stable_chunk_hash(content)}"
+
+
+def _merge_reference_candidates(
+    primary: list[Chunk],
+    secondary: list[Chunk],
+    limit: int,
+) -> list[Chunk]:
+    merged: list[Chunk] = []
+    seen: set[str] = set()
+    for candidate in [*primary, *secondary]:
+        key = _reference_chunk_key(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(candidate)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
+def _lexical_reference_candidates(
+    target_text: str,
+    candidates: list[Chunk],
+    *,
+    limit: int,
+    code_focus: bool,
+) -> list[Chunk]:
+    if not candidates or limit <= 0:
+        return []
+
+    target_tokens = _identifier_tokens(target_text, limit=96)
+    target_path = _extract_snapshot_file_path(target_text)
+    scored: list[tuple[float, int, Chunk]] = []
+    for idx, candidate in enumerate(candidates):
+        if getattr(candidate, "chunk_type", "") != "document":
+            continue
+        content = getattr(candidate, "content", "") or ""
+        if not content or _is_snapshot_metadata_chunk(content):
+            continue
+
+        candidate_tokens = _identifier_tokens(content, limit=96)
+        lexical_score = _token_overlap_ratio(target_tokens, candidate_tokens)
+        path_score = _path_overlap_score(target_path, _extract_snapshot_file_path(content))
+        code_bonus = 0.35 if "```" in content else 0.0
+        diff_bonus = 0.25 if "diff --git" in content or "@@" in content or "+++ b/" in content else 0.0
+        doc_penalty = 0.75 if code_focus and _is_doc_like_path(_extract_snapshot_file_path(content)) else 0.0
+        score = (lexical_score * 5.0) + (path_score * 1.5) + code_bonus + diff_bonus - doc_penalty
+        if score <= 0.0:
+            continue
+        scored.append((score, idx, candidate))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [candidate for _, _, candidate in scored[:limit]]
+
+
 def _rerank_reference_chunks(target_text: str, candidates: list[Chunk], code_focus: bool) -> list[Chunk]:
     candidate_limit, final_limit, max_per_source = _reference_selection_config(code_focus)
     if not candidates:
         return []
 
-    trimmed = candidates[:candidate_limit]
+    trim_limit = max(candidate_limit, min(len(candidates), candidate_limit * 2))
+    trimmed = candidates[:trim_limit]
     if not code_focus:
         return trimmed[:final_limit]
 
@@ -682,6 +753,7 @@ def process_text(
         target_embedding = existing_chunk.embedding
         code_focus = _is_code_review_chunk(doc, text)
         candidate_limit, _, _ = _reference_selection_config(code_focus)
+        merge_limit = max(candidate_limit, candidate_limit * 2)
 
         if target_embedding is not None:
             base_query = (
@@ -696,6 +768,7 @@ def process_text(
                 )
             )
 
+            all_candidates: list[Chunk] | None = None
             if VECTOR_BACKEND == "pgvector":
                 candidates = (
                     base_query.order_by(
@@ -704,6 +777,8 @@ def process_text(
                     .limit(candidate_limit)
                     .all()
                 )
+                if code_focus:
+                    all_candidates = base_query.all()
             else:
                 all_candidates = base_query.all()
                 scored: list[tuple[float, Chunk]] = []
@@ -713,7 +788,22 @@ def process_text(
                         scored.append((score, candidate))
                 scored.sort(key=lambda item: item[0], reverse=True)
                 candidates = [chunk for _, chunk in scored[:candidate_limit]]
+            if code_focus:
+                lexical_candidates = _lexical_reference_candidates(
+                    text,
+                    all_candidates or [],
+                    limit=candidate_limit,
+                    code_focus=True,
+                )
+                candidates = _merge_reference_candidates(candidates, lexical_candidates, merge_limit)
             references = _rerank_reference_chunks(text, candidates, code_focus=code_focus)
+            if not references:
+                logger.info(
+                    "[feedback] no references for doc=%s group_ids=%s code_focus=%s",
+                    doc.document_id,
+                    doc_group_ids,
+                    code_focus,
+                )
 
         sql_references: list[Reference] = []
         for ref_chunk in references:

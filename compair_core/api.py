@@ -5588,6 +5588,8 @@ CORE_PATHS: set[str] = {
     "/forgot-password",
     "/reset-password",
     "/load_session",
+    "/load_user_plan",
+    "/load_user_by_id",
     "/update_user",
     "/load_groups",
     "/load_group",
