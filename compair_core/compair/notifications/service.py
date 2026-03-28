@@ -9,10 +9,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import logging
 import os
-import re
 
 from sqlalchemy.orm import Session
 
+from ..local_summary import best_grounded_excerpt, excerpt_tokens
 from ..models import Chunk, Document, NotificationEvent
 from .delivery_logic import (
     CandidateContext,
@@ -27,17 +27,6 @@ from .llm_notification_scorer import NotificationScorer, NotificationScorerConfi
 from .parse_llm_structured_output import ParsedLLMNotificationAssessment
 
 logger = logging.getLogger(__name__)
-
-_EXCERPT_TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]{3,}")
-_EVIDENCE_STOPWORDS = {
-    "the", "and", "that", "this", "with", "from", "your", "into", "will", "have",
-    "about", "there", "their", "while", "which", "when", "where", "would", "should",
-    "could", "after", "before", "because", "through", "against", "between", "under",
-    "over", "without", "these", "those", "they", "them", "then", "than", "only",
-    "still", "being", "been", "also", "does", "doesn", "using", "used", "user",
-    "users", "docs", "document", "documents", "chunk", "related", "target", "peer",
-    "compair", "repo", "repos",
-}
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -87,79 +76,13 @@ class NotificationCandidate:
     now_utc: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
-def _normalize_excerpt_text(value: Optional[str]) -> str:
-    return " ".join((value or "").split())
-
-
-def _excerpt_tokens(*values: Optional[str]) -> set[str]:
-    out: set[str] = set()
-    for value in values:
-        if not value:
-            continue
-        for match in _EXCERPT_TOKEN_RE.findall(value):
-            token = match.strip().lower()
-            if len(token) < 3 or token in _EVIDENCE_STOPWORDS:
-                continue
-            out.add(token)
-    return out
-
-
-def _excerpt_segments(text: str) -> List[str]:
-    normalized_lines = [_normalize_excerpt_text(line) for line in (text or "").splitlines()]
-    normalized_lines = [line for line in normalized_lines if line]
-    if not normalized_lines:
-        full = _normalize_excerpt_text(text)
-        return [full] if full else []
-    segments: List[str] = []
-    for idx, line in enumerate(normalized_lines):
-        segments.append(line)
-        if idx + 1 < len(normalized_lines):
-            segments.append(f"{line} {normalized_lines[idx + 1]}")
-    seen: set[str] = set()
-    deduped: List[str] = []
-    for segment in segments:
-        if segment in seen:
-            continue
-        seen.add(segment)
-        deduped.append(segment)
-    return deduped[:200]
-
-
-def _score_excerpt_segment(segment: str, signal_tokens: set[str], preferred_tokens: set[str]) -> int:
-    segment_tokens = _excerpt_tokens(segment)
-    if not segment_tokens:
+def _grounded_excerpt_score(excerpt: str, signal_texts: List[str], preferred_text: str = "") -> int:
+    excerpt_tokens_set = excerpt_tokens(excerpt)
+    signal_tokens = excerpt_tokens(*signal_texts)
+    preferred_tokens = excerpt_tokens(preferred_text)
+    if not excerpt_tokens_set:
         return 0
-    score = len(segment_tokens & signal_tokens)
-    if preferred_tokens:
-        score += 2 * len(segment_tokens & preferred_tokens)
-    return score
-
-
-def _best_grounded_excerpt(text: str, signal_texts: List[str], preferred_excerpt: str = "", *, limit: int = 280) -> str:
-    source = _normalize_excerpt_text(text)
-    if not source:
-        return ""
-
-    preferred = _normalize_excerpt_text(preferred_excerpt)
-    if preferred and preferred in source:
-        return preferred[:limit]
-
-    signal_tokens = _excerpt_tokens(*signal_texts)
-    preferred_tokens = _excerpt_tokens(preferred)
-    if not signal_tokens and not preferred_tokens:
-        return ""
-
-    best_segment = ""
-    best_score = 0
-    for segment in _excerpt_segments(text):
-        score = _score_excerpt_segment(segment, signal_tokens, preferred_tokens)
-        if score > best_score or (score == best_score and score > 0 and len(segment) < len(best_segment)):
-            best_score = score
-            best_segment = segment
-
-    if best_score <= 0:
-        return ""
-    return best_segment[:limit]
+    return len(excerpt_tokens_set & signal_tokens) + (2 * len(excerpt_tokens_set & preferred_tokens))
 
 
 def _bucket_rank(value: str) -> int:
@@ -192,7 +115,7 @@ def _ground_notification_assessment(
         if text
     ]
 
-    grounded_target = _best_grounded_excerpt(
+    grounded_target = best_grounded_excerpt(
         candidate.target_text,
         signal_texts,
         assessment.evidence_target,
@@ -201,10 +124,10 @@ def _ground_notification_assessment(
     grounded_peer = ""
     best_peer_score = 0
     for peer in candidate.peer_candidates:
-        excerpt = _best_grounded_excerpt(peer.chunk_text, signal_texts, assessment.evidence_peer)
+        excerpt = best_grounded_excerpt(peer.chunk_text, signal_texts, assessment.evidence_peer)
         if not excerpt:
             continue
-        score = _score_excerpt_segment(excerpt, _excerpt_tokens(*signal_texts), _excerpt_tokens(assessment.evidence_peer))
+        score = _grounded_excerpt_score(excerpt, signal_texts, assessment.evidence_peer)
         if score > best_peer_score:
             best_peer_score = score
             grounded_peer = excerpt
@@ -235,10 +158,12 @@ def _build_payload(candidate: NotificationCandidate) -> Dict[str, Any]:
         return value if len(value) <= limit else value[:limit]
 
     feedback_summary = _feedback_summary(candidate)
-    target_excerpt = _best_grounded_excerpt(candidate.target_text, [feedback_summary], limit=360)
+    target_signals = [feedback_summary] if feedback_summary else [peer.chunk_text for peer in candidate.peer_candidates[:2]]
+    target_excerpt = best_grounded_excerpt(candidate.target_text, target_signals, limit=360)
     peers = []
     for p in candidate.peer_candidates:
-        peer_excerpt = _best_grounded_excerpt(p.chunk_text, [feedback_summary], limit=360)
+        peer_signals = [feedback_summary] if feedback_summary else [candidate.target_text]
+        peer_excerpt = best_grounded_excerpt(p.chunk_text, peer_signals, limit=360)
         peers.append(
             {
                 "peer_doc_id": p.doc_id,

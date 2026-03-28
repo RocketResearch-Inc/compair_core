@@ -23,6 +23,10 @@ except (ImportError, ModuleNotFoundError):
     cloud_create_embeddings = None
 
 
+def _openai_api_key() -> str | None:
+    return os.getenv("COMPAIR_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+
+
 class Embedder:
     def __init__(self) -> None:
         self.edition = os.getenv("COMPAIR_EDITION", "core").lower()
@@ -54,7 +58,7 @@ class Embedder:
                     log_event("openai_embedding_unavailable", reason="openai_library_missing")
                     self.provider = "local"
                 else:
-                    api_key = os.getenv("COMPAIR_OPENAI_API_KEY")
+                    api_key = _openai_api_key()
                     if hasattr(openai, "api_key") and api_key:
                         openai.api_key = api_key  # type: ignore[assignment]
                     if hasattr(openai, "OpenAI"):
@@ -172,7 +176,7 @@ def create_embeddings(embedder: Embedder, texts: list[str], user=None) -> list[l
     if provider == "openai" and openai is not None:
         client = getattr(embedder, "_openai_client", None)
         if client is None and hasattr(openai, "OpenAI"):
-            api_key = os.getenv("COMPAIR_OPENAI_API_KEY")
+            api_key = _openai_api_key()
             try:  # pragma: no cover - optional client differences
                 client = openai.OpenAI(api_key=api_key) if api_key else openai.OpenAI()  # type: ignore[attr-defined]
             except TypeError:
@@ -223,7 +227,7 @@ def _openai_embedding(embedder: Embedder, text: str) -> list[float] | None:
         return None
     client = getattr(embedder, "_openai_client", None)
     if client is None and hasattr(openai, "OpenAI"):
-        api_key = os.getenv("COMPAIR_OPENAI_API_KEY")
+        api_key = _openai_api_key()
         try:  # pragma: no cover - optional client differences
             client = openai.OpenAI(api_key=api_key) if api_key else openai.OpenAI()  # type: ignore[attr-defined]
         except TypeError:

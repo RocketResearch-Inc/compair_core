@@ -466,6 +466,10 @@ def _dispatch_process_document_task(
 
 def _json_safe_task_meta(value: Any) -> Any:
     if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        else:
+            value = value.astimezone(timezone.utc)
         return value.isoformat()
     if isinstance(value, Mapping):
         return {str(key): _json_safe_task_meta(item) for key, item in value.items()}
@@ -3338,10 +3342,10 @@ def _serialize_notification_event(event: Any, group_name: Optional[str] = None) 
         "rationale": event.rationale or [],
         "evidence_target": event.evidence_target,
         "evidence_peer": event.evidence_peer,
-        "created_at": event.created_at,
-        "delivered_at": event.delivered_at,
-        "acknowledged_at": event.acknowledged_at,
-        "dismissed_at": getattr(event, "dismissed_at", None),
+        "created_at": _json_safe_task_meta(event.created_at),
+        "delivered_at": _json_safe_task_meta(event.delivered_at),
+        "acknowledged_at": _json_safe_task_meta(event.acknowledged_at),
+        "dismissed_at": _json_safe_task_meta(getattr(event, "dismissed_at", None)),
     }
 
 
@@ -5197,10 +5201,10 @@ def get_notifications(
                     "rationale": n.rationale,
                     "evidence_target": n.evidence_target,
                     "evidence_peer": n.evidence_peer,
-                    "created_at": n.created_at.isoformat(),
-                    "delivered_at": n.delivered_at.isoformat() if n.delivered_at else None,
-                    "acknowledged_at": n.acknowledged_at.isoformat() if n.acknowledged_at else None,
-                    "dismissed_at": n.dismissed_at.isoformat() if n.dismissed_at else None,
+                    "created_at": _json_safe_task_meta(n.created_at),
+                    "delivered_at": _json_safe_task_meta(n.delivered_at),
+                    "acknowledged_at": _json_safe_task_meta(n.acknowledged_at),
+                    "dismissed_at": _json_safe_task_meta(n.dismissed_at),
                     "is_unread": n.acknowledged_at is None and n.dismissed_at is None,
                 }
                 for n in notifications

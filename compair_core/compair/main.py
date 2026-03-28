@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session as SASession
 
 from .embeddings import create_embedding, create_embeddings, Embedder
 from .feedback import get_feedback, Reviewer
+from .logger import log_event
 from .models import (
     Chunk,
     Document,
@@ -446,11 +447,19 @@ def process_document(
     chunks = chunk_text_with_mode(content, chunk_mode=chunk_mode)
     prev_set = set(prev_chunks)
     new_chunks = [c for c in chunks if c not in prev_set]
+    meaningful_new_chunk_count = 0
 
     prioritized_chunk_indices: list[int] = []
     code_focus = False
     if generate_feedback:
         code_focus = is_code_review_document(doc, chunk_mode)
+        meaningful_new_chunk_count = len(
+            [
+                chunk
+                for chunk in new_chunks
+                if not (code_focus and _is_snapshot_metadata_chunk(chunk))
+            ]
+        )
         prioritized_chunk_indices = detect_significant_edits(
             prev_chunks=prev_chunks,
             new_chunks=new_chunks,
@@ -465,13 +474,17 @@ def process_document(
     feedback_fallback_min = int(os.getenv("COMPAIR_FEEDBACK_MIN_TOKENS_FALLBACK", "20"))
     token_lens = [count_tokens(c) for c in new_chunks]
     eligible_indices = [i for i, t in enumerate(token_lens) if t >= feedback_min_tokens]
+    fallback_indices = list(range(len(token_lens)))
+    if code_focus:
+        eligible_indices = [i for i in eligible_indices if not _is_snapshot_metadata_chunk(new_chunks[i])]
+        fallback_indices = [i for i in fallback_indices if not _is_snapshot_metadata_chunk(new_chunks[i])]
     if generate_feedback and feedback_min_tokens > 0:
         prioritized_chunk_indices = [i for i in prioritized_chunk_indices if i in eligible_indices]
         if not prioritized_chunk_indices and eligible_indices:
             fallback_idx = max(eligible_indices, key=lambda idx: token_lens[idx])
             prioritized_chunk_indices = [fallback_idx]
-        elif not eligible_indices and new_chunks:
-            fallback_idx = max(range(len(token_lens)), key=lambda idx: token_lens[idx])
+        elif not eligible_indices and fallback_indices:
+            fallback_idx = max(fallback_indices, key=lambda idx: token_lens[idx])
             if token_lens[fallback_idx] >= feedback_fallback_min:
                 prioritized_chunk_indices = [fallback_idx]
 
@@ -482,6 +495,7 @@ def process_document(
         indices_to_generate_feedback = prioritized_chunk_indices[:num_chunks_can_generate_feedback]
 
     existing_indices_to_generate_feedback: list[int] = []
+    available_existing_candidate_count = 0
     if generate_feedback and reanalyze_existing and not new_chunks:
         existing_indices = _existing_feedback_candidate_indices(
             session=session,
@@ -496,6 +510,46 @@ def process_document(
         else:
             remaining_slots = max((feedback_limit - recent_feedback_count - len(indices_to_generate_feedback)), 0)
             existing_indices_to_generate_feedback = existing_indices[:remaining_slots]
+            available_existing_candidate_count = len(existing_indices)
+    elif generate_feedback and code_focus and not indices_to_generate_feedback:
+        existing_indices = _existing_feedback_candidate_indices(
+            session=session,
+            doc=doc,
+            chunks=chunks,
+            code_focus=code_focus,
+            feedback_min_tokens=feedback_min_tokens,
+            feedback_fallback_min=feedback_fallback_min,
+        )
+        available_existing_candidate_count = len(existing_indices)
+
+    if generate_feedback:
+        log_event(
+            "feedback_chunk_selection",
+            document_id=doc.document_id,
+            code_focus=code_focus,
+            total_chunks=len(chunks),
+            new_chunks=len(new_chunks),
+            meaningful_new_chunks=meaningful_new_chunk_count,
+            prioritized_new_chunks=len(prioritized_chunk_indices),
+            selected_new_chunks=len(indices_to_generate_feedback),
+            available_existing_candidates=available_existing_candidate_count,
+            selected_existing_chunks=len(existing_indices_to_generate_feedback),
+            reanalyze_existing=reanalyze_existing,
+        )
+        if (
+            code_focus
+            and available_existing_candidate_count > 0
+            and not indices_to_generate_feedback
+            and not existing_indices_to_generate_feedback
+        ):
+            log_event(
+                "feedback_existing_candidates_skipped",
+                document_id=doc.document_id,
+                available_existing_candidates=available_existing_candidate_count,
+                reason="reanalyze_existing_disabled",
+                new_chunks=len(new_chunks),
+                meaningful_new_chunks=meaningful_new_chunk_count,
+            )
 
     new_chunk_embeddings = create_embeddings(embedder, new_chunks, user=user) if new_chunks else []
     for i, chunk in enumerate(new_chunks):
@@ -756,6 +810,8 @@ def process_text(
         merge_limit = max(candidate_limit, candidate_limit * 2)
 
         if target_embedding is not None:
+            lexical_candidates: list[Chunk] = []
+            candidate_count = 0
             base_query = (
                 session.query(Chunk)
                 .join(Chunk.document)
@@ -777,10 +833,13 @@ def process_text(
                     .limit(candidate_limit)
                     .all()
                 )
+                candidate_count = len(candidates)
                 if code_focus:
                     all_candidates = base_query.all()
+                    candidate_count = len(all_candidates)
             else:
                 all_candidates = base_query.all()
+                candidate_count = len(all_candidates)
                 scored: list[tuple[float, Chunk]] = []
                 for candidate in all_candidates:
                     score = cosine_similarity(candidate.embedding, target_embedding)
@@ -798,11 +857,25 @@ def process_text(
                 candidates = _merge_reference_candidates(candidates, lexical_candidates, merge_limit)
             references = _rerank_reference_chunks(text, candidates, code_focus=code_focus)
             if not references:
-                logger.info(
-                    "[feedback] no references for doc=%s group_ids=%s code_focus=%s",
-                    doc.document_id,
-                    doc_group_ids,
-                    code_focus,
+                log_event(
+                    "feedback_no_references",
+                    document_id=doc.document_id,
+                    source_chunk_id=existing_chunk.chunk_id,
+                    group_ids=doc_group_ids,
+                    code_focus=code_focus,
+                    candidate_count=candidate_count,
+                    lexical_candidate_count=len(lexical_candidates),
+                )
+            else:
+                log_event(
+                    "feedback_references_selected",
+                    document_id=doc.document_id,
+                    source_chunk_id=existing_chunk.chunk_id,
+                    group_ids=doc_group_ids,
+                    code_focus=code_focus,
+                    candidate_count=candidate_count,
+                    lexical_candidate_count=len(lexical_candidates),
+                    selected_reference_count=len(references),
                 )
 
         sql_references: list[Reference] = []
@@ -823,73 +896,83 @@ def process_text(
             return
 
         feedback = get_feedback(reviewer, doc, text, references, user)
-        if feedback != "NONE":
-            sql_feedback = Feedback(
+        if feedback == "NONE":
+            log_event(
+                "feedback_generation_none",
+                document_id=doc.document_id,
                 source_chunk_id=existing_chunk.chunk_id,
-                feedback=feedback,
-                model=reviewer.model,
+                code_focus=code_focus,
+                provider=getattr(reviewer, "provider", "unknown"),
+                reference_count=len(references),
             )
-            session.add(sql_feedback)
-            session.commit()
-            try:
-                from .notifications.service import (
-                    NotificationCandidate,
-                    PeerCandidate,
-                    is_scoring_enabled,
-                    score_and_route_candidate,
-                )
+            return
 
-                if is_scoring_enabled() and doc.groups:
-                    peer_candidates: list[PeerCandidate] = []
-                    for ref_chunk in references:
-                        ref_doc = ref_chunk.document
-                        ref_user = ref_doc.user if ref_doc else None
-                        peer_candidates.append(
-                            PeerCandidate(
-                                doc_id=ref_doc.document_id if ref_doc else "",
-                                doc_title=ref_doc.title if ref_doc else "",
-                                chunk_id=ref_chunk.chunk_id,
-                                chunk_text=ref_chunk.content,
-                                doc_type=ref_doc.doc_type if ref_doc else "",
-                                author_role=ref_user.role if ref_user and ref_user.role else "",
-                                author_team="",
-                                last_modified_utc=(
-                                    ref_doc.datetime_modified.isoformat()
-                                    if ref_doc and ref_doc.datetime_modified
-                                    else None
-                                ),
-                                similarity=None,
-                            )
-                        )
-                    if peer_candidates:
-                        candidate = NotificationCandidate(
-                            user_id=user.user_id if user else doc.user_id,
-                            group_id=doc.groups[0].group_id,
-                            target_doc_id=doc.document_id,
-                            target_chunk_id=existing_chunk.chunk_id,
-                            target_text=text,
-                            target_doc_title=doc.title or "",
-                            target_doc_type=doc.doc_type or "",
-                            target_last_modified_utc=(
-                                doc.datetime_modified.isoformat() if doc.datetime_modified else None
+        sql_feedback = Feedback(
+            source_chunk_id=existing_chunk.chunk_id,
+            feedback=feedback,
+            model=reviewer.model,
+        )
+        session.add(sql_feedback)
+        session.commit()
+        try:
+            from .notifications.service import (
+                NotificationCandidate,
+                PeerCandidate,
+                is_scoring_enabled,
+                score_and_route_candidate,
+            )
+
+            if is_scoring_enabled() and doc.groups:
+                peer_candidates: list[PeerCandidate] = []
+                for ref_chunk in references:
+                    ref_doc = ref_chunk.document
+                    ref_user = ref_doc.user if ref_doc else None
+                    peer_candidates.append(
+                        PeerCandidate(
+                            doc_id=ref_doc.document_id if ref_doc else "",
+                            doc_title=ref_doc.title if ref_doc else "",
+                            chunk_id=ref_chunk.chunk_id,
+                            chunk_text=ref_chunk.content,
+                            doc_type=ref_doc.doc_type if ref_doc else "",
+                            author_role=ref_user.role if ref_user and ref_user.role else "",
+                            author_team="",
+                            last_modified_utc=(
+                                ref_doc.datetime_modified.isoformat()
+                                if ref_doc and ref_doc.datetime_modified
+                                else None
                             ),
-                            user_role=user.role if user and user.role else "",
-                            user_team="",
-                            user_is_doc_author=True,
-                            user_is_group_admin=False,
-                            peer_candidates=tuple(peer_candidates),
-                            generated_feedback={"summary": feedback},
-                            run_id=f"feedback_{sql_feedback.feedback_id}",
-                            now_utc=datetime.now(timezone.utc),
+                            similarity=None,
                         )
-                        score_and_route_candidate(
-                            session,
-                            candidate,
-                            commit=True,
-                            delivery_channel="inbox_only",
-                        )
-            except Exception as exc:
-                logger.warning("Notification scoring failed: %s", exc)
+                    )
+                if peer_candidates:
+                    candidate = NotificationCandidate(
+                        user_id=user.user_id if user else doc.user_id,
+                        group_id=doc.groups[0].group_id,
+                        target_doc_id=doc.document_id,
+                        target_chunk_id=existing_chunk.chunk_id,
+                        target_text=text,
+                        target_doc_title=doc.title or "",
+                        target_doc_type=doc.doc_type or "",
+                        target_last_modified_utc=(
+                            doc.datetime_modified.isoformat() if doc.datetime_modified else None
+                        ),
+                        user_role=user.role if user and user.role else "",
+                        user_team="",
+                        user_is_doc_author=True,
+                        user_is_group_admin=False,
+                        peer_candidates=tuple(peer_candidates),
+                        generated_feedback={"summary": feedback},
+                        run_id=f"feedback_{sql_feedback.feedback_id}",
+                        now_utc=datetime.now(timezone.utc),
+                    )
+                    score_and_route_candidate(
+                        session,
+                        candidate,
+                        commit=True,
+                        delivery_channel="inbox_only",
+                    )
+        except Exception as exc:
+            logger.warning("Notification scoring failed: %s", exc)
 
 
 def remove_text(session: SASession, text: str, document_id: str) -> None:

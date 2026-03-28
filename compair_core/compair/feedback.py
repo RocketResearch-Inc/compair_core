@@ -7,6 +7,7 @@ from typing import Any, Iterable, List
 import requests
 
 from .logger import log_event
+from .local_summary import ReferenceText, reference_payload_texts, summarize_reference_feedback
 from .models import Document, User
 
 try:
@@ -25,6 +26,10 @@ except (ImportError, ModuleNotFoundError):
 _REASONING_PREFIXES = ("gpt-5", "o1", "o2", "o3", "o4")
 _CODE_REVIEW_DOC_TYPE = "code-repo"
 logger = logging.getLogger(__name__)
+
+
+def _openai_api_key() -> str | None:
+    return os.getenv("COMPAIR_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 
 
 def _is_reasoning_model_name(model_name: str | None) -> bool:
@@ -80,7 +85,7 @@ class Reviewer:
             self.provider = "cloud"
         else:
             if self.provider == "openai":
-                api_key = os.getenv("COMPAIR_OPENAI_API_KEY")
+                api_key = _openai_api_key()
                 if api_key and openai is not None:
                     # Support both legacy (ChatCompletion) and new SDKs
                     if hasattr(openai, "api_key"):
@@ -126,38 +131,31 @@ def _reference_snippets(references: Iterable[Any], limit: int = 4) -> List[str]:
 
 
 def _fallback_feedback(text: str, references: list[Any]) -> str:
-    snippets = _reference_snippets(references)
-    if not snippets:
-        return "NONE"
-    joined = "; ".join(snippets)
-    return f"Consider aligning with these reference passages: {joined}"
+    summary = summarize_reference_feedback(text, _local_references(references))
+    return summary or "NONE"
 
 
 
 def _local_reference_feedback(
     reviewer: Reviewer,
+    text: str,
     references: list[Any],
     user: User,
 ) -> str | None:
-    if not references:
-        return None
-    summaries: list[str] = []
-    for ref in references[:4]:
-        doc = getattr(ref, "document", None)
-        title = getattr(doc, "title", None) or "a related document"
+    return summarize_reference_feedback(text, _local_references(references))
+
+
+def _local_references(references: list[Any]) -> list[ReferenceText]:
+    local_references: list[ReferenceText] = []
+    for ref in references[:6]:
         snippet = getattr(ref, "content", "") or getattr(ref, "text", "")
-        snippet = snippet.replace("\n", " ").strip()
+        snippet = snippet.strip()
         if not snippet:
             continue
-        summaries.append(f'"{title}" — {snippet[:200]}')
-    if not summaries:
-        return None
-    instruction = reviewer.length_map.get(user.preferred_feedback_length, "1–2 short sentences")
-    if len(summaries) == 1:
-        body = summaries[0]
-    else:
-        body = "; ".join(summaries)
-    return f"[local-feedback] {instruction}: Consider the guidance from {body}"
+        doc = getattr(ref, "document", None)
+        title = getattr(doc, "title", None) or "a related reference"
+        local_references.append(ReferenceText(label=title, text=snippet))
+    return local_references
 
 
 def _openai_feedback(
@@ -267,7 +265,7 @@ Your goal is to quickly surface **meaningful** connections or useful contrasts b
     try:
         client = reviewer._openai_client
         if client is None and hasattr(openai, "OpenAI"):
-            api_key = os.getenv("COMPAIR_OPENAI_API_KEY") or None
+            api_key = _openai_api_key()
             try:  # pragma: no cover - optional dependency differences
                 client = openai.OpenAI(api_key=api_key) if api_key else openai.OpenAI()
             except TypeError:
@@ -348,7 +346,7 @@ def _local_feedback(
 ) -> str | None:
     payload = {
         "document": text,
-        "references": [getattr(ref, "content", "") for ref in references],
+        "references": reference_payload_texts(_local_references(references)),
         "length_instruction": reviewer.length_map.get(
             user.preferred_feedback_length,
             "1–2 short sentences",
@@ -379,7 +377,7 @@ def _http_feedback(
         return None
     payload = {
         "document": text,
-        "references": [getattr(ref, "content", "") for ref in references],
+        "references": reference_payload_texts(_local_references(references)),
         "length_instruction": reviewer.length_map.get(
             user.preferred_feedback_length,
             "1–2 short sentences",
@@ -428,12 +426,12 @@ def get_feedback(
             return "NONE"
 
     if reviewer.provider == "local":
-        feedback = _local_reference_feedback(reviewer, references, user)
-        if feedback:
-            return feedback
         if getattr(reviewer, "endpoint", None):
             feedback = _local_feedback(reviewer, text, references, user)
             if feedback:
                 return feedback
+        feedback = _local_reference_feedback(reviewer, text, references, user)
+        if feedback:
+            return feedback
 
     return _fallback_feedback(text, references)

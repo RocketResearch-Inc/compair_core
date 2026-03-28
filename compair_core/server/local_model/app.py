@@ -8,6 +8,8 @@ from typing import List
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+from ...compair.local_summary import ReferenceText, reference_label_from_text, summarize_reference_feedback
+
 app = FastAPI(title="Compair Local Model", version="0.1.0")
 
 _DEFAULT_DIM = 384
@@ -75,13 +77,15 @@ def generate(request: GenerateRequest) -> GenerateResponse:
     if not text_input:
         return GenerateResponse(feedback="NONE")
 
-    first_sentence = text_input.split("\n", 1)[0][:200]
-    verbosity = request.length_instruction or request.verbosity or "brief response"
-    ref_snippet = ""
-    if request.references:
-        top_ref = (request.references[0] or "").strip()
-        if top_ref:
-            ref_snippet = f" Reference: {top_ref[:160]}"
+    references = [(ref or "").strip() for ref in (request.references or []) if (ref or "").strip()]
+    if not references:
+        return GenerateResponse(feedback="NONE")
 
-    feedback = f"[local-feedback] {verbosity}: {first_sentence}{ref_snippet}".strip()
-    return GenerateResponse(feedback=feedback or "NONE")
+    local_references = [
+        ReferenceText(label=reference_label_from_text(reference), text=reference)
+        for reference in references[:6]
+    ]
+    feedback = summarize_reference_feedback(text_input, local_references)
+    if not feedback:
+        return GenerateResponse(feedback="NONE")
+    return GenerateResponse(feedback=feedback)
