@@ -88,6 +88,85 @@ class LocalSummaryTests(unittest.TestCase):
         self.assertNotIn("baseline snapshot", match.peer_excerpt.lower())
         self.assertIn("/reviews", match.peer_excerpt)
 
+    def test_changed_lines_are_preferred_for_target_excerpt(self) -> None:
+        target = (
+            "@@ -1,5 +1,5 @@\n"
+            ' title = "Compair"\n'
+            '-payload.reviews.map((review) => render(review.severity, review.category));\n'
+            '+payload.items.map((item) => render(item.priority, item.type));\n'
+            ' footer = "done"\n'
+        )
+        reference = local_summary.ReferenceText(
+            label="demo.local:compair/demo-api",
+            text="payload.reviews.map((review) => render(review.severity, review.category));",
+        )
+        match = local_summary.best_reference_match(target, [reference])
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertIn("payload.items", match.target_excerpt)
+
+    def test_focus_text_guides_full_chunk_summary(self) -> None:
+        full_chunk = (
+            "### File: internal/api/capabilities.go\n"
+            "package api\n\n"
+            "func capabilitiesCachePath() string {\n"
+            '  return filepath.Join(dir, ".compair", "cache", "capabilities.json")\n'
+            "}\n\n"
+            "type authCaps struct {\n"
+            '  SingleUser bool `json:"singleUser"`\n'
+            '  ActivityFeed bool `json:"activityFeed"`\n'
+            "}\n"
+        )
+        focus_text = (
+            'type authCaps struct {\n'
+            '  SingleUser bool `json:"singleUser"`\n'
+            '  ActivityFeed bool `json:"activityFeed"`\n'
+            "}\n"
+        )
+        reference = local_summary.ReferenceText(
+            label="demo.local:compair/demo-api",
+            text=(
+                'type authCaps struct {\n'
+                '  SingleUser bool `json:"single_user"`\n'
+                '  ActivityFeed bool `json:"activity_feed"`\n'
+                "}\n"
+            ),
+        )
+        match = local_summary.best_reference_match(full_chunk, [reference], focus_text=focus_text)
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertIn("singleUser", match.target_excerpt)
+        summary = local_summary.summarize_reference_feedback(full_chunk, [reference], focus_text=focus_text)
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertIn("singleUser", summary)
+
+    def test_structured_config_fragments_remain_eligible(self) -> None:
+        summary = local_summary.summarize_reference_feedback(
+            'feature_flags = ["sync", "reviews"]\napi_base = "https://api.example.com/v2"',
+            [
+                local_summary.ReferenceText(
+                    label="ref",
+                    text='feature_flags = ["sync"]\napi_base = "https://api.example.com/v1"',
+                )
+            ],
+        )
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertIn("changed content", summary)
+
+    def test_generic_prose_peer_is_rejected_when_overlap_is_weak(self) -> None:
+        summary = local_summary.summarize_reference_feedback(
+            'payload.items.map((item) => render(item.priority, item.type));',
+            [
+                local_summary.ReferenceText(
+                    label="ref",
+                    text="This page includes general notes for contributors and general project guidance.",
+                )
+            ],
+        )
+        self.assertIsNone(summary)
+
     def test_weak_evidence_returns_none(self) -> None:
         summary = local_summary.summarize_reference_feedback(
             "Updated wording only.",

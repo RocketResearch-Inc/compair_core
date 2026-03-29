@@ -19,11 +19,10 @@ try:
         send_daily_usage_report,
     )
 except (ImportError, ModuleNotFoundError) as exc:
-    logger.warning(
-        "Failed to import compair_cloud.tasks; using core task implementations. (%s: %s)",
+    logger.info(
+        "compair_cloud.tasks unavailable; using core task implementations (%s: %s)",
         exc.__class__.__name__,
         exc,
-        exc_info=exc,
     )
     from sqlalchemy.orm import joinedload
 

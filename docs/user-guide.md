@@ -11,7 +11,7 @@ Before hitting the API, configure the deployment with environment variables. The
 | Variable | Purpose | Typical local value |
 | --- | --- | --- |
 | `COMPAIR_EDITION` | Keeps the code in "core" mode. | `core` |
-| `COMPAIR_REQUIRE_AUTHENTICATION` | Enables full sign-up/login flows. Disable for single-user demos. | `true` (or `false` for kiosks) |
+| `COMPAIR_REQUIRE_AUTHENTICATION` | Enables full sign-up/login flows. Leave unset for the default single-user Core experience, or set to `true` for account-based auth. | `false` |
 | `COMPAIR_REQUIRE_EMAIL_VERIFICATION` | When auth is enabled, decide if users must confirm via email before activation. | `false` |
 | `COMPAIR_DATABASE_URL` | Points to a custom PostgreSQL/MySQL instance instead of SQLite. | Leave unset to use SQLite |
 | `COMPAIR_DB_DIR` / `COMPAIR_DB_NAME` | Location of the SQLite database file when `COMPAIR_DATABASE_URL` is omitted. | `${HOME}/.compair-core/data` / `compair.db` |

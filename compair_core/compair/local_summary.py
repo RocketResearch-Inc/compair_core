@@ -30,6 +30,7 @@ _PATH_RE = re.compile(
     """,
     re.VERBOSE,
 )
+_DIFF_LINE_RE = re.compile(r"^\s*[+-](?![+-])")
 _META_LINE_RE = re.compile(
     r"^\s*(?:#{1,6}\s+|generated:|document(?:\s+id)?:|summary:|content budget:|files included:)",
     re.IGNORECASE,
@@ -291,6 +292,49 @@ def _segments(text: str) -> list[str]:
     return deduped[:240]
 
 
+def _changed_line_signals(text: str) -> tuple[str, ...]:
+    lines = (text or "").splitlines()
+    if not lines:
+        return ()
+
+    out: list[str] = []
+    seen: set[str] = set()
+    indexed_changed_lines: list[tuple[int, str]] = []
+    for idx, raw_line in enumerate(lines):
+        if _DIFF_LINE_RE.match(raw_line):
+            indexed_changed_lines.append((idx, raw_line))
+
+    ordered_changed_lines = [
+        (idx, raw_line)
+        for idx, raw_line in indexed_changed_lines
+        if raw_line.lstrip().startswith("+")
+    ] + [
+        (idx, raw_line)
+        for idx, raw_line in indexed_changed_lines
+        if raw_line.lstrip().startswith("-")
+    ]
+
+    for idx, raw_line in ordered_changed_lines:
+        cleaned = _clean_diff_prefix(raw_line)
+        if not cleaned:
+            continue
+        candidates = [cleaned]
+        next_idx = idx + 1
+        if next_idx < len(lines) and _DIFF_LINE_RE.match(lines[next_idx]):
+            paired = normalize_text(f"{cleaned} {_clean_diff_prefix(lines[next_idx])}")
+            if paired and paired != cleaned:
+                candidates.append(paired)
+        for candidate in candidates:
+            lowered = candidate.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            out.append(candidate)
+            if len(out) >= 24:
+                return tuple(out)
+    return tuple(out)
+
+
 def _segment_penalty(segment: str, profile: ArtifactProfile) -> int:
     penalty = 0
     if _META_LINE_RE.match(segment):
@@ -313,11 +357,18 @@ def _overlap_score(left: ArtifactProfile, right: ArtifactProfile) -> int:
     return score
 
 
+def _signal_overlap_score(profile: ArtifactProfile, signal_texts: Sequence[str]) -> int:
+    if not signal_texts:
+        return 0
+    return len(profile.tokens & excerpt_tokens(*signal_texts))
+
+
 def best_grounded_excerpt(
     text: str,
     signal_texts: Sequence[str],
     preferred_excerpt: str = "",
     *,
+    anchor_texts: Sequence[str] = (),
     limit: int = 280,
 ) -> str:
     source = normalize_text(text)
@@ -330,6 +381,7 @@ def best_grounded_excerpt(
 
     signal_profile = extract_artifacts(" ".join(signal_texts))
     preferred_profile = extract_artifacts(preferred)
+    anchor_profile = extract_artifacts(" ".join(anchor_texts))
 
     best_segment = ""
     best_score = -10
@@ -339,6 +391,11 @@ def best_grounded_excerpt(
             continue
         score = _overlap_score(segment_profile, signal_profile)
         score += 2 * _overlap_score(segment_profile, preferred_profile)
+        score += 3 * _overlap_score(segment_profile, anchor_profile)
+        if anchor_texts:
+            score += 2 * _signal_overlap_score(segment_profile, anchor_texts)
+            if any(normalize_text(anchor) == segment for anchor in anchor_texts if anchor):
+                score += 3
         score -= _segment_penalty(segment, segment_profile)
         if score > best_score or (score == best_score and score > -10 and len(segment) < len(best_segment)):
             best_score = score
@@ -361,6 +418,25 @@ def _is_prose_like(profile: ArtifactProfile, text: str) -> bool:
     if len(text.split()) < 6:
         return False
     return len(profile.assignments) == 0 and profile.structured_score <= 2
+
+
+def _is_weak_peer_match(
+    target: ArtifactProfile,
+    peer: ArtifactProfile,
+    relation: RelationAssessment,
+    overlap: int,
+    anchor_overlap: int,
+) -> bool:
+    if relation.kind is None:
+        return True
+    if relation.kind == "generic divergence" and (overlap < 3 or anchor_overlap < 2):
+        return True
+    if peer.structured_score == 0 and not peer.quoted_values and relation.kind != "docs-vs-impl mismatch":
+        if overlap < 4 or anchor_overlap < 2:
+            return True
+    if target.structured_score >= 2 and peer.structured_score == 0 and relation.kind != "docs-vs-impl mismatch":
+        return True
+    return False
 
 
 def assess_relation(target_excerpt: str, peer_excerpt: str) -> RelationAssessment:
@@ -517,30 +593,62 @@ def summarize_comparison(
     return None
 
 
-def best_reference_match(text: str, references: Sequence[ReferenceText]) -> ReferenceMatch | None:
+def best_reference_match(
+    text: str,
+    references: Sequence[ReferenceText],
+    *,
+    focus_text: str = "",
+) -> ReferenceMatch | None:
     cleaned_references = [ref for ref in references if normalize_text(ref.text)]
     if not normalize_text(text) or not cleaned_references:
         return None
 
+    focus = normalize_text(focus_text)
+    target_source_text = focus or text
     reference_signal = " ".join(ref.text for ref in cleaned_references[:6])
-    target_excerpt = best_grounded_excerpt(text, [reference_signal], limit=240)
+    changed_signals = _changed_line_signals(target_source_text)
+    target_signals = [reference_signal]
+    if focus:
+        target_signals.append(focus)
+    target_signals.extend(changed_signals)
+    preferred_target_excerpt = changed_signals[0] if changed_signals else focus
+    target_excerpt = best_grounded_excerpt(
+        target_source_text,
+        target_signals,
+        preferred_target_excerpt,
+        anchor_texts=changed_signals,
+        limit=240,
+    )
     if not target_excerpt:
-        target_excerpt = best_grounded_excerpt(text, [text], limit=240)
+        target_excerpt = best_grounded_excerpt(
+            target_source_text,
+            [target_source_text, *changed_signals],
+            preferred_target_excerpt,
+            anchor_texts=changed_signals,
+            limit=240,
+        )
     if not target_excerpt:
         return None
 
+    target_profile = extract_artifacts(target_excerpt)
     best_match: ReferenceMatch | None = None
     for reference in cleaned_references[:6]:
+        peer_anchor_texts = [target_excerpt, *changed_signals]
         peer_excerpt = best_grounded_excerpt(
             reference.text,
-            [text, target_excerpt],
+            [text, target_source_text, target_excerpt, *changed_signals],
+            anchor_texts=peer_anchor_texts,
             limit=240,
         )
         if not peer_excerpt:
             continue
         relation = assess_relation(target_excerpt, peer_excerpt)
-        overlap = _overlap_score(extract_artifacts(target_excerpt), extract_artifacts(peer_excerpt))
-        score = overlap + 4 * relation.confidence
+        peer_profile = extract_artifacts(peer_excerpt)
+        overlap = _overlap_score(target_profile, peer_profile)
+        anchor_overlap = _signal_overlap_score(peer_profile, changed_signals or (target_excerpt,))
+        if _is_weak_peer_match(target_profile, peer_profile, relation, overlap, anchor_overlap):
+            continue
+        score = overlap + 4 * relation.confidence + (2 * anchor_overlap)
         if relation.kind is None and overlap < 2:
             continue
         candidate = ReferenceMatch(
@@ -555,8 +663,13 @@ def best_reference_match(text: str, references: Sequence[ReferenceText]) -> Refe
     return best_match
 
 
-def summarize_reference_feedback(text: str, references: Sequence[ReferenceText]) -> str | None:
-    match = best_reference_match(text, references)
+def summarize_reference_feedback(
+    text: str,
+    references: Sequence[ReferenceText],
+    *,
+    focus_text: str = "",
+) -> str | None:
+    match = best_reference_match(text, references, focus_text=focus_text)
     if match is None:
         return None
     return summarize_comparison(match.target_excerpt, match.peer_excerpt, match.reference_label, match.relation)

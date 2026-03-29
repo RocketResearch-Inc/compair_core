@@ -4,6 +4,8 @@ Compair Core is the open-source foundation of the Compair platform. It bundles t
 
 The premium cloud offering (available at [https://www.compair.sh/](https://www.compair.sh/)) layers on premium services (premium models, OCR, storage,  etc.). Core gracefully falls back to local behaviour when those packages are not present.
 
+If you want the strongest out-of-the-box review quality with the least setup, start with Compair Cloud. Core is the self-hosted path: it works well for evaluation and local/private deployments, and it gets closer to Cloud quality when you connect your own OpenAI key instead of relying on the bundled local fallback.
+
 ## Installing
 
 ```bash
@@ -101,7 +103,7 @@ Key environment variables for the core edition:
 - `COMPAIR_EMBEDDING_PROVIDER` – choose `local` (default) or `openai` for embeddings independent of feedback.
 - `COMPAIR_OPENAI_EMBED_MODEL` – override the OpenAI embedding model when `COMPAIR_EMBEDDING_PROVIDER=openai`.
 - `COMPAIR_EMAIL_BACKEND` – the core mailer logs emails to stdout; cloud overrides this with transactional delivery.
-- `COMPAIR_REQUIRE_AUTHENTICATION` (`true`) – set to `false` to run the API in single-user mode without login or account management. When disabled, Compair auto-provisions a local user, group, and long-lived session token so you can upload documents immediately.
+- `COMPAIR_REQUIRE_AUTHENTICATION` (`false`) – leave this unset for the default single-user Core experience, or set it to `true` to enable full login/account-management flows. When disabled, Compair auto-provisions a local user, group, and long-lived session token so you can upload documents immediately.
 - `COMPAIR_REQUIRE_EMAIL_VERIFICATION` (`false`) – require new users to confirm via email before activation. Set to `true` only when SMTP credentials are configured.
 - `COMPAIR_SINGLE_USER_USERNAME` / `COMPAIR_SINGLE_USER_NAME` – override the email-style username and display name that are used for the auto-provisioned local user in single-user mode.
 - `COMPAIR_INCLUDE_LEGACY_ROUTES` (`false`) – opt-in to the full legacy API surface (used by the hosted product) when running the core edition. Leave unset to expose only the streamlined single-user endpoints in Swagger.
@@ -138,6 +140,12 @@ Core and Cloud share the same document, group, feedback, and authentication foun
 - `compair_cloud` adds the hosted-only layers: Google OAuth, billing, richer analytics, and hosted notification delivery.
 
 Core now includes ranked notification-event generation, `/notification_events`, and `/get_activity_feed` so the CLI, desktop app, and self-hosted evaluations can use the same review semantics as Cloud. Hosted-only delivery layers such as Google OAuth, billing, and transactional notification delivery still belong to `compair_cloud`.
+
+Practical guidance:
+
+- Choose **Cloud** when you want the best first-run review quality, hosted collaboration, and the least operational setup.
+- Choose **Core** when you want self-hosting, local/private evaluation, or control over your own runtime.
+- Choose **Core + your own OpenAI key** when you want self-hosting but still want review quality closer to the hosted experience.
 
 ## Tests / Linting
 

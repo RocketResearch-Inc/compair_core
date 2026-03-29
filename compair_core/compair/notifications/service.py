@@ -100,6 +100,13 @@ def _feedback_summary(candidate: NotificationCandidate) -> str:
     return summary.strip() if isinstance(summary, str) else ""
 
 
+def _feedback_focus_text(candidate: NotificationCandidate) -> str:
+    if not isinstance(candidate.generated_feedback, dict):
+        return ""
+    focus_text = candidate.generated_feedback.get("focus_text")
+    return focus_text.strip() if isinstance(focus_text, str) else ""
+
+
 def _ground_notification_assessment(
     candidate: NotificationCandidate,
     assessment: ParsedLLMNotificationAssessment,
@@ -107,6 +114,7 @@ def _ground_notification_assessment(
     signal_texts = [
         text
         for text in [
+            _feedback_focus_text(candidate),
             _feedback_summary(candidate),
             assessment.evidence_target,
             assessment.evidence_peer,
@@ -158,12 +166,29 @@ def _build_payload(candidate: NotificationCandidate) -> Dict[str, Any]:
         return value if len(value) <= limit else value[:limit]
 
     feedback_summary = _feedback_summary(candidate)
-    target_signals = [feedback_summary] if feedback_summary else [peer.chunk_text for peer in candidate.peer_candidates[:2]]
-    target_excerpt = best_grounded_excerpt(candidate.target_text, target_signals, limit=360)
+    feedback_focus = _feedback_focus_text(candidate)
+    target_signals = [text for text in [feedback_focus, feedback_summary] if text]
+    if not target_signals:
+        target_signals = [peer.chunk_text for peer in candidate.peer_candidates[:2]]
+    target_excerpt = best_grounded_excerpt(
+        candidate.target_text,
+        target_signals,
+        feedback_focus or feedback_summary,
+        anchor_texts=[feedback_focus] if feedback_focus else (),
+        limit=360,
+    )
     peers = []
     for p in candidate.peer_candidates:
-        peer_signals = [feedback_summary] if feedback_summary else [candidate.target_text]
-        peer_excerpt = best_grounded_excerpt(p.chunk_text, peer_signals, limit=360)
+        peer_signals = [text for text in [feedback_focus, feedback_summary] if text]
+        if not peer_signals:
+            peer_signals = [candidate.target_text]
+        peer_excerpt = best_grounded_excerpt(
+            p.chunk_text,
+            peer_signals,
+            feedback_focus or feedback_summary,
+            anchor_texts=[feedback_focus] if feedback_focus else (),
+            limit=360,
+        )
         peers.append(
             {
                 "peer_doc_id": p.doc_id,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import logging
 import os
 import re
@@ -494,6 +495,12 @@ def process_document(
         num_chunks_can_generate_feedback = max((feedback_limit - recent_feedback_count), 0)
         indices_to_generate_feedback = prioritized_chunk_indices[:num_chunks_can_generate_feedback]
 
+    feedback_focus_by_new_index: dict[int, str] = {}
+    for idx in indices_to_generate_feedback:
+        focus_text = _focus_text_for_chunk(new_chunks[idx], prev_chunks, code_focus=code_focus)
+        if focus_text:
+            feedback_focus_by_new_index[idx] = focus_text
+
     existing_indices_to_generate_feedback: list[int] = []
     available_existing_candidate_count = 0
     if generate_feedback and reanalyze_existing and not new_chunks:
@@ -562,9 +569,11 @@ def process_document(
             text=chunk,
             generate_feedback=should_generate_feedback,
             precomputed_embedding=new_chunk_embeddings[i],
+            focus_text=feedback_focus_by_new_index.get(i, ""),
         )
 
     for idx in existing_indices_to_generate_feedback:
+        focus_text = _focus_text_for_chunk(chunks[idx], prev_chunks, code_focus=code_focus)
         process_text(
             session=session,
             embedder=embedder,
@@ -572,6 +581,7 @@ def process_document(
             doc=doc,
             text=chunks[idx],
             generate_feedback=True,
+            focus_text=focus_text,
         )
 
     removed = [c for c in prev_chunks if c not in set(chunks)]
@@ -739,6 +749,118 @@ def _existing_feedback_candidate_indices(
     )
 
 
+def _best_previous_chunk_for_focus(
+    chunk: str,
+    prev_chunks: list[str],
+    *,
+    code_focus: bool,
+) -> str:
+    if not prev_chunks:
+        return ""
+    target_path = _extract_snapshot_file_path(chunk)
+    candidates = prev_chunks
+    if code_focus and target_path:
+        same_path = [prev for prev in prev_chunks if _extract_snapshot_file_path(prev) == target_path]
+        if same_path:
+            candidates = same_path
+    best_chunk = ""
+    best_score = float("-inf")
+    for prev_chunk in candidates:
+        score = Levenshtein.ratio(chunk, prev_chunk)
+        if score > best_score:
+            best_score = score
+            best_chunk = prev_chunk
+    return best_chunk
+
+
+def _merge_line_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not ranges:
+        return []
+    ranges.sort()
+    merged: list[tuple[int, int]] = [ranges[0]]
+    for start, end in ranges[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _initial_focus_window(chunk: str, *, max_lines: int = 12) -> str:
+    lines = [line.rstrip() for line in (chunk or "").splitlines()]
+    if not lines:
+        return ""
+    selected: list[str] = []
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if idx == 0 and stripped.startswith("### File:"):
+            selected.append(line)
+            continue
+        selected.append(line)
+        if len(selected) >= max_lines:
+            break
+    return "\n".join(selected).strip()
+
+
+def _compact_changed_focus_window(
+    current_chunk: str,
+    previous_chunk: str,
+    *,
+    context_lines: int = 1,
+    max_lines: int = 18,
+) -> str:
+    if not current_chunk.strip():
+        return ""
+    if not previous_chunk.strip():
+        return _initial_focus_window(current_chunk)
+
+    current_lines = [line.rstrip() for line in current_chunk.splitlines()]
+    previous_lines = [line.rstrip() for line in previous_chunk.splitlines()]
+    matcher = difflib.SequenceMatcher(a=previous_lines, b=current_lines, autojunk=False)
+    ranges: list[tuple[int, int]] = []
+    for tag, _, _, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag in {"replace", "insert"} and j1 != j2:
+            start = max(0, j1 - context_lines)
+            end = min(len(current_lines), j2 + context_lines)
+        else:
+            anchor = min(max(j1, 0), max(len(current_lines) - 1, 0))
+            start = max(0, anchor - context_lines)
+            end = min(len(current_lines), anchor + context_lines + 1)
+        if start < end:
+            ranges.append((start, end))
+
+    merged = _merge_line_ranges(ranges)
+    if not merged:
+        return _initial_focus_window(current_chunk)
+
+    selected: list[str] = []
+    if current_lines and current_lines[0].strip().startswith("### File:"):
+        selected.append(current_lines[0])
+
+    for idx, (start, end) in enumerate(merged):
+        if idx > 0 and selected and selected[-1] != "...":
+            selected.append("...")
+        selected.extend(current_lines[start:end])
+
+    compact = [line for line in selected if line.strip()]
+    if len(compact) > max_lines:
+        head = compact[:max_lines]
+        if head[-1] != "...":
+            head.append("...")
+        compact = head
+    return "\n".join(compact).strip()
+
+
+def _focus_text_for_chunk(chunk: str, prev_chunks: list[str], *, code_focus: bool) -> str:
+    previous_chunk = _best_previous_chunk_for_focus(chunk, prev_chunks, code_focus=code_focus)
+    return _compact_changed_focus_window(chunk, previous_chunk)
+
+
 def process_text(
     session: SASession,
     embedder: Embedder,
@@ -748,6 +870,7 @@ def process_text(
     generate_feedback: bool = True,
     note: Note | None = None,
     precomputed_embedding: list[float] | None = None,
+    focus_text: str = "",
 ) -> None:
     logger = logging.getLogger(__name__)
     chunk_hash = stable_chunk_hash(text)
@@ -895,7 +1018,7 @@ def process_text(
         if not references:
             return
 
-        feedback = get_feedback(reviewer, doc, text, references, user)
+        feedback = get_feedback(reviewer, doc, text, references, user, focus_text=focus_text)
         if feedback == "NONE":
             log_event(
                 "feedback_generation_none",
@@ -961,7 +1084,7 @@ def process_text(
                         user_is_doc_author=True,
                         user_is_group_admin=False,
                         peer_candidates=tuple(peer_candidates),
-                        generated_feedback={"summary": feedback},
+                        generated_feedback={"summary": feedback, "focus_text": focus_text},
                         run_id=f"feedback_{sql_feedback.feedback_id}",
                         now_utc=datetime.now(timezone.utc),
                     )

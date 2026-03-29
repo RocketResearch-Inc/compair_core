@@ -57,6 +57,7 @@ class GenerateRequest(BaseModel):
     document: str | None = None
     references: List[str] | None = None
     length_instruction: str | None = None
+    focus_text: str | None = None
 
 
 class GenerateResponse(BaseModel):
@@ -85,7 +86,11 @@ def generate(request: GenerateRequest) -> GenerateResponse:
         ReferenceText(label=reference_label_from_text(reference), text=reference)
         for reference in references[:6]
     ]
-    feedback = summarize_reference_feedback(text_input, local_references)
+    feedback = summarize_reference_feedback(
+        text_input,
+        local_references,
+        focus_text=(request.focus_text or "").strip(),
+    )
     if not feedback:
         return GenerateResponse(feedback="NONE")
     return GenerateResponse(feedback=feedback)

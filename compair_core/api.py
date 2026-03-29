@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import os
 import re
 import requests
@@ -78,6 +79,7 @@ redis_client = redis.Redis.from_url(redis_url) if (redis and redis_url) else Non
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 DEFAULT_NOTIFICATION_DIGEST_FREQUENCY = "daily"
 DEFAULT_NOTIFICATION_BUCKETS = ["conflicts", "updates", "overlaps", "validation"]
+logger = logging.getLogger("compair.core.api")
 
 
 def _clean_text(value: Optional[str], max_len: int) -> Optional[str]:
@@ -681,7 +683,7 @@ def log_service_resource_metrics(service_name="backend"):
             cpu_percent = p.cpu_percent(interval=1)
             log_event("service_resource", service=service_name, memory_mb=mem_mb, cpu_percent=cpu_percent)
         except Exception as e:
-            print(f"[Resource Log Error] {e}")
+            logger.warning("resource log failed: %s", e)
         finally:
             # Re-schedule logging in 5 minutes
             threading.Timer(300, log).start()
@@ -752,7 +754,6 @@ def load_user(
         user = user[0]
         if user.groups is None:
             user.groups = []
-        print(f'User: {user}')
         return user
 
 
@@ -777,7 +778,6 @@ def load_user(
         user = user[0]
         if user.groups is None:
             user.groups = []
-        print(f'User: {user}')
         return user
 
 
@@ -1043,7 +1043,6 @@ def create_user(
     # Track referral if a code is provided
     if referral_code:
         require_feature(HAS_REFERRALS, "Referral program")
-        print(f'Got to backend referral code: {referral_code}')
         referrer = session.query(models.User).filter(models.User.referral_code == referral_code).first()
         if referrer and hasattr(referrer, "referral_credits"):
             max_credits = 3
@@ -1059,7 +1058,7 @@ def create_user(
     try:
         analytics.track("user_signup", user.user_id)
     except Exception as exc:
-        print(f"analytics track failed: {exc}")
+        logger.warning("analytics track failed: %s", exc)
     return user
 
 
@@ -1664,11 +1663,10 @@ def notify_group_admins(
     with compair.Session() as session:
         admin_emails = [admin.user.username for admin in group.admins]
         if len(admin_emails) == 0:
-            print("No admins found for group:", group.name)
+            logger.warning("no admins found for group %s", group.name)
             return
         user = session.query(models.User).filter(models.User.user_id == user_id).first()
         emailer.connect()
-        print("Admin emails:", admin_emails)
         emailer.send(
             subject="Group Join Request",
             sender=EMAIL_USER,
@@ -1697,13 +1695,10 @@ def join_group_direct(
     group_id: str
 ):
     """Join a group based on its visibility."""
-    print("1")
     with compair.Session() as session:
         group = session.query(models.Group).filter(models.Group.group_id == group_id).first()
-        print(group)
         if not group:
             raise HTTPException(status_code=404, detail="Group not found")
-        print(group.visibility)
         if group.visibility in ["public", "internal"]:
             user = session.query(models.User).filter(models.User.user_id == user_id).first()
             # Look for any existing invitations associated with this group
@@ -1765,7 +1760,6 @@ async def create_group(
     current_user: models.User = Depends(get_current_user)
 ):
     with compair.Session() as session:
-        print('1')
         if category not in all_group_categories()['categories']:
             category = "Other"  # Default to "Other" if category is not valid
 
@@ -1784,13 +1778,11 @@ async def create_group(
             visibility=visibility,
             datetime_created=datetime.now(),
         )
-        print(created_group)
         # Check if user has an admin ID
         q = select(models.Administrator).filter(
             models.Administrator.user_id==current_user.user_id
         )
         admin = session.execute(q).fetchone()
-        print(admin)
         if admin is None:
             # Make the user an admin
             admin = models.Administrator(user_id=current_user.user_id)
@@ -1798,7 +1790,6 @@ async def create_group(
             session.commit()
         else:
             admin = admin[0]
-        print('3?')
         created_group.admins.append(admin)
         session.add(created_group)
         session.commit()
@@ -1816,7 +1807,6 @@ async def create_group(
 
         # Add group to user
         admin.user.groups.append(created_group)
-        print('4??')
         session.add(admin)
         session.commit()
 
@@ -1902,7 +1892,6 @@ def load_doc(
         q = q.order_by(models.Document.datetime_modified.desc())
 
         documents = session.execute(q).unique().fetchall()
-        print(documents)
         if documents is None or len(documents)==0:
             return {
                 "documents": [],
@@ -1914,15 +1903,11 @@ def load_doc(
         # Paging
         offset = (page - 1) * page_size
         documents = session.execute(q.order_by(models.Document.datetime_created.desc()).offset(offset).limit(page_size)).unique().fetchall()
-        #print(documents)
         if documents is None or len(documents)==0:
             return {
                 "documents": [],
                 "total_count": 0
             }
-        #print(f'API returning these documents: {documents}')
-        print(f'Total count: {total_count}')
-        print(f'Page: {page}, Page size: {page_size}, Offset: {offset}')
         return {
             "documents": [
                 schema.Document.model_validate(d[0]) for d in documents
@@ -1939,13 +1924,9 @@ def load_group_users(
     filter_type: str | None = None,
     current_user: models.User = Depends(get_current_user)
 ) -> dict:
-    print('1')
-    print(current_user.user_id)
-    print(group_id)
     with compair.Session() as session:
         # Check if the group exists
         group = session.query(models.Group).filter(models.Group.group_id == group_id).first()
-        print(group)
         if not group:
             raise HTTPException(status_code=404, detail="Group not found")
 
@@ -2039,12 +2020,6 @@ def update_doc(
     is_published: str = Form(None),
     current_user: models.User = Depends(get_current_user)
 ):
-    print('In update doc')
-    print(author_id)
-    print(title)
-    print(datetime_created)
-    print(group_ids)
-    print(image_url)
     with compair.Session() as session:
         doc = session.query(models.Document).filter(
             models.Document.document_id == doc_id,
@@ -2061,7 +2036,6 @@ def update_doc(
                 groups = load_groups_by_ids(group_ids)
                 doc.groups = []
                 doc.groups.extend(groups)
-                print(f'New groups here? {doc.groups}')
             if image_url is not None:
                 doc.image_url = image_url
             if is_published is not None:
@@ -2136,7 +2110,6 @@ def create_doc(
             datetime_created=datetime.now(timezone.utc),
             datetime_modified=datetime.now(timezone.utc)
         )
-        print('About to assign groups!')
         target_group_ids = []
         if groups:
             target_group_ids = [gid.strip() for gid in groups.split(',') if gid.strip()]
@@ -2172,7 +2145,6 @@ def create_doc(
 
         primary_group = document.groups[0]
 
-        print(f'doc check!!! {document.content}')
         session.add(document)
         session.commit()
 
@@ -2198,7 +2170,7 @@ def create_doc(
         try:
             analytics.track("document_created", document.user_id)
         except Exception as exc:
-            print(f"analytics track failed: {exc}")
+            logger.warning("analytics track failed: %s", exc)
         return {"document_id": document.document_id}
 
 
@@ -2330,7 +2302,7 @@ async def process_doc(
         try:
             analytics.track("feedback_requested", current_user.user_id)
         except Exception as exc:
-            print(f"analytics track failed: {exc}")
+            logger.warning("analytics track failed: %s", exc)
     return {"task_id": task_id}
 
 
@@ -2419,7 +2391,6 @@ def get_trial_status(
     settings: Settings = Depends(get_settings_dependency),
 ):
     """Return the trial status for the authenticated user."""
-    print('Trial 1')
     require_feature(HAS_TRIALS, "Trial management")
     with compair.Session() as session:
         trial_expiration = getattr(current_user, "trial_expiration_date", None)
@@ -2461,7 +2432,7 @@ def get_trial_status(
                     except NotImplementedError:
                         checkout_url = None
                     except Exception as exc:
-                        print(f"Error generating Checkout URL: {exc}")
+                        logger.warning("error generating checkout URL: %s", exc)
 
         return {
             "status": current_user.status,
@@ -2634,7 +2605,6 @@ def load_references(
                 document_author=r.document.user.username
             ) for r in references
         ]
-        print(f'Returned references: {returned_references}')
         return returned_references
 
 @router.get("/verify-email")
@@ -2646,13 +2616,9 @@ def verify_email(token: str):
             detail="Email verification is disabled because authentication is off. Set COMPAIR_REQUIRE_AUTHENTICATION=true to enable account flows.",
         )
     with compair.Session() as session:
-        print(token)
         user = session.query(models.User).filter(models.User.verification_token == token).first()
-        print(user)
         if not user:
             raise HTTPException(status_code=400, detail="Invalid or expired token")
-        print(user.token_expiration)
-        print(datetime.now(timezone.utc))
         if user.token_expiration < datetime.now(timezone.utc):
             raise HTTPException(status_code=400, detail="Token has expired")
         _activate_user_account(session, user, send_group_invites=True)
@@ -2689,11 +2655,9 @@ def sign_up(
             status_code=403,
             detail="Sign-up is disabled because authentication is off. Set COMPAIR_REQUIRE_AUTHENTICATION=true to enable account flows.",
         )
-    print('1')
     if not is_valid_email(request.username):
         raise HTTPException(status_code=400, detail="Invalid email address")
     with compair.Session() as session:
-        print('2')
         # Call internal function to create the user
         #user = create_user(email=request.email, password=request.password)
         user = create_user(
@@ -2704,13 +2668,10 @@ def sign_up(
             session=session,
             referral_code=request.referral_code,
         )
-        print('Passed create_user')
         if settings.require_email_verification:
             web_base = _public_web_base_url()
             verification_link = f"{web_base}/verify-email?token={user.verification_token}"
-            print('3?')
             emailer.connect()
-            print('4??')
             emailer.send(
                 subject="Verify your email address",
                 sender=EMAIL_USER,
@@ -2722,7 +2683,6 @@ def sign_up(
                     user_name=user.name or user.username or "there",
                 ),
             )
-            print('The end???')
             return {"message": "Sign-up successful. Please check your email for verification."}
         _activate_user_account(session, user, send_group_invites=False)
         return {"message": "Sign-up successful. Your account is ready to use."}
@@ -2735,28 +2695,22 @@ def forgot_password(request: schema.ForgotPasswordRequest) -> dict:
             status_code=403,
             detail="Password resets are disabled because authentication is off. Set COMPAIR_REQUIRE_AUTHENTICATION=true to enable account flows.",
         )
-    print('1')
     with compair.Session() as session:
-        print('2')
         user = session.query(models.User).filter(models.User.username == request.email).first()
-        print(user)
         if not user:
             return {"message": "If the email exists, a reset link will be sent."}
 
         # Generate reset token
         token, expiration = generate_verification_token()  # Same function as before
-        print(token)
         token = token.lower()
         user.reset_token = token
         user.token_expiration = expiration
         session.commit()
         
-        print('3')
         # Send email with reset link
         web_base = _public_web_base_url()
         reset_link = f"{web_base}/reset-password?token={token}"
         emailer.connect()
-        print('4')
         emailer.send(
             subject="Password Reset Request",
             sender=EMAIL_USER,
@@ -2768,7 +2722,6 @@ def forgot_password(request: schema.ForgotPasswordRequest) -> dict:
                 user_name=user.name or user.username or "",
             ),
         )
-        print('5')
         return {"message": "If the email exists, a reset link will be sent."}
 
 @router.post("/reset-password")
@@ -2780,22 +2733,16 @@ def reset_password(request: schema.ResetPasswordRequest) -> dict:
             detail="Password resets are disabled because authentication is off. Set COMPAIR_REQUIRE_AUTHENTICATION=true to enable account flows.",
         )
     with compair.Session() as session:
-        print('1')
         submitted_token = (request.token or "").strip().lower()
-        print(submitted_token)
         user = session.query(models.User).filter(models.User.reset_token == submitted_token).first()
-        print(user)
         if not user or not user.token_expiration or user.token_expiration < datetime.now(timezone.utc):
             raise HTTPException(status_code=400, detail="Invalid or expired token")
         
         # Update the password
         user.set_password(request.new_password)
-        print('2')
         user.reset_token = None  # Invalidate the token
         user.token_expiration = None
-        print('3')
         session.commit()
-        print('4')
         
         return {"message": "Password has been reset successfully"}
 
@@ -2903,21 +2850,13 @@ def update_group(
     current_user: models.User = Depends(get_current_user)
 ) -> dict:
     """Update group settings."""
-    print('1')
     with compair.Session() as session:
         group = session.query(models.Group).filter(
             models.Group.group_id == group_id,
             models.Group.admins.any(models.Administrator.user_id == current_user.user_id)
         ).first()
-        print('2')
         if not group:
             raise HTTPException(status_code=404, detail="Group not found")
-        print(group)
-        print(group_id)
-        print(name)
-        print(visibility)
-        print(category)
-        print(description)
         if name:
             group.name = name
         if visibility:
@@ -4154,21 +4093,16 @@ def handle_successful_checkout(session):
     """
     Capture the payment method during Stripe Checkout.
     """
-    print('made it to checkout event')
-    print(session)
     customer_id = session["customer"]
     if customer_id is None:
         customer_id = session["customer_details"]["email"]
 
     payment_method = session.get("payment_method")  # Might not exist if using trial
-    print(customer_id)
-    print(payment_method)
     if payment_method:
         with compair.Session() as session:
             user = session.query(models.User).filter(
                 models.User.stripe_customer_id == customer_id
             ).first()
-            print(user)
             if user:
                 user.payment_fingerprint = payment_method
                 track_payment_method(user.payment_fingerprint)
@@ -4229,9 +4163,6 @@ def handle_successful_payment_intent(intent):
     ### Get / Store payment intent to customer_id (if both available!) if payment_method not available
     customer_id = intent["customer"]
     payment_method = intent.get("payment_method")
-    print("Got to intent")
-    print(intent)
-    print(payment_method)
     if payment_method:
         with compair.Session() as session:
             user = session.query(models.User).filter(
@@ -4265,9 +4196,6 @@ def handle_successful_invoice_payment(
             break
 
     payment_method = invoice.get("payment_method")
-    print("Got to payment")
-    print(invoice)
-    print(payment_method)
     if payment_method:
         with compair.Session() as session:
             user = session.query(models.User).filter(
@@ -4282,7 +4210,6 @@ def handle_successful_invoice_payment(
         user = session.query(models.User).filter(
             models.User.stripe_customer_id == customer_id
         ).first()
-        print(f'invoice user: {user}')
         if user:
             # user.stripe_subscription_id = subscription_id ## Can track if needed
             user.status = 'active'  # Mark the user as subscribed
@@ -4291,14 +4218,11 @@ def handle_successful_invoice_payment(
             user.status_change_date = datetime.now(timezone.utc)
             if plan and hasattr(user, "plan"):
                 user.plan = plan
-            print(user.status)
             # Handle referrer logic
             if hasattr(user, "referred_by") and user.referred_by:
-                print(user.referred_by)
                 referrer = session.query(models.User).filter(
                     models.User.user_id == user.referred_by
                 ).first()
-                print(referrer)
                 if referrer and hasattr(referrer, "pending_referral_credits") and referrer.pending_referral_credits > 0:
                     # Convert pending credits to earned credits
                     if hasattr(referrer, "referral_credits"):
@@ -4322,7 +4246,6 @@ def handle_successful_invoice_payment(
                         amount=25
                     try:
                         coupon_id = billing.create_coupon(amount)
-                        print(f'Coupon ID 2:{coupon_id}')
                         if referrer.stripe_customer_id:
                             billing.apply_coupon(customer_id=referrer.stripe_customer_id, coupon_id=coupon_id)
                     except NotImplementedError:
@@ -4332,7 +4255,7 @@ def handle_successful_invoice_payment(
                 try:
                     analytics.track("subscription_created", user.user_id)
                 except Exception as exc:
-                    print(f"analytics track failed: {exc}")
+                    logger.warning("analytics track failed: %s", exc)
 
             session.commit()
 
@@ -4341,8 +4264,6 @@ def handle_subscription_cancellation(subscription):
     Revoke access if a subscription is canceled.
     """
     customer_id = subscription["customer"]
-    print('Cancelled')
-    print(subscription)
     with compair.Session() as session:
         user = session.query(models.User).filter(
             models.User.stripe_customer_id == customer_id
@@ -4358,8 +4279,6 @@ def handle_failed_payment(invoice):
     Handle failed payment attempts.
     """
     customer_id = invoice["customer"]
-    print('Failure')
-    print(invoice)
     with compair.Session() as session:
         user = session.query(models.User).filter(
             models.User.stripe_customer_id == customer_id
@@ -4382,10 +4301,8 @@ async def stripe_webhook(
 
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
-    #print(f'payload: {payload}')
     try:
         event = billing.construct_event(payload, sig_header)
-        print(f'webhook event: {event["type"]}')
 
         log_event("stripe_webhook_start", event_type=event['type'], data=event['data']['object'])
 

@@ -130,8 +130,8 @@ def _reference_snippets(references: Iterable[Any], limit: int = 4) -> List[str]:
     return snippets
 
 
-def _fallback_feedback(text: str, references: list[Any]) -> str:
-    summary = summarize_reference_feedback(text, _local_references(references))
+def _fallback_feedback(text: str, references: list[Any], *, focus_text: str = "") -> str:
+    summary = summarize_reference_feedback(text, _local_references(references), focus_text=focus_text)
     return summary or "NONE"
 
 
@@ -141,8 +141,10 @@ def _local_reference_feedback(
     text: str,
     references: list[Any],
     user: User,
+    *,
+    focus_text: str = "",
 ) -> str | None:
-    return summarize_reference_feedback(text, _local_references(references))
+    return summarize_reference_feedback(text, _local_references(references), focus_text=focus_text)
 
 
 def _local_references(references: list[Any]) -> list[ReferenceText]:
@@ -343,6 +345,8 @@ def _local_feedback(
     text: str,
     references: list[Any],
     user: User,
+    *,
+    focus_text: str = "",
 ) -> str | None:
     payload = {
         "document": text,
@@ -351,6 +355,7 @@ def _local_feedback(
             user.preferred_feedback_length,
             "1–2 short sentences",
         ),
+        "focus_text": focus_text or None,
     }
 
     try:
@@ -372,6 +377,8 @@ def _http_feedback(
     text: str,
     references: list[Any],
     user: User,
+    *,
+    focus_text: str = "",
 ) -> str | None:
     if not reviewer.custom_endpoint:
         return None
@@ -382,6 +389,7 @@ def _http_feedback(
             user.preferred_feedback_length,
             "1–2 short sentences",
         ),
+        "focus_text": focus_text or None,
     }
     try:
         response = requests.post(reviewer.custom_endpoint, json=payload, timeout=30)
@@ -404,6 +412,8 @@ def get_feedback(
     text: str,
     references: list[Any],
     user: User,
+    *,
+    focus_text: str = "",
 ) -> str:
     if _is_code_review_document(doc, text) and _is_snapshot_metadata_chunk(text):
         return "NONE"
@@ -419,7 +429,7 @@ def get_feedback(
             return "NONE"
 
     if reviewer.provider == "http":
-        feedback = _http_feedback(reviewer, text, references, user)
+        feedback = _http_feedback(reviewer, text, references, user, focus_text=focus_text)
         if feedback:
             return feedback
         if _is_code_review_document(doc, text):
@@ -427,11 +437,11 @@ def get_feedback(
 
     if reviewer.provider == "local":
         if getattr(reviewer, "endpoint", None):
-            feedback = _local_feedback(reviewer, text, references, user)
+            feedback = _local_feedback(reviewer, text, references, user, focus_text=focus_text)
             if feedback:
                 return feedback
-        feedback = _local_reference_feedback(reviewer, text, references, user)
+        feedback = _local_reference_feedback(reviewer, text, references, user, focus_text=focus_text)
         if feedback:
             return feedback
 
-    return _fallback_feedback(text, references)
+    return _fallback_feedback(text, references, focus_text=focus_text)
