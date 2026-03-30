@@ -29,6 +29,14 @@ from .parse_llm_structured_output import ParsedLLMNotificationAssessment
 logger = logging.getLogger(__name__)
 
 
+def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _bool_env(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -258,7 +266,7 @@ def _last_push_sent_at(session: Session, user_id: str) -> Optional[datetime]:
             .order_by(NotificationEvent.created_at.desc())
             .first()
         )
-        return record.created_at if record else None
+        return _as_utc(record.created_at) if record else None
     except Exception as exc:
         logger.warning("NotificationEvent last push lookup failed: %s", exc)
         return None
