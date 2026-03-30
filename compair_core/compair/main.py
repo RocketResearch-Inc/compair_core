@@ -326,6 +326,7 @@ def _lexical_reference_candidates(
 
     target_tokens = _identifier_tokens(target_text, limit=96)
     target_path = _extract_snapshot_file_path(target_text)
+    target_is_doc_like = code_focus and _is_doc_like_path(target_path)
     scored: list[tuple[float, int, Chunk]] = []
     for idx, candidate in enumerate(candidates):
         if getattr(candidate, "chunk_type", "") != "document":
@@ -335,12 +336,20 @@ def _lexical_reference_candidates(
             continue
 
         candidate_tokens = _identifier_tokens(content, limit=96)
+        candidate_path = _extract_snapshot_file_path(content)
         lexical_score = _token_overlap_ratio(target_tokens, candidate_tokens)
-        path_score = _path_overlap_score(target_path, _extract_snapshot_file_path(content))
+        path_score = _path_overlap_score(target_path, candidate_path)
         code_bonus = 0.35 if "```" in content else 0.0
         diff_bonus = 0.25 if "diff --git" in content or "@@" in content or "+++ b/" in content else 0.0
-        doc_penalty = 0.75 if code_focus and _is_doc_like_path(_extract_snapshot_file_path(content)) else 0.0
-        score = (lexical_score * 5.0) + (path_score * 1.5) + code_bonus + diff_bonus - doc_penalty
+        doc_penalty = 0.0
+        doc_bonus = 0.0
+        if code_focus:
+            candidate_is_doc_like = _is_doc_like_path(candidate_path)
+            if target_is_doc_like and candidate_is_doc_like:
+                doc_bonus = 0.75
+            elif not target_is_doc_like and candidate_is_doc_like:
+                doc_penalty = 0.75
+        score = (lexical_score * 5.0) + (path_score * 1.5) + code_bonus + diff_bonus + doc_bonus - doc_penalty
         if score <= 0.0:
             continue
         scored.append((score, idx, candidate))
@@ -360,6 +369,7 @@ def _rerank_reference_chunks(target_text: str, candidates: list[Chunk], code_foc
         return trimmed[:final_limit]
 
     target_path = _extract_snapshot_file_path(target_text)
+    target_is_doc_like = _is_doc_like_path(target_path)
     target_tokens = _identifier_tokens(target_text)
     used_indices: set[int] = set()
     source_counts: dict[str, int] = {}
@@ -383,15 +393,19 @@ def _rerank_reference_chunks(target_text: str, candidates: list[Chunk], code_foc
                 continue
 
             candidate_tokens = _identifier_tokens(content)
+            candidate_path = _extract_snapshot_file_path(content)
             base_score = float(len(trimmed) - idx) / float(max(1, len(trimmed)))
             lexical_score = _token_overlap_ratio(target_tokens, candidate_tokens)
-            path_score = _path_overlap_score(target_path, _extract_snapshot_file_path(content))
+            path_score = _path_overlap_score(target_path, candidate_path)
             code_bonus = 0.4 if "```" in content else 0.0
+            doc_bonus = 0.0
+            if target_is_doc_like and _is_doc_like_path(candidate_path):
+                doc_bonus = 0.75
             diversity_penalty = 0.0
             if selected_tokens:
                 diversity_penalty = max(_token_overlap_ratio(candidate_tokens, prev) for prev in selected_tokens)
             source_penalty = 0.75 * float(source_counts.get(source_key, 0))
-            score = (base_score * 3.0) + (lexical_score * 4.0) + path_score + code_bonus - (diversity_penalty * 2.5) - source_penalty
+            score = (base_score * 3.0) + (lexical_score * 4.0) + path_score + code_bonus + doc_bonus - (diversity_penalty * 2.5) - source_penalty
             if score > best_score:
                 best_score = score
                 best_index = idx

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Iterable, List
 
 import requests
@@ -25,6 +26,7 @@ except (ImportError, ModuleNotFoundError):
 
 _REASONING_PREFIXES = ("gpt-5", "o1", "o2", "o3", "o4")
 _CODE_REVIEW_DOC_TYPE = "code-repo"
+_SNAPSHOT_FILE_RE = re.compile(r"^### File:\s+(.+?)(?:\s+\(.*)?$", re.MULTILINE)
 logger = logging.getLogger(__name__)
 
 
@@ -58,6 +60,47 @@ def _is_code_review_document(doc: Document, text: str) -> bool:
 def _is_snapshot_metadata_chunk(text: str) -> bool:
     stripped = (text or "").lstrip()
     return stripped.startswith("# Compair baseline snapshot") or stripped.startswith("## Snapshot limits")
+
+
+def _extract_snapshot_file_path(text: str) -> str:
+    match = _SNAPSHOT_FILE_RE.search(text or "")
+    if not match:
+        return ""
+    return (match.group(1) or "").strip()
+
+
+def _is_doc_like_path(path: str) -> bool:
+    normalized = (path or "").replace("\\", "/").strip().lower()
+    if not normalized:
+        return False
+    base = os.path.basename(normalized)
+    doc_basenames = {
+        "readme",
+        "readme.md",
+        "readme.rst",
+        "readme.txt",
+        "changelog",
+        "changelog.md",
+        "changelog.rst",
+        "changelog.txt",
+        "security",
+        "security.md",
+        "security.rst",
+        "security.txt",
+        "contributing",
+        "contributing.md",
+        "contributing.rst",
+        "contributing.txt",
+        "architecture",
+        "architecture.md",
+        "architecture.rst",
+        "architecture.txt",
+    }
+    return base in doc_basenames or "/docs/" in normalized or "/doc/" in normalized
+
+
+def _is_doc_like_snapshot_chunk(text: str) -> bool:
+    return _is_doc_like_path(_extract_snapshot_file_path(text))
 
 
 class Reviewer:
@@ -172,9 +215,34 @@ def _openai_feedback(
     instruction = reviewer.length_map.get(user.preferred_feedback_length, "1–2 short sentences")
     ref_text = "\n\n".join(_reference_snippets(references, limit=4))
     is_code_review = _is_code_review_document(doc, text)
+    is_doc_like = is_code_review and _is_doc_like_snapshot_chunk(text)
     if is_code_review and _is_snapshot_metadata_chunk(text):
         return "NONE"
-    if is_code_review:
+    if is_doc_like:
+        system_prompt = f"""# Identity
+You are a cross-repo review assistant inside Compair. You compare repository documentation, API maps, config notes, and nearby implementation snippets to find concrete product-surface drift across repos.
+
+# Purpose
+Your goal is to identify a specific, evidence-backed mismatch between the changed document chunk and the related repo excerpts: feature-surface drift, docs-vs-implementation drift, auth or capability drift, route or endpoint drift, config/env drift, or rollout/status drift.
+
+# Instructions
+
+- Prioritize the single strongest cross-repo mismatch that is directly supported by the changed chunk and the references.
+- Treat documentation drift as valid when one repo claims behavior or availability that the related implementation/docs in other repos contradict.
+- Mention concrete paths, endpoints, capability fields, auth modes, env vars, or product-surface claims when the evidence supports them.
+- Do not fall back to vague architectural commentary or “verify everything” summaries.
+- Stay grounded. If the references are too weak to support a concrete mismatch, respond with: **NONE**.
+- Length: {instruction}
+- Structure: Use one compact paragraph, not bullet lists or headings.
+
+# Output Format
+- If no concrete cross-repo mismatch is supported: **NONE**
+        """
+        user_prompt = (
+            f"Changed repository chunk:\n{text}\n\nRelated repository chunks:\n{ref_text or 'None provided'}\n\n"
+            f"{instruction} Focus on the strongest supported product-surface or docs-vs-implementation mismatch."
+        )
+    elif is_code_review:
         system_prompt = f"""# Identity
 You are a code review assistant inside Compair. You compare chunks from repository snapshots and surface concrete implementation mismatches, integration risks, information gaps, or non-obvious overlaps between repos.
 
