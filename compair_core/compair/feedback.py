@@ -8,7 +8,12 @@ from typing import Any, Iterable, List
 import requests
 
 from .logger import log_event
-from .local_summary import ReferenceText, reference_payload_texts, summarize_reference_feedback
+from .local_summary import (
+    ReferenceText,
+    best_reference_match,
+    reference_payload_texts,
+    summarize_reference_feedback,
+)
 from .models import Document, User
 
 try:
@@ -173,6 +178,22 @@ def _reference_snippets(references: Iterable[Any], limit: int = 4) -> List[str]:
     return snippets
 
 
+def _grounded_reference_context(text: str, references: list[Any], *, focus_text: str = "") -> str:
+    match = best_reference_match(text, _local_references(references), focus_text=focus_text)
+    if match is None:
+        return ""
+    lines = [
+        "Changed excerpt:",
+        match.target_excerpt,
+        "",
+        f"Related excerpt from {match.reference_label}:",
+        match.peer_excerpt,
+    ]
+    if match.relation.kind:
+        lines.extend(["", f"Likely relation: {match.relation.kind}"])
+    return "\n".join(lines).strip()
+
+
 def _fallback_feedback(text: str, references: list[Any], *, focus_text: str = "") -> str:
     summary = summarize_reference_feedback(text, _local_references(references), focus_text=focus_text)
     return summary or "NONE"
@@ -209,11 +230,14 @@ def _openai_feedback(
     text: str,
     references: list[Any],
     user: User,
+    *,
+    focus_text: str = "",
 ) -> str | None:
     if openai is None:
         return None
     instruction = reviewer.length_map.get(user.preferred_feedback_length, "1–2 short sentences")
     ref_text = "\n\n".join(_reference_snippets(references, limit=4))
+    grounded_context = _grounded_reference_context(text, references, focus_text=focus_text)
     is_code_review = _is_code_review_document(doc, text)
     is_doc_like = is_code_review and _is_doc_like_snapshot_chunk(text)
     if is_code_review and _is_snapshot_metadata_chunk(text):
@@ -238,8 +262,9 @@ Your goal is to identify a specific, evidence-backed mismatch between the change
 # Output Format
 - If no concrete cross-repo mismatch is supported: **NONE**
         """
+        evidence_block = f"\n\nStrongest grounded evidence:\n{grounded_context}" if grounded_context else ""
         user_prompt = (
-            f"Changed repository chunk:\n{text}\n\nRelated repository chunks:\n{ref_text or 'None provided'}\n\n"
+            f"Changed repository chunk:\n{text}{evidence_block}\n\nRelated repository chunks:\n{ref_text or 'None provided'}\n\n"
             f"{instruction} Focus on the strongest supported product-surface or docs-vs-implementation mismatch."
         )
     elif is_code_review:
@@ -264,8 +289,9 @@ Your goal is to identify specific, evidence-backed code observations that matter
 # Output Format
 - If no meaningful code-focused observation stands out: **NONE**
         """
+        evidence_block = f"\n\nStrongest grounded evidence:\n{grounded_context}" if grounded_context else ""
         user_prompt = (
-            f"Repository chunk:\n{text}\n\nRelated repository chunks:\n{ref_text or 'None provided'}\n\n"
+            f"Repository chunk:\n{text}{evidence_block}\n\nRelated repository chunks:\n{ref_text or 'None provided'}\n\n"
             f"{instruction} Prefer one concrete observation."
         )
     else:
@@ -490,10 +516,19 @@ def get_feedback(
         return cloud_get_feedback(reviewer._cloud_impl, doc, text, references, user)  # type: ignore[arg-type]
 
     if reviewer.provider == "openai":
-        feedback = _openai_feedback(reviewer, doc, text, references, user)
+        feedback = _openai_feedback(reviewer, doc, text, references, user, focus_text=focus_text)
         if feedback:
             return feedback
         if _is_code_review_document(doc, text):
+            if _is_doc_like_snapshot_chunk(text):
+                fallback_feedback = _local_reference_feedback(reviewer, text, references, user, focus_text=focus_text)
+                if fallback_feedback:
+                    log_event(
+                        "openai_feedback_doc_fallback",
+                        document_id=getattr(doc, "document_id", None),
+                        provider="openai",
+                    )
+                    return fallback_feedback
             return "NONE"
 
     if reviewer.provider == "http":
