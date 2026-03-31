@@ -12,7 +12,7 @@ import os
 
 from sqlalchemy.orm import Session
 
-from ..local_summary import best_grounded_excerpt, excerpt_tokens
+from ..local_summary import assess_relation, best_grounded_excerpt, excerpt_tokens
 from ..models import Chunk, Document, NotificationEvent
 from .delivery_logic import (
     CandidateContext,
@@ -27,6 +27,31 @@ from .llm_notification_scorer import NotificationScorer, NotificationScorerConfi
 from .parse_llm_structured_output import ParsedLLMNotificationAssessment
 
 logger = logging.getLogger(__name__)
+_CONFLICT_SUMMARY_TERMS = (
+    "conflict",
+    "drift",
+    "mismatch",
+    "regression",
+    "contradict",
+    "contradiction",
+    "incompatible",
+    "inconsistent",
+    "rename",
+    "renamed",
+    "missing integration",
+)
+_HIGH_IMPACT_TERMS = (
+    "api",
+    "capabilities",
+    "endpoint",
+    "route",
+    "field",
+    "schema",
+    "auth",
+    "oauth",
+    "env",
+    "payload",
+)
 
 
 def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
@@ -101,6 +126,10 @@ def _cap_bucket(value: str, max_value: str) -> str:
     return value if _bucket_rank(value) <= _bucket_rank(max_value) else max_value
 
 
+def _raise_bucket(value: str, min_value: str) -> str:
+    return value if _bucket_rank(value) >= _bucket_rank(min_value) else min_value
+
+
 def _feedback_summary(candidate: NotificationCandidate) -> str:
     if not isinstance(candidate.generated_feedback, dict):
         return ""
@@ -163,6 +192,53 @@ def _ground_notification_assessment(
         delivery=delivery,
         evidence_target=grounded_target,
         evidence_peer=grounded_peer,
+    )
+
+
+def _calibrate_assessment_from_feedback(
+    candidate: NotificationCandidate,
+    assessment: ParsedLLMNotificationAssessment,
+) -> ParsedLLMNotificationAssessment:
+    summary = _feedback_summary(candidate)
+    if not summary:
+        return assessment
+    if assessment.intent not in {"hidden_overlap", "quiet_validation"}:
+        return assessment
+
+    lowered = summary.lower()
+    if not any(term in lowered for term in _CONFLICT_SUMMARY_TERMS):
+        return assessment
+
+    target_excerpt = assessment.evidence_target or best_grounded_excerpt(candidate.target_text, [summary], summary)
+    peer_excerpt = assessment.evidence_peer
+    relation = assess_relation(target_excerpt or "", peer_excerpt or "")
+
+    promoted_intent = "relevant_update"
+    if relation.kind in {"route/path mismatch", "value mismatch", "rename", "docs-vs-impl mismatch"}:
+        promoted_intent = "potential_conflict"
+
+    min_severity = "MEDIUM"
+    min_relevance = "MEDIUM"
+    min_novelty = "MEDIUM"
+    min_certainty = "MEDIUM"
+    if promoted_intent == "potential_conflict" and any(term in lowered for term in _HIGH_IMPACT_TERMS):
+        min_severity = "HIGH"
+        min_relevance = "HIGH"
+
+    rationale = list(assessment.rationale[:2])
+    rationale.append("Generated feedback describes a mismatch/drift, so this is not treated as benign overlap.")
+
+    return replace(
+        assessment,
+        intent=promoted_intent,
+        severity=_raise_bucket(assessment.severity, min_severity),
+        relevance=_raise_bucket(assessment.relevance, min_relevance),
+        novelty=_raise_bucket(assessment.novelty, min_novelty),
+        certainty=_raise_bucket(assessment.certainty, min_certainty),
+        delivery="digest",
+        rationale=rationale[:3],
+        evidence_target=target_excerpt or assessment.evidence_target,
+        evidence_peer=peer_excerpt or assessment.evidence_peer,
     )
 
 
@@ -397,6 +473,7 @@ def score_and_route_candidate(
     payload = _build_payload(candidate)
     assessment = scorer.score(payload)
     assessment = _ground_notification_assessment(candidate, assessment)
+    assessment = _calibrate_assessment_from_feedback(candidate, assessment)
 
     ctx = CandidateContext(
         user_id=candidate.user_id,
