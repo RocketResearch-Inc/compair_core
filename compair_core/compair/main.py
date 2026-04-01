@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+from functools import lru_cache
 import logging
 import os
 import re
@@ -15,6 +16,7 @@ from sqlalchemy.orm import Session as SASession
 from .embeddings import create_embedding, create_embeddings, Embedder
 from .feedback import get_feedback, Reviewer
 from .logger import log_event
+from .local_summary import extract_artifacts
 from .models import (
     Chunk,
     Document,
@@ -213,6 +215,39 @@ def _token_overlap_ratio(left: set[str], right: set[str]) -> float:
     return len(left & right) / float(max(1, min(len(left), len(right))))
 
 
+@lru_cache(maxsize=2048)
+def _artifact_overlap_score(left_text: str, right_text: str) -> float:
+    left = extract_artifacts(left_text or "")
+    right = extract_artifacts(right_text or "")
+    if not left.text or not right.text:
+        return 0.0
+
+    score = 0.0
+    left_paths = {path.lower() for path in left.paths}
+    right_paths = {path.lower() for path in right.paths}
+    exact_path_overlap = left_paths & right_paths
+    if exact_path_overlap:
+        score += 3.0 + min(1.5, 0.5 * float(max(len(exact_path_overlap) - 1, 0)))
+
+    path_token_overlap = left.path_tokens & right.path_tokens
+    if path_token_overlap:
+        score += min(2.5, 0.5 * float(len(path_token_overlap)))
+
+    quoted_overlap = left.quoted_norm & right.quoted_norm
+    if quoted_overlap:
+        score += min(2.0, 0.75 * float(len(quoted_overlap)))
+
+    key_overlap = left.key_names & right.key_names
+    if key_overlap:
+        score += min(1.5, 0.5 * float(len(key_overlap)))
+
+    compound_overlap = left.compound_prefixes & right.compound_prefixes
+    if compound_overlap:
+        score += min(1.0, 0.25 * float(len(compound_overlap)))
+
+    return score
+
+
 def _is_doc_like_path(path: str) -> bool:
     normalized = (path or "").strip().lower().replace("\\", "/")
     if not normalized:
@@ -339,6 +374,7 @@ def _lexical_reference_candidates(
         candidate_path = _extract_snapshot_file_path(content)
         lexical_score = _token_overlap_ratio(target_tokens, candidate_tokens)
         path_score = _path_overlap_score(target_path, candidate_path)
+        artifact_score = min(_artifact_overlap_score(target_text, content), 4.0)
         code_bonus = 0.35 if "```" in content else 0.0
         diff_bonus = 0.25 if "diff --git" in content or "@@" in content or "+++ b/" in content else 0.0
         doc_penalty = 0.0
@@ -349,7 +385,15 @@ def _lexical_reference_candidates(
                 doc_bonus = 0.75
             elif not target_is_doc_like and candidate_is_doc_like:
                 doc_penalty = 0.75
-        score = (lexical_score * 5.0) + (path_score * 1.5) + code_bonus + diff_bonus + doc_bonus - doc_penalty
+        score = (
+            (lexical_score * 5.0)
+            + artifact_score
+            + (path_score * 1.5)
+            + code_bonus
+            + diff_bonus
+            + doc_bonus
+            - doc_penalty
+        )
         if score <= 0.0:
             continue
         scored.append((score, idx, candidate))
@@ -397,6 +441,7 @@ def _rerank_reference_chunks(target_text: str, candidates: list[Chunk], code_foc
             base_score = float(len(trimmed) - idx) / float(max(1, len(trimmed)))
             lexical_score = _token_overlap_ratio(target_tokens, candidate_tokens)
             path_score = _path_overlap_score(target_path, candidate_path)
+            artifact_score = min(_artifact_overlap_score(target_text, content), 4.0)
             code_bonus = 0.4 if "```" in content else 0.0
             doc_bonus = 0.0
             if target_is_doc_like and _is_doc_like_path(candidate_path):
@@ -405,7 +450,16 @@ def _rerank_reference_chunks(target_text: str, candidates: list[Chunk], code_foc
             if selected_tokens:
                 diversity_penalty = max(_token_overlap_ratio(candidate_tokens, prev) for prev in selected_tokens)
             source_penalty = 0.75 * float(source_counts.get(source_key, 0))
-            score = (base_score * 3.0) + (lexical_score * 4.0) + path_score + code_bonus + doc_bonus - (diversity_penalty * 2.5) - source_penalty
+            score = (
+                (base_score * 3.0)
+                + (lexical_score * 4.0)
+                + artifact_score
+                + path_score
+                + code_bonus
+                + doc_bonus
+                - (diversity_penalty * 2.5)
+                - source_penalty
+            )
             if score > best_score:
                 best_score = score
                 best_index = idx
@@ -424,6 +478,26 @@ def _rerank_reference_chunks(target_text: str, candidates: list[Chunk], code_foc
     if selected:
         return selected
     return trimmed[:final_limit]
+
+
+def _reference_query_text(text: str, focus_text: str, *, code_focus: bool) -> str:
+    if not code_focus or _is_snapshot_metadata_chunk(text):
+        return text
+    focus = (focus_text or "").strip()
+    target = (text or "").strip()
+    if not focus or not target or focus == target:
+        return text
+
+    focus_tokens = count_tokens(focus)
+    target_tokens = count_tokens(text)
+    if focus_tokens <= 0 or target_tokens <= 0 or focus_tokens >= target_tokens:
+        return text
+
+    # Only switch to the compact changed-window query when it meaningfully narrows
+    # the search surface; otherwise reuse the full chunk embedding.
+    if (focus_tokens * 4) > (target_tokens * 3) and (len(focus) * 4) > (len(target) * 3):
+        return text
+    return focus
 
 
 def process_document(
@@ -514,6 +588,24 @@ def process_document(
         focus_text = _focus_text_for_chunk(new_chunks[idx], prev_chunks, code_focus=code_focus)
         if focus_text:
             feedback_focus_by_new_index[idx] = focus_text
+    feedback_query_embedding_by_new_index: dict[int, list[float]] = {}
+    query_embedding_requests: list[tuple[int, str]] = []
+    for idx in indices_to_generate_feedback:
+        query_text = _reference_query_text(
+            new_chunks[idx],
+            feedback_focus_by_new_index.get(idx, ""),
+            code_focus=code_focus,
+        )
+        if query_text.strip() and query_text != new_chunks[idx]:
+            query_embedding_requests.append((idx, query_text))
+    if query_embedding_requests:
+        query_embeddings = create_embeddings(
+            embedder,
+            [query_text for _, query_text in query_embedding_requests],
+            user=user,
+        )
+        for (idx, _), query_embedding in zip(query_embedding_requests, query_embeddings):
+            feedback_query_embedding_by_new_index[idx] = query_embedding
 
     existing_indices_to_generate_feedback: list[int] = []
     available_existing_candidate_count = 0
@@ -583,11 +675,16 @@ def process_document(
             text=chunk,
             generate_feedback=should_generate_feedback,
             precomputed_embedding=new_chunk_embeddings[i],
+            query_embedding=feedback_query_embedding_by_new_index.get(i),
             focus_text=feedback_focus_by_new_index.get(i, ""),
         )
 
     for idx in existing_indices_to_generate_feedback:
         focus_text = _focus_text_for_chunk(chunks[idx], prev_chunks, code_focus=code_focus)
+        query_embedding = None
+        query_text = _reference_query_text(chunks[idx], focus_text, code_focus=code_focus)
+        if query_text.strip() and query_text != chunks[idx]:
+            query_embedding = create_embedding(embedder, query_text, user=user)
         process_text(
             session=session,
             embedder=embedder,
@@ -595,6 +692,7 @@ def process_document(
             doc=doc,
             text=chunks[idx],
             generate_feedback=True,
+            query_embedding=query_embedding,
             focus_text=focus_text,
         )
 
@@ -884,6 +982,7 @@ def process_text(
     generate_feedback: bool = True,
     note: Note | None = None,
     precomputed_embedding: list[float] | None = None,
+    query_embedding: list[float] | None = None,
     focus_text: str = "",
 ) -> None:
     logger = logging.getLogger(__name__)
@@ -943,10 +1042,14 @@ def process_text(
         doc_group_ids = [g.group_id for g in doc.groups]
         target_embedding = existing_chunk.embedding
         code_focus = _is_code_review_chunk(doc, text)
+        query_text = _reference_query_text(text, focus_text, code_focus=code_focus)
+        query_vector = query_embedding or target_embedding
+        if query_vector is None and query_text:
+            query_vector = create_embedding(embedder, query_text, user=user)
         candidate_limit, _, _ = _reference_selection_config(code_focus)
         merge_limit = max(candidate_limit, candidate_limit * 2)
 
-        if target_embedding is not None:
+        if query_vector is not None:
             lexical_candidates: list[Chunk] = []
             candidate_count = 0
             base_query = (
@@ -965,7 +1068,7 @@ def process_text(
             if VECTOR_BACKEND == "pgvector":
                 candidates = (
                     base_query.order_by(
-                        Chunk.embedding.cosine_distance(existing_chunk.embedding)
+                        Chunk.embedding.cosine_distance(query_vector)
                     )
                     .limit(candidate_limit)
                     .all()
@@ -979,20 +1082,20 @@ def process_text(
                 candidate_count = len(all_candidates)
                 scored: list[tuple[float, Chunk]] = []
                 for candidate in all_candidates:
-                    score = cosine_similarity(candidate.embedding, target_embedding)
+                    score = cosine_similarity(candidate.embedding, query_vector)
                     if score is not None:
                         scored.append((score, candidate))
                 scored.sort(key=lambda item: item[0], reverse=True)
                 candidates = [chunk for _, chunk in scored[:candidate_limit]]
             if code_focus:
                 lexical_candidates = _lexical_reference_candidates(
-                    text,
+                    query_text,
                     all_candidates or [],
                     limit=candidate_limit,
                     code_focus=True,
                 )
                 candidates = _merge_reference_candidates(candidates, lexical_candidates, merge_limit)
-            references = _rerank_reference_chunks(text, candidates, code_focus=code_focus)
+            references = _rerank_reference_chunks(query_text, candidates, code_focus=code_focus)
             if not references:
                 log_event(
                     "feedback_no_references",
