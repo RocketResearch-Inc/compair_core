@@ -108,6 +108,25 @@ def _is_doc_like_snapshot_chunk(text: str) -> bool:
     return _is_doc_like_path(_extract_snapshot_file_path(text))
 
 
+def _format_changed_chunk_prompt(
+    text: str,
+    focus_text: str = "",
+    *,
+    primary_label: str = "Primary changed excerpt",
+    secondary_label: str = "Surrounding chunk context (secondary)",
+) -> str:
+    full_text = (text or "").strip()
+    focused = (focus_text or "").strip()
+    if not full_text:
+        return ""
+    if not focused or focused == full_text:
+        return f"{primary_label}:\n{full_text}"
+    return (
+        f"{primary_label}:\n{focused}\n\n"
+        f"{secondary_label}:\n{full_text}"
+    )
+
+
 class Reviewer:
     """Edition-aware wrapper that selects a feedback provider based on configuration."""
 
@@ -252,6 +271,7 @@ Your goal is to identify a specific, evidence-backed mismatch between the change
 # Instructions
 
 - Prioritize the single strongest cross-repo mismatch that is directly supported by the changed chunk and the references.
+- If a primary changed excerpt is provided separately from surrounding chunk context, analyze the primary excerpt first and use the larger chunk only as supporting context.
 - Treat documentation drift as valid when one repo claims behavior or availability that the related implementation/docs in other repos contradict.
 - Mention concrete paths, endpoints, capability fields, auth modes, env vars, or product-surface claims when the evidence supports them.
 - Do not fall back to vague architectural commentary or “verify everything” summaries.
@@ -262,9 +282,10 @@ Your goal is to identify a specific, evidence-backed mismatch between the change
 # Output Format
 - If no concrete cross-repo mismatch is supported: **NONE**
         """
+        changed_chunk_prompt = _format_changed_chunk_prompt(text, focus_text)
         evidence_block = f"\n\nStrongest grounded evidence:\n{grounded_context}" if grounded_context else ""
         user_prompt = (
-            f"Changed repository chunk:\n{text}{evidence_block}\n\nRelated repository chunks:\n{ref_text or 'None provided'}\n\n"
+            f"{changed_chunk_prompt}{evidence_block}\n\nRelated repository chunks:\n{ref_text or 'None provided'}\n\n"
             f"{instruction} Focus on the strongest supported product-surface or docs-vs-implementation mismatch."
         )
     elif is_code_review:
@@ -277,6 +298,7 @@ Your goal is to identify specific, evidence-backed code observations that matter
 # Instructions
 
 - Prioritize concrete implementation observations over broad architectural summaries.
+- If a primary changed excerpt is provided separately from surrounding chunk context, analyze the primary excerpt first and use the larger chunk only as supporting context.
 - Mention specific file paths, endpoints, env vars, settings, or interfaces when the evidence supports it.
 - When the evidence points to hidden overlap, reinforcement, or an information gap rather than a conflict, say that plainly instead of forcing issue/fix framing.
 - Stay grounded: only make claims that are directly supported by the provided chunk and references. If evidence is partial, say what to verify next instead of asserting it as fact.
@@ -289,9 +311,10 @@ Your goal is to identify specific, evidence-backed code observations that matter
 # Output Format
 - If no meaningful code-focused observation stands out: **NONE**
         """
+        changed_chunk_prompt = _format_changed_chunk_prompt(text, focus_text)
         evidence_block = f"\n\nStrongest grounded evidence:\n{grounded_context}" if grounded_context else ""
         user_prompt = (
-            f"Repository chunk:\n{text}{evidence_block}\n\nRelated repository chunks:\n{ref_text or 'None provided'}\n\n"
+            f"{changed_chunk_prompt}{evidence_block}\n\nRelated repository chunks:\n{ref_text or 'None provided'}\n\n"
             f"{instruction} Prefer one concrete observation."
         )
     else:
@@ -513,7 +536,7 @@ def get_feedback(
         return "NONE"
 
     if reviewer.is_cloud and cloud_get_feedback is not None:
-        return cloud_get_feedback(reviewer._cloud_impl, doc, text, references, user)  # type: ignore[arg-type]
+        return cloud_get_feedback(reviewer._cloud_impl, doc, text, references, user, focus_text=focus_text)  # type: ignore[arg-type]
 
     if reviewer.provider == "openai":
         feedback = _openai_feedback(reviewer, doc, text, references, user, focus_text=focus_text)

@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import pathlib
+import sys
+import types
+import unittest
+
+
+def _load_notification_scorer_module():
+    root = pathlib.Path(__file__).resolve().parents[1]
+    package_name = "test_compair_notification_scorer"
+    scorer_path = root / "compair_core" / "compair" / "notifications" / "llm_notification_scorer.py"
+    parse_path = root / "compair_core" / "compair" / "notifications" / "parse_llm_structured_output.py"
+
+    package = types.ModuleType(package_name)
+    package.__path__ = [str(scorer_path.parent)]
+    sys.modules[package_name] = package
+
+    parse_spec = importlib.util.spec_from_file_location(
+        f"{package_name}.parse_llm_structured_output",
+        parse_path,
+    )
+    parse_module = importlib.util.module_from_spec(parse_spec)
+    sys.modules[parse_spec.name] = parse_module
+    assert parse_spec.loader is not None
+    parse_spec.loader.exec_module(parse_module)
+
+    spec = importlib.util.spec_from_file_location(f"{package_name}.llm_notification_scorer", scorer_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+scorer_module = _load_notification_scorer_module()
+
+
+class _FakeResponse:
+    def __init__(self, output_text: str) -> None:
+        self.output_text = output_text
+        self.output = []
+
+
+class _FakeResponses:
+    def __init__(self, planned: list[object]) -> None:
+        self._planned = list(planned)
+        self.requests: list[dict] = []
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        if not self._planned:
+            raise AssertionError("unexpected extra responses.create call")
+        current = self._planned.pop(0)
+        if isinstance(current, Exception):
+            raise current
+        return current
+
+
+class _FakeClient:
+    def __init__(self, planned: list[object]) -> None:
+        self.responses = _FakeResponses(planned)
+
+
+def _payload() -> dict:
+    return {
+        "target": {
+            "chunk_excerpt": "| `activity` | `GET /activity_feed` |",
+            "chunk_text": "### File: docs/api_mapping.md\n| `activity` | `GET /activity_feed` |",
+        },
+        "candidates": [
+            {
+                "peer_excerpt": "| `activity` | `GET /get_activity_feed` |",
+                "peer_chunk_text": "### File: desktop/api_mapping.md\n| `activity` | `GET /get_activity_feed` |",
+            }
+        ],
+        "generated_feedback": {
+            "summary": "There is a concrete route/path drift between /activity_feed and /get_activity_feed.",
+        },
+    }
+
+
+def _assessment(parse_mode: str) -> scorer_module.ParsedLLMNotificationAssessment:
+    return scorer_module.ParsedLLMNotificationAssessment(
+        intent="potential_conflict",
+        relevance="HIGH",
+        novelty="HIGH",
+        severity="HIGH",
+        certainty="HIGH",
+        delivery="push",
+        rationale=["Target and peer disagree on the route path."],
+        evidence_target="| `activity` | `GET /activity_feed` |",
+        evidence_peer="| `activity` | `GET /get_activity_feed` |",
+        parse_mode=parse_mode,
+        raw_extracted=None,
+        errors=[],
+    )
+
+
+class NotificationScorerTests(unittest.TestCase):
+    def test_score_prefers_json_schema_output(self) -> None:
+        client = _FakeClient(
+            [
+                _FakeResponse(
+                    json.dumps(
+                        {
+                            "intent": "potential_conflict",
+                            "relevance": "HIGH",
+                            "novelty": "HIGH",
+                            "severity": "HIGH",
+                            "certainty": "HIGH",
+                            "delivery": "push",
+                            "rationale": ["Target and peer disagree on the route path."],
+                            "evidence_target": "| `activity` | `GET /activity_feed` |",
+                            "evidence_peer": "| `activity` | `GET /get_activity_feed` |",
+                        }
+                    )
+                )
+            ]
+        )
+        scorer = scorer_module.NotificationScorer(
+            config=scorer_module.NotificationScorerConfig(max_retries=1),
+            client=client,
+        )
+
+        result = scorer.score(_payload())
+
+        self.assertEqual(result.parse_mode, "json_schema")
+        self.assertEqual(len(client.responses.requests), 1)
+        request = client.responses.requests[0]
+        self.assertIn("text", request)
+        self.assertEqual(request["text"]["format"]["type"], "json_schema")
+        self.assertTrue(request["text"]["format"]["strict"])
+        self.assertEqual(request["text"]["format"]["name"], "notification_score")
+
+    def test_score_stops_after_repair_without_kv_fallback(self) -> None:
+        scorer = scorer_module.NotificationScorer(
+            config=scorer_module.NotificationScorerConfig(max_retries=1),
+            client=object(),
+        )
+        calls: list[str] = []
+
+        def fake_structured(system_prompt: str, user_prompt: str):
+            calls.append("structured")
+            return scorer_module.conservative_default("failed_default", errors=["schema path unavailable"])
+
+        legacy_results = iter(
+            [
+                scorer_module.conservative_default("failed_default", errors=["legacy parse failed"]),
+                _assessment("json_repaired"),
+            ]
+        )
+
+        def fake_score_once(system_prompt: str, user_prompt: str):
+            calls.append("legacy" if len(calls) == 1 else "repair")
+            return next(legacy_results)
+
+        scorer._score_once_structured = fake_structured  # type: ignore[method-assign]
+        scorer._score_once = fake_score_once  # type: ignore[method-assign]
+
+        result = scorer.score(_payload())
+
+        self.assertEqual(result.parse_mode, "json_repaired")
+        self.assertEqual(calls, ["structured", "legacy", "repair"])
+
+
+if __name__ == "__main__":
+    unittest.main()

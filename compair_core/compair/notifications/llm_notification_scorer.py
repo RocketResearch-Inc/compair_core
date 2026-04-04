@@ -22,10 +22,10 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
 
 from .parse_llm_structured_output import (
     ParsedLLMNotificationAssessment,
-    build_kv_fallback_prompt,
     build_repair_prompt,
     conservative_default,
     parse_llm_assessment,
+    validate_and_normalize,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,45 @@ Guidelines:
 - hidden_overlap and quiet_validation should NEVER be push.
 - potential_conflict should be push only if certainty is HIGH and severity is at least MEDIUM.
 """
+
+NOTIFICATION_SCORE_JSON_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "intent",
+        "relevance",
+        "novelty",
+        "severity",
+        "certainty",
+        "delivery",
+        "rationale",
+        "evidence_target",
+        "evidence_peer",
+    ],
+    "properties": {
+        "intent": {
+            "type": "string",
+            "enum": [
+                "potential_conflict",
+                "relevant_update",
+                "hidden_overlap",
+                "quiet_validation",
+            ],
+        },
+        "relevance": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+        "novelty": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+        "severity": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+        "certainty": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+        "delivery": {"type": "string", "enum": ["push", "digest"]},
+        "rationale": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 6,
+        },
+        "evidence_target": {"type": "string"},
+        "evidence_peer": {"type": "string"},
+    },
+}
 
 _CONFLICT_TERMS = {
     "conflict", "drift", "mismatch", "regression", "contradict", "contradiction",
@@ -255,6 +294,10 @@ class NotificationScorer:
         system = SYSTEM_INSTRUCTIONS
         user = build_user_prompt(payload)
 
+        structured = self._score_once_structured(system, user)
+        if structured.parse_mode != "failed_default":
+            return structured
+
         first = self._score_once(system, user)
         if first.parse_mode != "failed_default":
             return first
@@ -267,18 +310,39 @@ class NotificationScorer:
         if repaired.parse_mode != "failed_default":
             return repaired
 
-        kv_prompt = build_kv_fallback_prompt(system + "\n\n" + user)
-        kv_resp = self._score_once(
-            "Return only key=value lines. No extra text.",
-            kv_prompt,
-        )
-        if kv_resp.parse_mode != "failed_default":
-            return kv_resp
-
         heuristic = _heuristic_assessment(payload)
         return ParsedLLMNotificationAssessment(
             **{**heuristic.__dict__, "errors": ["OpenAI scorer failed; heuristic fallback used."]}
         )
+
+    def _score_once_structured(self, system_prompt: str, user_prompt: str) -> ParsedLLMNotificationAssessment:
+        raw = self._responses_create_text(
+            model=self.config.model,
+            input_items=[
+                {
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": system_prompt}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": user_prompt}],
+                },
+            ],
+            json_schema=NOTIFICATION_SCORE_JSON_SCHEMA,
+            schema_name="notification_score",
+        )
+        if not raw:
+            return conservative_default("failed_default", errors=["Empty structured response"])
+        try:
+            obj = json.loads(raw)
+        except Exception as exc:
+            return conservative_default("failed_default", errors=[f"json_schema_load_error: {exc}"])
+        parsed, errors = validate_and_normalize(obj)
+        if parsed:
+            return ParsedLLMNotificationAssessment(
+                **{**parsed.__dict__, "parse_mode": "json_schema", "raw_extracted": raw}
+            )
+        return conservative_default("failed_default", errors=errors or ["Invalid structured scorer output"])
 
     def _score_once(self, system_prompt: str, user_prompt: str) -> ParsedLLMNotificationAssessment:
         raw = self._responses_create_text(
@@ -298,7 +362,14 @@ class NotificationScorer:
             return parse_llm_assessment(raw)
         return conservative_default("failed_default", errors=["Empty response"])
 
-    def _responses_create_text(self, model: str, input_items: List[Dict[str, str]]) -> Optional[str]:
+    def _responses_create_text(
+        self,
+        model: str,
+        input_items: List[Dict[str, Any]],
+        *,
+        json_schema: Optional[Dict[str, Any]] = None,
+        schema_name: str = "structured_output",
+    ) -> Optional[str]:
         if self.client is None:
             return None
         last_err: Optional[str] = None
@@ -311,6 +382,15 @@ class NotificationScorer:
                 }
                 if self.config.temperature is not None:
                     request["temperature"] = self.config.temperature
+                if json_schema is not None:
+                    request["text"] = {
+                        "format": {
+                            "type": "json_schema",
+                            "name": schema_name,
+                            "schema": json_schema,
+                            "strict": True,
+                        }
+                    }
                 resp = self.client.responses.create(**request)
                 text = getattr(resp, "output_text", None)
                 if isinstance(text, str) and text.strip():
