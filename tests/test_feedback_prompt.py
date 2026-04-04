@@ -77,6 +77,34 @@ class FeedbackPromptTests(unittest.TestCase):
         )
         self.assertNotIn("Surrounding chunk context (secondary):", prompt)
 
+    def test_split_feedback_items_supports_multiple_findings(self) -> None:
+        raw = (
+            "The docs claim /activity_feed.\n"
+            "<<<FINDING>>>\n"
+            "The desktop client still calls /get_activity_feed.\n"
+        )
+
+        items = feedback.split_feedback_items(raw)
+
+        self.assertEqual(
+            items,
+            [
+                "The docs claim /activity_feed.",
+                "The desktop client still calls /get_activity_feed.",
+            ],
+        )
+
+    def test_split_feedback_items_dedupes_repeated_findings(self) -> None:
+        raw = (
+            "The workflow skips the artifact audit.\n"
+            "<<<FINDING>>>\n"
+            "The workflow skips the artifact audit.\n"
+        )
+
+        items = feedback.split_feedback_items(raw)
+
+        self.assertEqual(items, ["The workflow skips the artifact audit."])
+
 
 if __name__ == "__main__":
     unittest.main()

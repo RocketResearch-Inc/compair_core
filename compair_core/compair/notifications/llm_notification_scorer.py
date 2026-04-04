@@ -52,35 +52,63 @@ Guidelines:
 - potential_conflict should be push only if certainty is HIGH and severity is at least MEDIUM.
 """
 
-NOTIFICATION_SCORE_JSON_SCHEMA: Dict[str, Any] = {
+RUBRIC_SYSTEM_INSTRUCTIONS = """You are a notification scoring engine for a collaborative document platform.
+
+Evaluate the candidate using the rubric fields below.
+
+Return JSON only. Do not return LOW/MEDIUM/HIGH labels directly.
+
+Rubric fields:
+- same_surface_area: yes | no | unclear
+  Does the target and peer discuss the same endpoint, field, capability, feature flag, workflow step, or product-surface claim?
+- direct_contradiction: yes | no | unclear
+  Do the target and peer explicitly disagree?
+- docs_vs_impl_drift: yes | no | unclear
+  Does one side document or claim behavior that the other side's implementation/config/workflow contradicts?
+- user_or_runtime_impact: yes | no | unclear
+  Could the mismatch mislead users, break integrations, or change observable behavior?
+- policy_or_release_risk: yes | no | unclear
+  Does the mismatch affect policy, compliance, security, packaging, or release gating?
+- duplication_or_overlap: yes | no | unclear
+  Do the target and peer substantially overlap without a clear contradiction?
+- alignment_or_confirmation: yes | no | unclear
+  Does the peer reinforce or confirm the target rather than conflict with it?
+- novel_for_user: yes | no | unclear
+  Is this likely new/non-redundant information for the user right now?
+
+Requirements:
+- Use only the provided input.
+- evidence_target must be copied verbatim from the target excerpt when possible.
+- evidence_peer must be copied verbatim from a peer excerpt when possible.
+- If evidence is weak, use "unclear" rather than forcing "yes".
+- rationale should be 1-3 concise bullets grounded in the text.
+"""
+
+NOTIFICATION_RUBRIC_JSON_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": [
-        "intent",
-        "relevance",
-        "novelty",
-        "severity",
-        "certainty",
-        "delivery",
+        "same_surface_area",
+        "direct_contradiction",
+        "docs_vs_impl_drift",
+        "user_or_runtime_impact",
+        "policy_or_release_risk",
+        "duplication_or_overlap",
+        "alignment_or_confirmation",
+        "novel_for_user",
         "rationale",
         "evidence_target",
         "evidence_peer",
     ],
     "properties": {
-        "intent": {
-            "type": "string",
-            "enum": [
-                "potential_conflict",
-                "relevant_update",
-                "hidden_overlap",
-                "quiet_validation",
-            ],
-        },
-        "relevance": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
-        "novelty": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
-        "severity": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
-        "certainty": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
-        "delivery": {"type": "string", "enum": ["push", "digest"]},
+        "same_surface_area": {"type": "string", "enum": ["yes", "no", "unclear"]},
+        "direct_contradiction": {"type": "string", "enum": ["yes", "no", "unclear"]},
+        "docs_vs_impl_drift": {"type": "string", "enum": ["yes", "no", "unclear"]},
+        "user_or_runtime_impact": {"type": "string", "enum": ["yes", "no", "unclear"]},
+        "policy_or_release_risk": {"type": "string", "enum": ["yes", "no", "unclear"]},
+        "duplication_or_overlap": {"type": "string", "enum": ["yes", "no", "unclear"]},
+        "alignment_or_confirmation": {"type": "string", "enum": ["yes", "no", "unclear"]},
+        "novel_for_user": {"type": "string", "enum": ["yes", "no", "unclear"]},
         "rationale": {
             "type": "array",
             "items": {"type": "string"},
@@ -123,6 +151,124 @@ def build_user_prompt(payload: Dict[str, Any]) -> str:
         "INPUT_JSON:\n"
         f"{compact}"
     )
+
+
+def build_rubric_user_prompt(payload: Dict[str, Any]) -> str:
+    compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return (
+        "Evaluate this notification candidate using the rubric schema.\n"
+        "Return JSON only with the rubric fields requested by the schema.\n"
+        "Use target.chunk_excerpt and candidates[*].peer_excerpt when they are present; otherwise quote directly from the supplied chunk text.\n"
+        "INPUT_JSON:\n"
+        f"{compact}"
+    )
+
+
+def _normalize_rubric_flag(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    mapping = {
+        "yes": "yes",
+        "true": "yes",
+        "1": "yes",
+        "y": "yes",
+        "no": "no",
+        "false": "no",
+        "0": "no",
+        "n": "no",
+        "unclear": "unclear",
+        "unknown": "unclear",
+        "unsure": "unclear",
+        "maybe": "unclear",
+    }
+    return mapping.get(normalized, "unclear")
+
+
+def _rubric_assessment(obj: Dict[str, Any]) -> tuple[Optional[ParsedLLMNotificationAssessment], List[str]]:
+    def flag(name: str) -> str:
+        return _normalize_rubric_flag(obj.get(name))
+
+    same_surface = flag("same_surface_area") == "yes"
+    contradiction = flag("direct_contradiction") == "yes"
+    docs_vs_impl = flag("docs_vs_impl_drift") == "yes"
+    impact = flag("user_or_runtime_impact") == "yes"
+    policy = flag("policy_or_release_risk") == "yes"
+    overlap = flag("duplication_or_overlap") == "yes"
+    alignment = flag("alignment_or_confirmation") == "yes"
+    novel_flag = flag("novel_for_user")
+
+    rationale = obj.get("rationale")
+    rationale_items = [str(item).strip() for item in rationale or [] if str(item).strip()] if isinstance(rationale, list) else []
+    if not rationale_items:
+        if contradiction or docs_vs_impl:
+            rationale_items = ["Target and peer disagree on the same product surface."]
+        elif overlap:
+            rationale_items = ["Target and peer overlap substantially without a direct contradiction."]
+        elif alignment:
+            rationale_items = ["Peer evidence reinforces the target rather than contradicting it."]
+        else:
+            rationale_items = ["Structured rubric response provided limited supporting detail."]
+
+    evidence_target = str(obj.get("evidence_target") or "").strip()
+    evidence_peer = str(obj.get("evidence_peer") or "").strip()
+    grounded_target = bool(evidence_target)
+    grounded_peer = bool(evidence_peer)
+    grounded_both = grounded_target and grounded_peer
+
+    if contradiction or docs_vs_impl:
+        intent = "potential_conflict"
+    elif overlap and not alignment:
+        intent = "hidden_overlap"
+    elif alignment and not contradiction and not docs_vs_impl:
+        intent = "quiet_validation"
+    else:
+        intent = "relevant_update"
+
+    relevance = "LOW"
+    if policy or impact or contradiction:
+        relevance = "HIGH"
+    elif same_surface or docs_vs_impl or overlap or alignment:
+        relevance = "MEDIUM"
+
+    novelty = {"yes": "HIGH", "no": "LOW"}.get(novel_flag, "MEDIUM")
+
+    severity = "LOW"
+    if intent == "potential_conflict":
+        if policy:
+            severity = "HIGH"
+        elif contradiction and (impact or docs_vs_impl):
+            severity = "HIGH" if grounded_both or same_surface else "MEDIUM"
+        elif impact or docs_vs_impl or (same_surface and contradiction):
+            severity = "MEDIUM"
+    elif intent == "relevant_update":
+        if policy or impact:
+            severity = "MEDIUM"
+
+    certainty = "LOW"
+    if grounded_both and (same_surface or contradiction or docs_vs_impl or overlap or alignment):
+        certainty = "HIGH"
+    elif grounded_both or (same_surface and (grounded_target or grounded_peer)):
+        certainty = "MEDIUM"
+
+    delivery = "digest"
+    if intent == "potential_conflict" and severity == "HIGH" and certainty in {"HIGH", "MEDIUM"}:
+        delivery = "push"
+    elif intent == "relevant_update" and severity == "HIGH" and certainty == "HIGH":
+        delivery = "push"
+
+    parsed, errors = validate_and_normalize(
+        {
+            "intent": intent,
+            "relevance": relevance,
+            "novelty": novelty,
+            "severity": severity,
+            "certainty": certainty,
+            "delivery": delivery,
+            "rationale": rationale_items,
+            "evidence_target": evidence_target,
+            "evidence_peer": evidence_peer,
+        }
+    )
+    return parsed, errors
 
 
 def _tokenize(*values: Optional[str]) -> set[str]:
@@ -291,13 +437,15 @@ class NotificationScorer:
         if self.client is None:
             return _heuristic_assessment(payload)
 
-        system = SYSTEM_INSTRUCTIONS
-        user = build_user_prompt(payload)
+        rubric_system = RUBRIC_SYSTEM_INSTRUCTIONS
+        rubric_user = build_rubric_user_prompt(payload)
 
-        structured = self._score_once_structured(system, user)
+        structured = self._score_once_structured(rubric_system, rubric_user)
         if structured.parse_mode != "failed_default":
             return structured
 
+        system = SYSTEM_INSTRUCTIONS
+        user = build_user_prompt(payload)
         first = self._score_once(system, user)
         if first.parse_mode != "failed_default":
             return first
@@ -328,7 +476,7 @@ class NotificationScorer:
                     "content": [{"type": "input_text", "text": user_prompt}],
                 },
             ],
-            json_schema=NOTIFICATION_SCORE_JSON_SCHEMA,
+            json_schema=NOTIFICATION_RUBRIC_JSON_SCHEMA,
             schema_name="notification_score",
         )
         if not raw:
@@ -337,10 +485,10 @@ class NotificationScorer:
             obj = json.loads(raw)
         except Exception as exc:
             return conservative_default("failed_default", errors=[f"json_schema_load_error: {exc}"])
-        parsed, errors = validate_and_normalize(obj)
+        parsed, errors = _rubric_assessment(obj)
         if parsed:
             return ParsedLLMNotificationAssessment(
-                **{**parsed.__dict__, "parse_mode": "json_schema", "raw_extracted": raw}
+                **{**parsed.__dict__, "parse_mode": "json_schema_rubric", "raw_extracted": raw}
             )
         return conservative_default("failed_default", errors=errors or ["Invalid structured scorer output"])
 

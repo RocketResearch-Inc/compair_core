@@ -32,6 +32,7 @@ except (ImportError, ModuleNotFoundError):
 _REASONING_PREFIXES = ("gpt-5", "o1", "o2", "o3", "o4")
 _CODE_REVIEW_DOC_TYPE = "code-repo"
 _SNAPSHOT_FILE_RE = re.compile(r"^### File:\s+(.+?)(?:\s+\(.*)?$", re.MULTILINE)
+_FINDING_SEPARATOR = "<<<FINDING>>>"
 logger = logging.getLogger(__name__)
 
 
@@ -124,6 +125,48 @@ def _format_changed_chunk_prompt(
     return (
         f"{primary_label}:\n{focused}\n\n"
         f"{secondary_label}:\n{full_text}"
+    )
+
+
+def _max_findings_per_chunk(*, code_review: bool) -> int:
+    env_value = os.getenv("COMPAIR_MAX_FINDINGS_PER_CHUNK")
+    default = 2 if code_review else 1
+    try:
+        value = int(env_value) if env_value else default
+    except ValueError:
+        value = default
+    return max(1, min(value, 5))
+
+
+def split_feedback_items(feedback: str, *, max_items: int | None = None) -> list[str]:
+    text = (feedback or "").strip()
+    if not text or text.upper() == "NONE":
+        return []
+    parts = [part.strip() for part in re.split(rf"\s*{re.escape(_FINDING_SEPARATOR)}\s*", text) if part.strip()]
+    if not parts:
+        return []
+    limit = max_items if max_items is not None else len(parts)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        normalized = " ".join(part.split()).lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(part)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def _finding_prompt_instructions(max_findings: int) -> str:
+    if max_findings <= 1:
+        return "- Return a single compact paragraph."
+    return (
+        f"- If there are multiple distinct, well-supported observations, return up to {max_findings} findings.\n"
+        f"- Separate distinct findings with a standalone line containing exactly: {_FINDING_SEPARATOR}\n"
+        "- Only include multiple findings when they rely on meaningfully different evidence artifacts or product surfaces.\n"
+        "- Each finding must be a compact paragraph with no bullets or headings."
     )
 
 
@@ -259,6 +302,8 @@ def _openai_feedback(
     grounded_context = _grounded_reference_context(text, references, focus_text=focus_text)
     is_code_review = _is_code_review_document(doc, text)
     is_doc_like = is_code_review and _is_doc_like_snapshot_chunk(text)
+    max_findings = _max_findings_per_chunk(code_review=is_code_review)
+    finding_prompt_instructions = _finding_prompt_instructions(max_findings if is_code_review else 1)
     if is_code_review and _is_snapshot_metadata_chunk(text):
         return "NONE"
     if is_doc_like:
@@ -276,6 +321,8 @@ Your goal is to identify a specific, evidence-backed mismatch between the change
 - Mention concrete paths, endpoints, capability fields, auth modes, env vars, or product-surface claims when the evidence supports them.
 - Do not fall back to vague architectural commentary or “verify everything” summaries.
 - Stay grounded. If the references are too weak to support a concrete mismatch, respond with: **NONE**.
+- Prefer one finding unless the changed chunk clearly contains multiple distinct, well-supported drifts.
+{finding_prompt_instructions}
 - Length: {instruction}
 - Structure: Use one compact paragraph, not bullet lists or headings.
 
@@ -304,6 +351,8 @@ Your goal is to identify specific, evidence-backed code observations that matter
 - Stay grounded: only make claims that are directly supported by the provided chunk and references. If evidence is partial, say what to verify next instead of asserting it as fact.
 - Do not suggest direct package dependencies across decoupled services unless the evidence clearly shows that is intended.
 - Ignore weak signals like repo descriptions, version numbers, or stack recaps unless they imply a real compatibility issue.
+- Prefer one finding unless the changed chunk clearly contains multiple distinct, well-supported issues.
+{finding_prompt_instructions}
 - Length: {instruction}
 - Structure: Use one compact paragraph, not bullet lists or headings.
 - If there is no concrete, code-focused observation, respond with: **NONE**.

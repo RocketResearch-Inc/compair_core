@@ -14,7 +14,7 @@ from sqlalchemy.orm.attributes import get_history
 from sqlalchemy.orm import Session as SASession
 
 from .embeddings import create_embedding, create_embeddings, Embedder
-from .feedback import get_feedback, Reviewer
+from .feedback import get_feedback, Reviewer, split_feedback_items
 from .logger import log_event
 from .local_summary import extract_artifacts
 from .models import (
@@ -1136,7 +1136,8 @@ def process_text(
             return
 
         feedback = get_feedback(reviewer, doc, text, references, user, focus_text=focus_text)
-        if feedback == "NONE":
+        feedback_items = split_feedback_items(feedback)
+        if not feedback_items:
             log_event(
                 "feedback_generation_none",
                 document_id=doc.document_id,
@@ -1146,13 +1147,23 @@ def process_text(
                 reference_count=len(references),
             )
             return
-
-        sql_feedback = Feedback(
-            source_chunk_id=existing_chunk.chunk_id,
-            feedback=feedback,
-            model=reviewer.model,
-        )
-        session.add(sql_feedback)
+        if len(feedback_items) > 1:
+            log_event(
+                "feedback_generation_multiple",
+                document_id=doc.document_id,
+                source_chunk_id=existing_chunk.chunk_id,
+                code_focus=code_focus,
+                finding_count=len(feedback_items),
+            )
+        sql_feedback_entries: list[Feedback] = []
+        for item_feedback in feedback_items:
+            sql_feedback = Feedback(
+                source_chunk_id=existing_chunk.chunk_id,
+                feedback=item_feedback,
+                model=reviewer.model,
+            )
+            session.add(sql_feedback)
+            sql_feedback_entries.append(sql_feedback)
         session.commit()
         try:
             from .notifications.service import (
@@ -1185,32 +1196,33 @@ def process_text(
                         )
                     )
                 if peer_candidates:
-                    candidate = NotificationCandidate(
-                        user_id=user.user_id if user else doc.user_id,
-                        group_id=doc.groups[0].group_id,
-                        target_doc_id=doc.document_id,
-                        target_chunk_id=existing_chunk.chunk_id,
-                        target_text=text,
-                        target_doc_title=doc.title or "",
-                        target_doc_type=doc.doc_type or "",
-                        target_last_modified_utc=(
-                            doc.datetime_modified.isoformat() if doc.datetime_modified else None
-                        ),
-                        user_role=user.role if user and user.role else "",
-                        user_team="",
-                        user_is_doc_author=True,
-                        user_is_group_admin=False,
-                        peer_candidates=tuple(peer_candidates),
-                        generated_feedback={"summary": feedback, "focus_text": focus_text},
-                        run_id=f"feedback_{sql_feedback.feedback_id}",
-                        now_utc=datetime.now(timezone.utc),
-                    )
-                    score_and_route_candidate(
-                        session,
-                        candidate,
-                        commit=True,
-                        delivery_channel="inbox_only",
-                    )
+                    for sql_feedback in sql_feedback_entries:
+                        candidate = NotificationCandidate(
+                            user_id=user.user_id if user else doc.user_id,
+                            group_id=doc.groups[0].group_id,
+                            target_doc_id=doc.document_id,
+                            target_chunk_id=existing_chunk.chunk_id,
+                            target_text=text,
+                            target_doc_title=doc.title or "",
+                            target_doc_type=doc.doc_type or "",
+                            target_last_modified_utc=(
+                                doc.datetime_modified.isoformat() if doc.datetime_modified else None
+                            ),
+                            user_role=user.role if user and user.role else "",
+                            user_team="",
+                            user_is_doc_author=True,
+                            user_is_group_admin=False,
+                            peer_candidates=tuple(peer_candidates),
+                            generated_feedback={"summary": sql_feedback.feedback, "focus_text": focus_text},
+                            run_id=f"feedback_{sql_feedback.feedback_id}",
+                            now_utc=datetime.now(timezone.utc),
+                        )
+                        score_and_route_candidate(
+                            session,
+                            candidate,
+                            commit=True,
+                            delivery_channel="inbox_only",
+                        )
         except Exception as exc:
             logger.warning("Notification scoring failed: %s", exc)
 

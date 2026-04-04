@@ -44,6 +44,7 @@ def _load_main_module():
     feedback = types.ModuleType(f"{package_name}.feedback")
     feedback.get_feedback = lambda *args, **kwargs: "NONE"
     feedback.Reviewer = object
+    feedback.split_feedback_items = lambda feedback_text, **kwargs: [feedback_text] if feedback_text and feedback_text != "NONE" else []
     sys.modules[feedback.__name__] = feedback
 
     logger = types.ModuleType(f"{package_name}.logger")

@@ -106,12 +106,14 @@ class NotificationScorerTests(unittest.TestCase):
                 _FakeResponse(
                     json.dumps(
                         {
-                            "intent": "potential_conflict",
-                            "relevance": "HIGH",
-                            "novelty": "HIGH",
-                            "severity": "HIGH",
-                            "certainty": "HIGH",
-                            "delivery": "push",
+                            "same_surface_area": "yes",
+                            "direct_contradiction": "yes",
+                            "docs_vs_impl_drift": "yes",
+                            "user_or_runtime_impact": "yes",
+                            "policy_or_release_risk": "no",
+                            "duplication_or_overlap": "no",
+                            "alignment_or_confirmation": "no",
+                            "novel_for_user": "yes",
                             "rationale": ["Target and peer disagree on the route path."],
                             "evidence_target": "| `activity` | `GET /activity_feed` |",
                             "evidence_peer": "| `activity` | `GET /get_activity_feed` |",
@@ -127,13 +129,39 @@ class NotificationScorerTests(unittest.TestCase):
 
         result = scorer.score(_payload())
 
-        self.assertEqual(result.parse_mode, "json_schema")
+        self.assertEqual(result.parse_mode, "json_schema_rubric")
+        self.assertEqual(result.intent, "potential_conflict")
+        self.assertEqual(result.severity, "HIGH")
+        self.assertEqual(result.delivery, "push")
         self.assertEqual(len(client.responses.requests), 1)
         request = client.responses.requests[0]
         self.assertIn("text", request)
         self.assertEqual(request["text"]["format"]["type"], "json_schema")
         self.assertTrue(request["text"]["format"]["strict"])
         self.assertEqual(request["text"]["format"]["name"], "notification_score")
+
+    def test_rubric_mapping_yields_low_overlap_digest(self) -> None:
+        parsed, errors = scorer_module._rubric_assessment(
+            {
+                "same_surface_area": "yes",
+                "direct_contradiction": "no",
+                "docs_vs_impl_drift": "no",
+                "user_or_runtime_impact": "no",
+                "policy_or_release_risk": "no",
+                "duplication_or_overlap": "yes",
+                "alignment_or_confirmation": "no",
+                "novel_for_user": "no",
+                "rationale": ["Both snippets cover the same endpoint mapping without disagreement."],
+                "evidence_target": "| `notifications` | `GET /notification_events` |",
+                "evidence_peer": "| `notifications` | `GET /notification_events` |",
+            }
+        )
+
+        self.assertEqual(errors, [])
+        assert parsed is not None
+        self.assertEqual(parsed.intent, "hidden_overlap")
+        self.assertEqual(parsed.severity, "LOW")
+        self.assertEqual(parsed.delivery, "digest")
 
     def test_score_stops_after_repair_without_kv_fallback(self) -> None:
         scorer = scorer_module.NotificationScorer(
