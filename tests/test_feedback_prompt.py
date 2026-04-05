@@ -105,6 +105,13 @@ class FeedbackPromptTests(unittest.TestCase):
 
         self.assertEqual(items, ["The workflow skips the artifact audit."])
 
+    def test_reasoning_retry_only_triggers_on_unsupported_reasoning_errors(self) -> None:
+        unsupported = Exception("Unknown parameter: reasoning.effort")
+        transient = Exception("Read timeout while calling /responses")
+
+        self.assertTrue(feedback._should_retry_without_reasoning(unsupported))
+        self.assertFalse(feedback._should_retry_without_reasoning(transient))
+
 
 if __name__ == "__main__":
     unittest.main()

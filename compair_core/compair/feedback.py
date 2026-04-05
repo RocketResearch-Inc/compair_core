@@ -40,6 +40,25 @@ def _openai_api_key() -> str | None:
     return os.getenv("COMPAIR_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 
 
+def _openai_sdk_max_retries() -> int:
+    raw = os.getenv("COMPAIR_OPENAI_SDK_MAX_RETRIES") or os.getenv("OPENAI_SDK_MAX_RETRIES")
+    try:
+        return max(0, int(raw)) if raw is not None else 0
+    except ValueError:
+        return 0
+
+
+def _make_openai_client(api_key: str | None) -> Any:
+    kwargs: dict[str, Any] = {"max_retries": _openai_sdk_max_retries()}
+    if api_key:
+        kwargs["api_key"] = api_key
+    try:  # pragma: no cover - optional dependency differences
+        return openai.OpenAI(**kwargs)  # type: ignore[attr-defined]
+    except TypeError:
+        kwargs.pop("max_retries", None)
+        return openai.OpenAI(**kwargs)  # type: ignore[attr-defined]
+
+
 def _is_reasoning_model_name(model_name: str | None) -> bool:
     if not model_name:
         return False
@@ -170,6 +189,22 @@ def _finding_prompt_instructions(max_findings: int) -> str:
     )
 
 
+def _should_retry_without_reasoning(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    if "reasoning" not in message:
+        return False
+    unsupported_markers = (
+        "unsupported",
+        "not supported",
+        "unknown parameter",
+        "unexpected",
+        "invalid parameter",
+        "extra inputs are not permitted",
+        "not permitted",
+    )
+    return any(marker in message for marker in unsupported_markers)
+
+
 class Reviewer:
     """Edition-aware wrapper that selects a feedback provider based on configuration."""
 
@@ -202,7 +237,7 @@ class Reviewer:
                         openai.api_key = api_key  # type: ignore[assignment]
                     if hasattr(openai, "OpenAI"):
                         try:  # pragma: no cover - optional runtime dependency
-                            self._openai_client = openai.OpenAI(api_key=api_key)  # type: ignore[attr-defined]
+                            self._openai_client = _make_openai_client(api_key)
                         except Exception:  # pragma: no cover - if instantiation fails
                             self._openai_client = None
                 if self._openai_client is None and not hasattr(openai, "ChatCompletion"):
@@ -434,10 +469,7 @@ Your goal is to quickly surface **meaningful** connections or useful contrasts b
         client = reviewer._openai_client
         if client is None and hasattr(openai, "OpenAI"):
             api_key = _openai_api_key()
-            try:  # pragma: no cover - optional dependency differences
-                client = openai.OpenAI(api_key=api_key) if api_key else openai.OpenAI()
-            except TypeError:
-                client = openai.OpenAI()
+            client = _make_openai_client(api_key)
             reviewer._openai_client = client
 
         content: str | None = None
@@ -457,22 +489,16 @@ Your goal is to quickly surface **meaningful** connections or useful contrasts b
             else:
                 request_kwargs["instructions"] = system_prompt
                 request_kwargs["input"] = user_prompt
-            attempts: list[dict[str, Any]] = [dict(request_kwargs)]
-            if "reasoning" in request_kwargs:
-                reduced = dict(request_kwargs)
-                reduced.pop("reasoning", None)
-                attempts.append(reduced)
-
-            response = None
-            last_exc: Exception | None = None
-            for attempt in attempts:
-                try:
-                    response = client.responses.create(**attempt)
-                    break
-                except Exception as exc:
-                    last_exc = exc
-            if response is None and last_exc is not None:
-                raise last_exc
+            try:
+                response = client.responses.create(**request_kwargs)
+            except Exception as exc:
+                if "reasoning" in request_kwargs and _should_retry_without_reasoning(exc):
+                    log_event("openai_feedback_reasoning_retry", model=model_name)
+                    reduced = dict(request_kwargs)
+                    reduced.pop("reasoning", None)
+                    response = client.responses.create(**reduced)
+                else:
+                    raise
             content = _extract_response_text(response, reasoning_mode=uses_reasoning)
         elif client is not None and hasattr(client, "chat") and hasattr(client.chat, "completions"):
             response = client.chat.completions.create(

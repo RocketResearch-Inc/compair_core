@@ -141,6 +141,14 @@ def _getenv(*names: str, default: Optional[str] = None) -> Optional[str]:
     return default
 
 
+def _openai_sdk_max_retries() -> int:
+    raw = _getenv("COMPAIR_OPENAI_SDK_MAX_RETRIES", "OPENAI_SDK_MAX_RETRIES")
+    try:
+        return max(0, int(raw)) if raw is not None else 0
+    except ValueError:
+        return 0
+
+
 def build_user_prompt(payload: Dict[str, Any]) -> str:
     compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return (
@@ -425,7 +433,12 @@ class NotificationScorer:
         self.client = client
         if self.client is None and OpenAI is not None and api_key and cfg.provider.lower() != "heuristic":
             try:
-                self.client = OpenAI(api_key=api_key)
+                self.client = OpenAI(api_key=api_key, max_retries=_openai_sdk_max_retries())
+            except TypeError:
+                try:
+                    self.client = OpenAI(api_key=api_key)
+                except Exception:
+                    self.client = None
             except Exception:
                 self.client = None
 
