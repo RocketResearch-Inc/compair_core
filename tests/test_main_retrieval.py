@@ -120,7 +120,7 @@ class MainRetrievalTests(unittest.TestCase):
             "| `notifications` | `GET /notification_events` |\n"
         )
         focus_text = "| `activity` | `GET /activity_feed` |"
-        self.assertEqual(main._reference_query_text(full_chunk, focus_text, code_focus=True), focus_text)
+        self.assertEqual(main._reference_query_text(full_chunk, focus_text, "", code_focus=True), focus_text)
 
     def test_reference_query_text_keeps_full_chunk_when_focus_is_not_much_smaller(self) -> None:
         full_chunk = (
@@ -128,7 +128,42 @@ class MainRetrievalTests(unittest.TestCase):
             "OAuth cache ready.\n"
         )
         focus_text = "Google OAuth is available on Core and should appear in /capabilities when configured."
-        self.assertEqual(main._reference_query_text(full_chunk, focus_text, code_focus=True), full_chunk)
+        self.assertEqual(main._reference_query_text(full_chunk, focus_text, "", code_focus=True), full_chunk)
+
+    def test_reference_query_text_prefers_before_after_change_context(self) -> None:
+        full_chunk = (
+            "### File: docs/api_mapping.md\n"
+            "| `docs list` | `GET /load_documents` |\n"
+            "| `activity` | `GET /activity_feed` |\n"
+            "| `notifications` | `GET /notification_events` |\n"
+        )
+        focus_text = "| `activity` | `GET /activity_feed` |"
+        change_context = (
+            "### File: docs/api_mapping.md\n"
+            "- | `activity` | `GET /get_activity_feed` |\n"
+            "+ | `activity` | `GET /activity_feed` |"
+        )
+        self.assertEqual(
+            main._reference_query_text(full_chunk, focus_text, change_context, code_focus=True),
+            change_context,
+        )
+
+    def test_change_context_for_chunk_captures_before_and_after_lines(self) -> None:
+        prev_chunks = [
+            "### File: docs/api_mapping.md\n"
+            "| `docs list` | `GET /load_documents` |\n"
+            "| `activity` | `GET /get_activity_feed` |\n"
+            "| `notifications` | `GET /notification_events` |\n"
+        ]
+        chunk = (
+            "### File: docs/api_mapping.md\n"
+            "| `docs list` | `GET /load_documents` |\n"
+            "| `activity` | `GET /activity_feed` |\n"
+            "| `notifications` | `GET /notification_events` |\n"
+        )
+        change_context = main._change_context_for_chunk(chunk, prev_chunks, code_focus=True)
+        self.assertIn("- | `activity` | `GET /get_activity_feed` |", change_context)
+        self.assertIn("+ | `activity` | `GET /activity_feed` |", change_context)
 
     def test_lexical_reference_candidates_prioritize_exact_route_artifacts(self) -> None:
         target = "| `activity` | `GET /activity_feed` |"

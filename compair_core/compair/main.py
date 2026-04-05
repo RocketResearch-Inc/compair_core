@@ -480,24 +480,26 @@ def _rerank_reference_chunks(target_text: str, candidates: list[Chunk], code_foc
     return trimmed[:final_limit]
 
 
-def _reference_query_text(text: str, focus_text: str, *, code_focus: bool) -> str:
+def _reference_query_text(text: str, focus_text: str, change_context: str, *, code_focus: bool) -> str:
     if not code_focus or _is_snapshot_metadata_chunk(text):
         return text
     focus = (focus_text or "").strip()
+    change = (change_context or "").strip()
     target = (text or "").strip()
-    if not focus or not target or focus == target:
+    query = change or focus
+    if not query or not target or query == target:
         return text
 
-    focus_tokens = count_tokens(focus)
+    focus_tokens = count_tokens(query)
     target_tokens = count_tokens(text)
     if focus_tokens <= 0 or target_tokens <= 0 or focus_tokens >= target_tokens:
         return text
 
     # Only switch to the compact changed-window query when it meaningfully narrows
     # the search surface; otherwise reuse the full chunk embedding.
-    if (focus_tokens * 4) > (target_tokens * 3) and (len(focus) * 4) > (len(target) * 3):
+    if (focus_tokens * 4) > (target_tokens * 3) and (len(query) * 4) > (len(target) * 3):
         return text
-    return focus
+    return query
 
 
 def process_document(
@@ -584,16 +586,21 @@ def process_document(
         indices_to_generate_feedback = prioritized_chunk_indices[:num_chunks_can_generate_feedback]
 
     feedback_focus_by_new_index: dict[int, str] = {}
+    feedback_change_context_by_new_index: dict[int, str] = {}
     for idx in indices_to_generate_feedback:
         focus_text = _focus_text_for_chunk(new_chunks[idx], prev_chunks, code_focus=code_focus)
         if focus_text:
             feedback_focus_by_new_index[idx] = focus_text
+        change_context = _change_context_for_chunk(new_chunks[idx], prev_chunks, code_focus=code_focus)
+        if change_context:
+            feedback_change_context_by_new_index[idx] = change_context
     feedback_query_embedding_by_new_index: dict[int, list[float]] = {}
     query_embedding_requests: list[tuple[int, str]] = []
     for idx in indices_to_generate_feedback:
         query_text = _reference_query_text(
             new_chunks[idx],
             feedback_focus_by_new_index.get(idx, ""),
+            feedback_change_context_by_new_index.get(idx, ""),
             code_focus=code_focus,
         )
         if query_text.strip() and query_text != new_chunks[idx]:
@@ -677,12 +684,14 @@ def process_document(
             precomputed_embedding=new_chunk_embeddings[i],
             query_embedding=feedback_query_embedding_by_new_index.get(i),
             focus_text=feedback_focus_by_new_index.get(i, ""),
+            change_context=feedback_change_context_by_new_index.get(i, ""),
         )
 
     for idx in existing_indices_to_generate_feedback:
         focus_text = _focus_text_for_chunk(chunks[idx], prev_chunks, code_focus=code_focus)
+        change_context = _change_context_for_chunk(chunks[idx], prev_chunks, code_focus=code_focus)
         query_embedding = None
-        query_text = _reference_query_text(chunks[idx], focus_text, code_focus=code_focus)
+        query_text = _reference_query_text(chunks[idx], focus_text, change_context, code_focus=code_focus)
         if query_text.strip() and query_text != chunks[idx]:
             query_embedding = create_embedding(embedder, query_text, user=user)
         process_text(
@@ -694,6 +703,7 @@ def process_document(
             generate_feedback=True,
             query_embedding=query_embedding,
             focus_text=focus_text,
+            change_context=change_context,
         )
 
     removed = [c for c in prev_chunks if c not in set(chunks)]
@@ -968,9 +978,43 @@ def _compact_changed_focus_window(
     return "\n".join(compact).strip()
 
 
+def _compact_change_context(
+    current_chunk: str,
+    previous_chunk: str,
+    *,
+    max_lines: int = 12,
+) -> str:
+    if not current_chunk.strip() or not previous_chunk.strip():
+        return ""
+
+    current_lines = [line.rstrip() for line in current_chunk.splitlines()]
+    previous_lines = [line.rstrip() for line in previous_chunk.splitlines()]
+    matcher = difflib.SequenceMatcher(a=previous_lines, b=current_lines, autojunk=False)
+    out: list[str] = []
+
+    if current_lines and current_lines[0].strip().startswith("### File:"):
+        out.append(current_lines[0])
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        before_lines = [f"- {line}" for line in previous_lines[i1:i2] if line.strip()]
+        after_lines = [f"+ {line}" for line in current_lines[j1:j2] if line.strip()]
+        for line in [*before_lines, *after_lines]:
+            out.append(line)
+            if len(out) >= max_lines:
+                return "\n".join(out).strip()
+    return "\n".join(out).strip()
+
+
 def _focus_text_for_chunk(chunk: str, prev_chunks: list[str], *, code_focus: bool) -> str:
     previous_chunk = _best_previous_chunk_for_focus(chunk, prev_chunks, code_focus=code_focus)
     return _compact_changed_focus_window(chunk, previous_chunk)
+
+
+def _change_context_for_chunk(chunk: str, prev_chunks: list[str], *, code_focus: bool) -> str:
+    previous_chunk = _best_previous_chunk_for_focus(chunk, prev_chunks, code_focus=code_focus)
+    return _compact_change_context(chunk, previous_chunk)
 
 
 def process_text(
@@ -984,6 +1028,7 @@ def process_text(
     precomputed_embedding: list[float] | None = None,
     query_embedding: list[float] | None = None,
     focus_text: str = "",
+    change_context: str = "",
 ) -> None:
     logger = logging.getLogger(__name__)
     chunk_hash = stable_chunk_hash(text)
@@ -1042,7 +1087,7 @@ def process_text(
         doc_group_ids = [g.group_id for g in doc.groups]
         target_embedding = existing_chunk.embedding
         code_focus = _is_code_review_chunk(doc, text)
-        query_text = _reference_query_text(text, focus_text, code_focus=code_focus)
+        query_text = _reference_query_text(text, focus_text, change_context, code_focus=code_focus)
         query_vector = query_embedding or target_embedding
         if query_vector is None and query_text:
             query_vector = create_embedding(embedder, query_text, user=user)
@@ -1135,7 +1180,15 @@ def process_text(
         if not references:
             return
 
-        feedback = get_feedback(reviewer, doc, text, references, user, focus_text=focus_text)
+        feedback = get_feedback(
+            reviewer,
+            doc,
+            text,
+            references,
+            user,
+            focus_text=focus_text,
+            change_context=change_context,
+        )
         feedback_items = split_feedback_items(feedback)
         if not feedback_items:
             log_event(
@@ -1213,7 +1266,11 @@ def process_text(
                             user_is_doc_author=True,
                             user_is_group_admin=False,
                             peer_candidates=tuple(peer_candidates),
-                            generated_feedback={"summary": sql_feedback.feedback, "focus_text": focus_text},
+                            generated_feedback={
+                                "summary": sql_feedback.feedback,
+                                "focus_text": focus_text,
+                                "change_context": change_context,
+                            },
                             run_id=f"feedback_{sql_feedback.feedback_id}",
                             now_utc=datetime.now(timezone.utc),
                         )

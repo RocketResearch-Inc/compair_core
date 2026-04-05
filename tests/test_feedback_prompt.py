@@ -77,6 +77,21 @@ class FeedbackPromptTests(unittest.TestCase):
         )
         self.assertNotIn("Surrounding chunk context (secondary):", prompt)
 
+    def test_openai_prompt_can_include_change_context_block(self) -> None:
+        changed_chunk_prompt = feedback._format_changed_chunk_prompt(
+            "### File: docs/api_mapping.md\n| `activity` | `GET /activity_feed` |",
+            "| `activity` | `GET /activity_feed` |",
+        )
+        change_context = (
+            "### File: docs/api_mapping.md\n"
+            "- | `activity` | `GET /get_activity_feed` |\n"
+            "+ | `activity` | `GET /activity_feed` |"
+        )
+
+        self.assertIn("Primary changed excerpt:\n| `activity` | `GET /activity_feed` |", changed_chunk_prompt)
+        self.assertIn("- | `activity` | `GET /get_activity_feed` |", change_context)
+        self.assertIn("+ | `activity` | `GET /activity_feed` |", change_context)
+
     def test_split_feedback_items_supports_multiple_findings(self) -> None:
         raw = (
             "The docs claim /activity_feed.\n"

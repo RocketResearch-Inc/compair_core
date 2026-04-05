@@ -335,6 +335,20 @@ def _changed_line_signals(text: str) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _merge_signal_texts(*groups: Sequence[str]) -> tuple[str, ...]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for value in group:
+            candidate = normalize_text(value)
+            lowered = candidate.lower()
+            if not candidate or lowered in seen:
+                continue
+            seen.add(lowered)
+            merged.append(candidate)
+    return tuple(merged)
+
+
 def _segment_penalty(segment: str, profile: ArtifactProfile) -> int:
     penalty = 0
     if _META_LINE_RE.match(segment):
@@ -598,18 +612,25 @@ def best_reference_match(
     references: Sequence[ReferenceText],
     *,
     focus_text: str = "",
+    change_context: str = "",
 ) -> ReferenceMatch | None:
     cleaned_references = [ref for ref in references if normalize_text(ref.text)]
     if not normalize_text(text) or not cleaned_references:
         return None
 
     focus = normalize_text(focus_text)
+    change = normalize_text(change_context)
     target_source_text = focus or text
     reference_signal = " ".join(ref.text for ref in cleaned_references[:6])
-    changed_signals = _changed_line_signals(target_source_text)
+    changed_signals = _merge_signal_texts(
+        _changed_line_signals(change_context),
+        _changed_line_signals(target_source_text),
+    )
     target_signals = [reference_signal]
     if focus:
         target_signals.append(focus)
+    if change:
+        target_signals.append(change)
     target_signals.extend(changed_signals)
     preferred_target_excerpt = changed_signals[0] if changed_signals else focus
     target_excerpt = best_grounded_excerpt(
@@ -668,8 +689,9 @@ def summarize_reference_feedback(
     references: Sequence[ReferenceText],
     *,
     focus_text: str = "",
+    change_context: str = "",
 ) -> str | None:
-    match = best_reference_match(text, references, focus_text=focus_text)
+    match = best_reference_match(text, references, focus_text=focus_text, change_context=change_context)
     if match is None:
         return None
     return summarize_comparison(match.target_excerpt, match.peer_excerpt, match.reference_label, match.relation)

@@ -275,8 +275,19 @@ def _reference_snippets(references: Iterable[Any], limit: int = 4) -> List[str]:
     return snippets
 
 
-def _grounded_reference_context(text: str, references: list[Any], *, focus_text: str = "") -> str:
-    match = best_reference_match(text, _local_references(references), focus_text=focus_text)
+def _grounded_reference_context(
+    text: str,
+    references: list[Any],
+    *,
+    focus_text: str = "",
+    change_context: str = "",
+) -> str:
+    match = best_reference_match(
+        text,
+        _local_references(references),
+        focus_text=focus_text,
+        change_context=change_context,
+    )
     if match is None:
         return ""
     lines = [
@@ -291,8 +302,19 @@ def _grounded_reference_context(text: str, references: list[Any], *, focus_text:
     return "\n".join(lines).strip()
 
 
-def _fallback_feedback(text: str, references: list[Any], *, focus_text: str = "") -> str:
-    summary = summarize_reference_feedback(text, _local_references(references), focus_text=focus_text)
+def _fallback_feedback(
+    text: str,
+    references: list[Any],
+    *,
+    focus_text: str = "",
+    change_context: str = "",
+) -> str:
+    summary = summarize_reference_feedback(
+        text,
+        _local_references(references),
+        focus_text=focus_text,
+        change_context=change_context,
+    )
     return summary or "NONE"
 
 
@@ -304,8 +326,14 @@ def _local_reference_feedback(
     user: User,
     *,
     focus_text: str = "",
+    change_context: str = "",
 ) -> str | None:
-    return summarize_reference_feedback(text, _local_references(references), focus_text=focus_text)
+    return summarize_reference_feedback(
+        text,
+        _local_references(references),
+        focus_text=focus_text,
+        change_context=change_context,
+    )
 
 
 def _local_references(references: list[Any]) -> list[ReferenceText]:
@@ -329,12 +357,18 @@ def _openai_feedback(
     user: User,
     *,
     focus_text: str = "",
+    change_context: str = "",
 ) -> str | None:
     if openai is None:
         return None
     instruction = reviewer.length_map.get(user.preferred_feedback_length, "1–2 short sentences")
     ref_text = "\n\n".join(_reference_snippets(references, limit=4))
-    grounded_context = _grounded_reference_context(text, references, focus_text=focus_text)
+    grounded_context = _grounded_reference_context(
+        text,
+        references,
+        focus_text=focus_text,
+        change_context=change_context,
+    )
     is_code_review = _is_code_review_document(doc, text)
     is_doc_like = is_code_review and _is_doc_like_snapshot_chunk(text)
     max_findings = _max_findings_per_chunk(code_review=is_code_review)
@@ -365,9 +399,10 @@ Your goal is to identify a specific, evidence-backed mismatch between the change
 - If no concrete cross-repo mismatch is supported: **NONE**
         """
         changed_chunk_prompt = _format_changed_chunk_prompt(text, focus_text)
+        change_block = f"\n\nRecent change summary (before/after):\n{change_context}" if change_context else ""
         evidence_block = f"\n\nStrongest grounded evidence:\n{grounded_context}" if grounded_context else ""
         user_prompt = (
-            f"{changed_chunk_prompt}{evidence_block}\n\nRelated repository chunks:\n{ref_text or 'None provided'}\n\n"
+            f"{changed_chunk_prompt}{change_block}{evidence_block}\n\nRelated repository chunks:\n{ref_text or 'None provided'}\n\n"
             f"{instruction} Focus on the strongest supported product-surface or docs-vs-implementation mismatch."
         )
     elif is_code_review:
@@ -396,9 +431,10 @@ Your goal is to identify specific, evidence-backed code observations that matter
 - If no meaningful code-focused observation stands out: **NONE**
         """
         changed_chunk_prompt = _format_changed_chunk_prompt(text, focus_text)
+        change_block = f"\n\nRecent change summary (before/after):\n{change_context}" if change_context else ""
         evidence_block = f"\n\nStrongest grounded evidence:\n{grounded_context}" if grounded_context else ""
         user_prompt = (
-            f"{changed_chunk_prompt}{evidence_block}\n\nRelated repository chunks:\n{ref_text or 'None provided'}\n\n"
+            f"{changed_chunk_prompt}{change_block}{evidence_block}\n\nRelated repository chunks:\n{ref_text or 'None provided'}\n\n"
             f"{instruction} Prefer one concrete observation."
         )
     else:
@@ -539,6 +575,7 @@ def _local_feedback(
     user: User,
     *,
     focus_text: str = "",
+    change_context: str = "",
 ) -> str | None:
     payload = {
         "document": text,
@@ -548,6 +585,7 @@ def _local_feedback(
             "1–2 short sentences",
         ),
         "focus_text": focus_text or None,
+        "change_context": change_context or None,
     }
 
     try:
@@ -571,6 +609,7 @@ def _http_feedback(
     user: User,
     *,
     focus_text: str = "",
+    change_context: str = "",
 ) -> str | None:
     if not reviewer.custom_endpoint:
         return None
@@ -582,6 +621,7 @@ def _http_feedback(
             "1–2 short sentences",
         ),
         "focus_text": focus_text or None,
+        "change_context": change_context or None,
     }
     try:
         response = requests.post(reviewer.custom_endpoint, json=payload, timeout=30)
@@ -606,20 +646,44 @@ def get_feedback(
     user: User,
     *,
     focus_text: str = "",
+    change_context: str = "",
 ) -> str:
     if _is_code_review_document(doc, text) and _is_snapshot_metadata_chunk(text):
         return "NONE"
 
     if reviewer.is_cloud and cloud_get_feedback is not None:
-        return cloud_get_feedback(reviewer._cloud_impl, doc, text, references, user, focus_text=focus_text)  # type: ignore[arg-type]
+        return cloud_get_feedback(
+            reviewer._cloud_impl,
+            doc,
+            text,
+            references,
+            user,
+            focus_text=focus_text,
+            change_context=change_context,
+        )  # type: ignore[arg-type]
 
     if reviewer.provider == "openai":
-        feedback = _openai_feedback(reviewer, doc, text, references, user, focus_text=focus_text)
+        feedback = _openai_feedback(
+            reviewer,
+            doc,
+            text,
+            references,
+            user,
+            focus_text=focus_text,
+            change_context=change_context,
+        )
         if feedback:
             return feedback
         if _is_code_review_document(doc, text):
             if _is_doc_like_snapshot_chunk(text):
-                fallback_feedback = _local_reference_feedback(reviewer, text, references, user, focus_text=focus_text)
+                fallback_feedback = _local_reference_feedback(
+                    reviewer,
+                    text,
+                    references,
+                    user,
+                    focus_text=focus_text,
+                    change_context=change_context,
+                )
                 if fallback_feedback:
                     log_event(
                         "openai_feedback_doc_fallback",
@@ -630,7 +694,14 @@ def get_feedback(
             return "NONE"
 
     if reviewer.provider == "http":
-        feedback = _http_feedback(reviewer, text, references, user, focus_text=focus_text)
+        feedback = _http_feedback(
+            reviewer,
+            text,
+            references,
+            user,
+            focus_text=focus_text,
+            change_context=change_context,
+        )
         if feedback:
             return feedback
         if _is_code_review_document(doc, text):
@@ -638,11 +709,25 @@ def get_feedback(
 
     if reviewer.provider == "local":
         if getattr(reviewer, "endpoint", None):
-            feedback = _local_feedback(reviewer, text, references, user, focus_text=focus_text)
+            feedback = _local_feedback(
+                reviewer,
+                text,
+                references,
+                user,
+                focus_text=focus_text,
+                change_context=change_context,
+            )
             if feedback:
                 return feedback
-        feedback = _local_reference_feedback(reviewer, text, references, user, focus_text=focus_text)
+        feedback = _local_reference_feedback(
+            reviewer,
+            text,
+            references,
+            user,
+            focus_text=focus_text,
+            change_context=change_context,
+        )
         if feedback:
             return feedback
 
-    return _fallback_feedback(text, references, focus_text=focus_text)
+    return _fallback_feedback(text, references, focus_text=focus_text, change_context=change_context)
