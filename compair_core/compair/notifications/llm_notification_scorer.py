@@ -149,6 +149,31 @@ def _openai_sdk_max_retries() -> int:
         return 0
 
 
+def _is_transport_error_text(value: str | None) -> bool:
+    text = str(value or "").lower()
+    if not text:
+        return False
+    markers = (
+        "apitimeouterror",
+        "timeout",
+        "timed out",
+        "apiconnectionerror",
+        "connection error",
+        "connectionerror",
+        "rate limit",
+        "ratelimit",
+        "server error",
+        "internalservererror",
+        "bad gateway",
+        "service unavailable",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _has_transport_error(errors: List[str] | None) -> bool:
+    return any(_is_transport_error_text(error) for error in (errors or []))
+
+
 def build_user_prompt(payload: Dict[str, Any]) -> str:
     compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return (
@@ -456,12 +481,28 @@ class NotificationScorer:
         structured = self._score_once_structured(rubric_system, rubric_user)
         if structured.parse_mode != "failed_default":
             return structured
+        if _has_transport_error(structured.errors):
+            heuristic = _heuristic_assessment(payload)
+            return ParsedLLMNotificationAssessment(
+                **{
+                    **heuristic.__dict__,
+                    "errors": ["OpenAI scorer transport failure; heuristic fallback used.", *(structured.errors or [])],
+                }
+            )
 
         system = SYSTEM_INSTRUCTIONS
         user = build_user_prompt(payload)
         first = self._score_once(system, user)
         if first.parse_mode != "failed_default":
             return first
+        if _has_transport_error(first.errors):
+            heuristic = _heuristic_assessment(payload)
+            return ParsedLLMNotificationAssessment(
+                **{
+                    **heuristic.__dict__,
+                    "errors": ["OpenAI scorer transport failure; heuristic fallback used.", *(first.errors or [])],
+                }
+            )
 
         repaired_prompt = build_repair_prompt(first.raw_extracted or user)
         repaired = self._score_once(
@@ -470,6 +511,14 @@ class NotificationScorer:
         )
         if repaired.parse_mode != "failed_default":
             return repaired
+        if _has_transport_error(repaired.errors):
+            heuristic = _heuristic_assessment(payload)
+            return ParsedLLMNotificationAssessment(
+                **{
+                    **heuristic.__dict__,
+                    "errors": ["OpenAI scorer transport failure; heuristic fallback used.", *(repaired.errors or [])],
+                }
+            )
 
         heuristic = _heuristic_assessment(payload)
         return ParsedLLMNotificationAssessment(
@@ -477,7 +526,7 @@ class NotificationScorer:
         )
 
     def _score_once_structured(self, system_prompt: str, user_prompt: str) -> ParsedLLMNotificationAssessment:
-        raw = self._responses_create_text(
+        raw, last_err = self._responses_create_text(
             model=self.config.model,
             input_items=[
                 {
@@ -493,7 +542,8 @@ class NotificationScorer:
             schema_name="notification_score",
         )
         if not raw:
-            return conservative_default("failed_default", errors=["Empty structured response"])
+            errors = [f"structured_transport_error: {last_err}"] if _is_transport_error_text(last_err) else ["Empty structured response"]
+            return conservative_default("failed_default", errors=errors)
         try:
             obj = json.loads(raw)
         except Exception as exc:
@@ -506,7 +556,7 @@ class NotificationScorer:
         return conservative_default("failed_default", errors=errors or ["Invalid structured scorer output"])
 
     def _score_once(self, system_prompt: str, user_prompt: str) -> ParsedLLMNotificationAssessment:
-        raw = self._responses_create_text(
+        raw, last_err = self._responses_create_text(
             model=self.config.model,
             input_items=[
                 {
@@ -521,7 +571,8 @@ class NotificationScorer:
         )
         if raw:
             return parse_llm_assessment(raw)
-        return conservative_default("failed_default", errors=["Empty response"])
+        errors = [f"transport_error: {last_err}"] if _is_transport_error_text(last_err) else ["Empty response"]
+        return conservative_default("failed_default", errors=errors)
 
     def _responses_create_text(
         self,
@@ -530,9 +581,9 @@ class NotificationScorer:
         *,
         json_schema: Optional[Dict[str, Any]] = None,
         schema_name: str = "structured_output",
-    ) -> Optional[str]:
+    ) -> tuple[Optional[str], Optional[str]]:
         if self.client is None:
-            return None
+            return None, None
         last_err: Optional[str] = None
         for attempt in range(self.config.max_retries):
             try:
@@ -555,7 +606,7 @@ class NotificationScorer:
                 resp = self.client.responses.create(**request)
                 text = getattr(resp, "output_text", None)
                 if isinstance(text, str) and text.strip():
-                    return text
+                    return text, None
                 output = getattr(resp, "output", None)
                 if output and isinstance(output, list):
                     for item in output:
@@ -565,12 +616,12 @@ class NotificationScorer:
                         for part in content:
                             maybe_text = part.get("text") if isinstance(part, dict) else getattr(part, "text", None)
                             if isinstance(maybe_text, str) and maybe_text.strip():
-                                return maybe_text
+                                return maybe_text, None
                 raw = str(resp)
                 if raw.strip():
-                    return raw
+                    return raw, None
             except Exception as exc:
                 last_err = repr(exc)
                 logger.warning("Notification scoring request failed: %s", last_err)
                 time.sleep(min(0.4 * (attempt + 1), 1.5))
-        return None
+        return None, last_err

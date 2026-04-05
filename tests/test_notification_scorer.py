@@ -193,6 +193,33 @@ class NotificationScorerTests(unittest.TestCase):
         self.assertEqual(result.parse_mode, "json_repaired")
         self.assertEqual(calls, ["structured", "legacy", "repair"])
 
+    def test_score_short_circuits_to_heuristic_on_transport_failure(self) -> None:
+        scorer = scorer_module.NotificationScorer(
+            config=scorer_module.NotificationScorerConfig(max_retries=1),
+            client=object(),
+        )
+        calls: list[str] = []
+
+        def fake_structured(system_prompt: str, user_prompt: str):
+            calls.append("structured")
+            return scorer_module.conservative_default(
+                "failed_default",
+                errors=["structured_transport_error: APITimeoutError('Request timed out.')"],
+            )
+
+        def fake_score_once(system_prompt: str, user_prompt: str):
+            calls.append("legacy")
+            return _assessment("json")
+
+        scorer._score_once_structured = fake_structured  # type: ignore[method-assign]
+        scorer._score_once = fake_score_once  # type: ignore[method-assign]
+
+        result = scorer.score(_payload())
+
+        self.assertEqual(result.parse_mode, "heuristic")
+        self.assertEqual(result.intent, "potential_conflict")
+        self.assertEqual(calls, ["structured"])
+
 
 if __name__ == "__main__":
     unittest.main()
