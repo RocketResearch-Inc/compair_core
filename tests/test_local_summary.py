@@ -49,6 +49,24 @@ class LocalSummaryTests(unittest.TestCase):
         )
         self.assertIn('introduces "experimental_mode"', summary)
 
+    def test_numeric_fraction_is_not_treated_as_path_artifact(self) -> None:
+        profile = local_summary.extract_artifacts("1/2 OAuth Core capabilities")
+        self.assertEqual(profile.paths, ())
+
+    def test_numeric_fraction_does_not_drive_presence_absence_summary(self) -> None:
+        relation = local_summary.assess_relation(
+            "1/2 OAuth Core capabilities",
+            "OAuth Core capabilities",
+        )
+        self.assertNotEqual(relation.kind, "presence/absence")
+        summary = local_summary.summarize_comparison(
+            "1/2 OAuth Core capabilities",
+            "OAuth Core capabilities",
+            "ref",
+            relation,
+        )
+        self.assertNotIn('introduces "1/2"', summary or "")
+
     def test_route_path_mismatch_relation(self) -> None:
         relation = local_summary.assess_relation("GET /v2/reviews", "GET /reviews")
         self.assertEqual(relation.kind, "route/path mismatch")

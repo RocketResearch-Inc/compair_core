@@ -153,6 +153,8 @@ def _extract_paths(text: str) -> tuple[str, ...]:
     seen: set[str] = set()
     for match in _PATH_RE.findall(text or ""):
         candidate = normalize_text(match)
+        if re.fullmatch(r"\d+(?:/\d+)+", candidate):
+            continue
         lowered = candidate.lower()
         if len(candidate) < 3 or lowered in seen:
             continue
