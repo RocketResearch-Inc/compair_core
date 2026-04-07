@@ -8,6 +8,7 @@ local Core parity does not depend on a hosted-only model path.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import json
 import logging
@@ -28,7 +29,33 @@ from .parse_llm_structured_output import (
     validate_and_normalize,
 )
 
+try:
+    from ..logger import log_event
+except Exception:  # pragma: no cover - isolated test loaders may not build the full package tree
+    def log_event(message: str, **fields: Any) -> None:
+        return None
+
 logger = logging.getLogger(__name__)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _usage_int(usage: Any, key: str) -> Optional[int]:
+    value = getattr(usage, key, None)
+    if value is None and isinstance(usage, dict):
+        value = usage.get(key)
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value))
+        except ValueError:
+            return None
+    return None
 
 SYSTEM_INSTRUCTIONS = """You are a notification scoring engine for a collaborative document platform.
 
@@ -220,6 +247,30 @@ def _normalize_rubric_flag(value: Any) -> str:
     return mapping.get(normalized, "unclear")
 
 
+def _env_int(*names: str) -> Optional[int]:
+    for name in names:
+        raw = os.getenv(name)
+        if not raw:
+            continue
+        try:
+            return int(raw.strip())
+        except ValueError:
+            continue
+    return None
+
+
+def _env_float(*names: str) -> Optional[float]:
+    for name in names:
+        raw = os.getenv(name)
+        if not raw:
+            continue
+        try:
+            return float(raw.strip())
+        except ValueError:
+            continue
+    return None
+
+
 def _rubric_assessment(obj: Dict[str, Any]) -> tuple[Optional[ParsedLLMNotificationAssessment], List[str]]:
     def flag(name: str) -> str:
         return _normalize_rubric_flag(obj.get(name))
@@ -267,6 +318,11 @@ def _rubric_assessment(obj: Dict[str, Any]) -> tuple[Optional[ParsedLLMNotificat
         relevance = "MEDIUM"
 
     novelty = {"yes": "HIGH", "no": "LOW"}.get(novel_flag, "MEDIUM")
+    weak_cross_repo_relation = not any([same_surface, contradiction, docs_vs_impl, impact, policy, overlap, alignment])
+    if weak_cross_repo_relation:
+        # If the rubric itself cannot establish a comparable cross-repo relationship,
+        # keep the candidate conservative enough for routing to drop it.
+        novelty = "LOW"
 
     severity = "LOW"
     if intent == "potential_conflict":
@@ -429,6 +485,14 @@ class NotificationScorer:
         model_env = _getenv("COMPAIR_OPENAI_NOTIF_MODEL", "OPENAI_NOTIF_MODEL")
         provider_env = _getenv("COMPAIR_NOTIFICATION_SCORING_PROVIDER", "NOTIFICATION_SCORING_PROVIDER")
         temp_env = _getenv("COMPAIR_OPENAI_NOTIF_TEMPERATURE", "OPENAI_NOTIF_TEMPERATURE")
+        max_retries_env = _env_int(
+            "COMPAIR_NOTIFICATION_SCORING_MAX_RETRIES",
+            "NOTIFICATION_SCORING_MAX_RETRIES",
+        )
+        timeout_env = _env_float(
+            "COMPAIR_NOTIFICATION_SCORING_TIMEOUT_S",
+            "NOTIFICATION_SCORING_TIMEOUT_S",
+        )
         if model_env:
             cfg = NotificationScorerConfig(
                 model=model_env,
@@ -456,6 +520,22 @@ class NotificationScorer:
                 )
             except ValueError:
                 pass
+        if max_retries_env is not None and max_retries_env >= 0:
+            cfg = NotificationScorerConfig(
+                model=cfg.model,
+                provider=cfg.provider,
+                temperature=cfg.temperature,
+                max_retries=max_retries_env,
+                timeout_s=cfg.timeout_s,
+            )
+        if timeout_env is not None and timeout_env > 0:
+            cfg = NotificationScorerConfig(
+                model=cfg.model,
+                provider=cfg.provider,
+                temperature=cfg.temperature,
+                max_retries=cfg.max_retries,
+                timeout_s=timeout_env,
+            )
         object.__setattr__(self, "config", cfg)
 
         api_key = _getenv("COMPAIR_OPENAI_API_KEY", "OPENAI_API_KEY")
@@ -614,7 +694,19 @@ class NotificationScorer:
                             "strict": True,
                         }
                     }
+                started_at = time.time()
                 resp = self.client.responses.create(**request)
+                usage = getattr(resp, "usage", None)
+                log_event(
+                    "openai_notification_scoring_created",
+                    model=model,
+                    input_tokens=_usage_int(usage, "input_tokens"),
+                    output_tokens=_usage_int(usage, "output_tokens"),
+                    duration_sec=round(time.time() - started_at, 3),
+                    structured=bool(json_schema is not None),
+                    schema_name=schema_name if json_schema is not None else None,
+                    created_at=_utc_now(),
+                )
                 text = getattr(resp, "output_text", None)
                 if isinstance(text, str) and text.strip():
                     return text, None

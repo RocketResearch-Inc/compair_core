@@ -20,6 +20,8 @@ Before hitting the API, configure the deployment with environment variables. The
 | `COMPAIR_LOCAL_MODEL_URL` | Base URL of the bundled/local text generation + embedding service used when `COMPAIR_GENERATION_PROVIDER=local`. | `http://127.0.0.1:9000` |
 | `COMPAIR_NOTIFICATION_SCORING_ENABLED` | Enables ranked notification-event scoring for feedback generated in Core. | `true` |
 | `COMPAIR_NOTIFICATION_SCORING_PROVIDER` | Chooses the notification scorer: `auto`, `heuristic`, or `openai`. | `auto` |
+| `COMPAIR_NOTIFICATION_SCORING_TIMEOUT_S` | Timeout in seconds for OpenAI-backed notification scoring requests. Increase for large survey-style runs. | `30` |
+| `COMPAIR_NOTIFICATION_SCORING_MAX_RETRIES` | Retries for OpenAI-backed notification scoring transport failures/timeouts. | `2` |
 | `COMPAIR_OCR_ENDPOINT` | HTTP endpoint used for OCR uploads. When set, OCR auto-enables for core deployments. | `http://127.0.0.1:9001/ocr-file` |
 | `COMPAIR_EMAIL_BACKEND` | Controls how verification/reset emails are sent. | `console` (logs to stdout) |
 | `COMPAIR_TELEMETRY_ENABLED` | Enables an anonymous daily heartbeat back to Compair Cloud for self-hosted usage analytics. | `false` |

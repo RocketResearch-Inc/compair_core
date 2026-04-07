@@ -140,6 +140,37 @@ class NotificationScorerTests(unittest.TestCase):
         self.assertTrue(request["text"]["format"]["strict"])
         self.assertEqual(request["text"]["format"]["name"], "notification_score")
 
+    def test_structured_request_uses_configured_timeout(self) -> None:
+        client = _FakeClient(
+            [
+                _FakeResponse(
+                    json.dumps(
+                        {
+                            "same_surface_area": "yes",
+                            "direct_contradiction": "yes",
+                            "docs_vs_impl_drift": "yes",
+                            "user_or_runtime_impact": "yes",
+                            "policy_or_release_risk": "no",
+                            "duplication_or_overlap": "no",
+                            "alignment_or_confirmation": "no",
+                            "novel_for_user": "yes",
+                            "rationale": ["Target and peer disagree on the route path."],
+                            "evidence_target": "| `activity` | `GET /activity_feed` |",
+                            "evidence_peer": "| `activity` | `GET /get_activity_feed` |",
+                        }
+                    )
+                )
+            ]
+        )
+        scorer = scorer_module.NotificationScorer(
+            config=scorer_module.NotificationScorerConfig(max_retries=1, timeout_s=75.0),
+            client=client,
+        )
+
+        scorer.score(_payload())
+
+        self.assertEqual(client.responses.requests[0]["timeout"], 75.0)
+
     def test_rubric_mapping_yields_low_overlap_digest(self) -> None:
         parsed, errors = scorer_module._rubric_assessment(
             {
@@ -162,6 +193,30 @@ class NotificationScorerTests(unittest.TestCase):
         self.assertEqual(parsed.intent, "hidden_overlap")
         self.assertEqual(parsed.severity, "LOW")
         self.assertEqual(parsed.delivery, "digest")
+
+    def test_rubric_mapping_caps_relationless_novelty(self) -> None:
+        parsed, errors = scorer_module._rubric_assessment(
+            {
+                "same_surface_area": "no",
+                "direct_contradiction": "no",
+                "docs_vs_impl_drift": "no",
+                "user_or_runtime_impact": "no",
+                "policy_or_release_risk": "no",
+                "duplication_or_overlap": "no",
+                "alignment_or_confirmation": "no",
+                "novel_for_user": "yes",
+                "rationale": ["The peer mentions a different topic."],
+                "evidence_target": "target excerpt",
+                "evidence_peer": "peer excerpt",
+            }
+        )
+
+        self.assertEqual(errors, [])
+        assert parsed is not None
+        self.assertEqual(parsed.intent, "relevant_update")
+        self.assertEqual(parsed.relevance, "LOW")
+        self.assertEqual(parsed.severity, "LOW")
+        self.assertEqual(parsed.novelty, "LOW")
 
     def test_score_stops_after_repair_without_kv_fallback(self) -> None:
         scorer = scorer_module.NotificationScorer(

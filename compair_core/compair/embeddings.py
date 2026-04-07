@@ -1,6 +1,8 @@
 import hashlib
 import math
 import os
+import time
+from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 import requests
@@ -29,6 +31,29 @@ def _openai_api_key() -> str | None:
 
 def _openai_base_url() -> str | None:
     return os.getenv("COMPAIR_OPENAI_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _usage_total_tokens(response: Any) -> int | None:
+    usage = getattr(response, "usage", None)
+    if usage is None and isinstance(response, dict):
+        usage = response.get("usage")
+    value = getattr(usage, "total_tokens", None)
+    if value is None and isinstance(usage, dict):
+        value = usage.get("total_tokens")
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value))
+        except ValueError:
+            return None
+    return None
 
 
 class Embedder:
@@ -209,6 +234,7 @@ def create_embeddings(embedder: Embedder, texts: list[str], user=None) -> list[l
                     regular.append((idx, text))
             if client is not None and hasattr(client, "embeddings"):
                 if regular:
+                    started_at = time.time()
                     response = client.embeddings.create(
                         model=embedder.openai_embed_model,
                         input=[text for _, text in regular],
@@ -219,10 +245,20 @@ def create_embeddings(embedder: Embedder, texts: list[str], user=None) -> list[l
                     )
                     for (item_idx, _), row in zip(regular, ordered):
                         vectors[item_idx] = getattr(row, "embedding", None)
+                    log_event(
+                        "openai_embedding_created",
+                        model=embedder.openai_embed_model,
+                        token_count=_usage_total_tokens(response),
+                        batch_size=len(regular),
+                        duration_sec=round(time.time() - started_at, 3),
+                        user_id=getattr(user, "user_id", None) if user is not None else None,
+                        created_at=_utc_now(),
+                    )
                 if all(isinstance(vector, list) for vector in vectors):
                     return vectors  # type: ignore[return-value]
             elif hasattr(openai, "Embedding"):
                 if regular:
+                    started_at = time.time()
                     response = openai.Embedding.create(  # type: ignore[attr-defined]
                         model=embedder.openai_embed_model,
                         input=[text for _, text in regular],
@@ -230,6 +266,15 @@ def create_embeddings(embedder: Embedder, texts: list[str], user=None) -> list[l
                     data = sorted(response["data"], key=lambda row: row.get("index", 0))  # type: ignore[index]
                     for (item_idx, _), row in zip(regular, data):
                         vectors[item_idx] = row.get("embedding")
+                    log_event(
+                        "openai_embedding_created",
+                        model=embedder.openai_embed_model,
+                        token_count=_usage_total_tokens(response),
+                        batch_size=len(regular),
+                        duration_sec=round(time.time() - started_at, 3),
+                        user_id=getattr(user, "user_id", None) if user is not None else None,
+                        created_at=_utc_now(),
+                    )
                 if all(isinstance(vector, list) for vector in vectors):
                     return vectors  # type: ignore[return-value]
         except Exception as exc:  # pragma: no cover - network/API failure
@@ -257,6 +302,7 @@ def _openai_embedding(embedder: Embedder, text: str) -> list[float] | None:
         embedder._openai_client = client  # type: ignore[attr-defined]
 
     try:
+        started_at = time.time()
         token_count = _token_count(text, embedder.openai_embed_model)
         if token_count > _embed_max_tokens():
             parts = _split_text_for_embedding(text, embedder.openai_embed_model, _embed_max_tokens())
@@ -277,6 +323,15 @@ def _openai_embedding(embedder: Embedder, text: str) -> list[float] | None:
             else:
                 vectors = None
             if vectors and all(isinstance(vector, list) for vector in vectors):
+                log_event(
+                    "openai_embedding_created",
+                    model=embedder.openai_embed_model,
+                    token_count=_usage_total_tokens(response) or token_count,
+                    split_input=True,
+                    segment_count=len(parts),
+                    duration_sec=round(time.time() - started_at, 3),
+                    created_at=_utc_now(),
+                )
                 return _combine_embeddings(vectors, [weight for _, weight in parts])  # type: ignore[arg-type]
         if client is not None and hasattr(client, "embeddings"):
             response = client.embeddings.create(
@@ -287,6 +342,14 @@ def _openai_embedding(embedder: Embedder, text: str) -> list[float] | None:
             if data:
                 vector = getattr(data[0], "embedding", None)
                 if isinstance(vector, list):
+                    log_event(
+                        "openai_embedding_created",
+                        model=embedder.openai_embed_model,
+                        token_count=_usage_total_tokens(response) or token_count,
+                        split_input=False,
+                        duration_sec=round(time.time() - started_at, 3),
+                        created_at=_utc_now(),
+                    )
                     return vector
         elif hasattr(openai, "Embedding"):
             response = openai.Embedding.create(  # type: ignore[attr-defined]
@@ -295,6 +358,14 @@ def _openai_embedding(embedder: Embedder, text: str) -> list[float] | None:
             )
             vector = response["data"][0]["embedding"]  # type: ignore[index]
             if isinstance(vector, list):
+                log_event(
+                    "openai_embedding_created",
+                    model=embedder.openai_embed_model,
+                    token_count=_usage_total_tokens(response) or token_count,
+                    split_input=False,
+                    duration_sec=round(time.time() - started_at, 3),
+                    created_at=_utc_now(),
+                )
                 return vector
     except Exception as exc:  # pragma: no cover - network/API failure
         log_event("openai_embedding_failed", error=str(exc))

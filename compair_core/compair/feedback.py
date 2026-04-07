@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import logging
 import os
 import re
+import time
 from typing import Any, Iterable, List
 
 import requests
@@ -81,6 +83,24 @@ def _get_field(source: Any, key: str) -> Any:
     if isinstance(source, dict):
         return source.get(key)
     return getattr(source, key, None)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _usage_int(usage: Any, key: str) -> int | None:
+    value = _get_field(usage, key)
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value))
+        except ValueError:
+            return None
+    return None
 
 
 def _is_code_review_document(doc: Document, text: str) -> bool:
@@ -460,6 +480,7 @@ def _openai_feedback(
 ) -> str | None:
     if openai is None:
         return None
+    started_at = time.time()
     instruction = reviewer.length_map.get(user.preferred_feedback_length, "1–2 short sentences")
     ref_text = "\n\n".join(_reference_snippets(references, limit=4))
     grounded_context = _grounded_reference_context(
@@ -610,6 +631,9 @@ Your goal is to quickly surface **meaningful** connections or useful contrasts b
         content: str | None = None
         uses_reasoning = reviewer.uses_reasoning_model
         model_name = reviewer.code_openai_model if is_code_review else reviewer.openai_model
+        input_chars = len(text or "")
+        reference_count = len(references or [])
+        response: Any = None
         if client is not None and hasattr(client, "responses"):
             request_kwargs: dict[str, Any] = {
                 "model": model_name,
@@ -658,8 +682,23 @@ Your goal is to quickly surface **meaningful** connections or useful contrasts b
                 temperature=0.3,
                 max_tokens=256,
             )
+            response = chat_response
             content = chat_response["choices"][0]["message"]["content"].strip()  # type: ignore[index, assignment]
         if content:
+            usage = _get_field(response, "usage")
+            log_event(
+                "openai_feedback_created",
+                model=model_name,
+                input_tokens=_usage_int(usage, "input_tokens"),
+                output_tokens=_usage_int(usage, "output_tokens"),
+                duration_sec=round(time.time() - started_at, 3),
+                input_chars=input_chars,
+                reference_count=reference_count,
+                is_code_review=is_code_review,
+                document_id=getattr(doc, "document_id", None),
+                user_id=getattr(user, "user_id", None),
+                created_at=_utc_now(),
+            )
             return content.strip()
     except Exception as exc:  # pragma: no cover - network/API failure
         log_event("openai_feedback_failed", error=str(exc))

@@ -114,6 +114,8 @@ Key environment variables for the core edition:
 - `COMPAIR_GENERATION_ENDPOINT` – HTTP endpoint invoked when `COMPAIR_GENERATION_PROVIDER=http`; the service receives a JSON payload (`document`, `references`, `length_instruction`) and should return `{"feedback": ...}`.
 - `COMPAIR_NOTIFICATION_SCORING_ENABLED` (`true`) – enable ranked notification-event scoring in Core. Set to `false` if you only want raw feedback without notification triage.
 - `COMPAIR_NOTIFICATION_SCORING_PROVIDER` (`auto`) – choose `auto`, `heuristic`, or `openai` for notification-event scoring. `auto` uses OpenAI when an API key is configured and otherwise falls back to a deterministic local heuristic.
+- `COMPAIR_NOTIFICATION_SCORING_TIMEOUT_S` (`30`) – request timeout in seconds for OpenAI-backed notification scoring. Increase this for large cross-repo review runs if scorer requests are timing out.
+- `COMPAIR_NOTIFICATION_SCORING_MAX_RETRIES` (`2`) – retry count for OpenAI-backed notification scoring transport failures/timeouts.
 - `COMPAIR_OCR_ENDPOINT` – endpoint the backend calls for OCR uploads. Setting this (e.g., to the bundled Tesseract wrapper at `http://127.0.0.1:9001/ocr-file`) automatically enables OCR.
 - `COMPAIR_OCR_REQUEST_TIMEOUT` – timeout in seconds for HTTP OCR requests (default `30`).
 
