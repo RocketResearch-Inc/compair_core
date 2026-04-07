@@ -4,6 +4,7 @@ import importlib.util
 import pathlib
 import sys
 import types
+from types import SimpleNamespace
 import unittest
 
 
@@ -126,6 +127,64 @@ class FeedbackPromptTests(unittest.TestCase):
 
         self.assertTrue(feedback._should_retry_without_reasoning(unsupported))
         self.assertFalse(feedback._should_retry_without_reasoning(transient))
+
+    def test_render_local_reference_match_prefers_concise_route_message(self) -> None:
+        relation = SimpleNamespace(
+            kind="route/path mismatch",
+            confidence=6,
+            target_artifact="/activity_feed",
+            peer_artifact="/get_activity_feed",
+        )
+        match = SimpleNamespace(
+            relation=relation,
+            reference_label="RocketResearch-Inc/compair_core",
+            target_excerpt='| `activity` | `GET /activity_feed` |',
+            peer_excerpt='| `activity` | `GET /get_activity_feed` |',
+        )
+
+        summary = feedback._render_local_reference_match(match)
+
+        self.assertEqual(
+            summary,
+            'Possible route/path drift: the changed excerpt uses "/activity_feed", while RocketResearch-Inc/compair_core uses "/get_activity_feed".',
+        )
+
+    def test_render_local_reference_match_genericizes_weak_match(self) -> None:
+        relation = SimpleNamespace(kind="generic divergence", confidence=1, target_artifact="", peer_artifact="")
+        match = SimpleNamespace(
+            relation=relation,
+            reference_label="RocketResearch-Inc/compair_core",
+            target_excerpt="WinGet is live today.",
+            peer_excerpt="Homebrew remains pending.",
+        )
+
+        summary = feedback._render_local_reference_match(match)
+
+        self.assertIn("Possible cross-repo drift detected", summary)
+        self.assertIn("bundled local review path", summary)
+
+    def test_render_local_reference_match_avoids_specific_path_when_excerpt_has_many_paths(self) -> None:
+        relation = SimpleNamespace(
+            kind="presence/absence",
+            confidence=3,
+            target_artifact="/notification_events",
+            peer_artifact="",
+        )
+        match = SimpleNamespace(
+            relation=relation,
+            reference_label="RocketResearch-Inc/compair_core",
+            target_excerpt=(
+                "| `docs list` | `GET /load_documents` |\n"
+                "| `activity` | `GET /activity_feed` |\n"
+                "| `notifications` | `GET /notification_events` |"
+            ),
+            peer_excerpt='| `activity` | `GET /get_activity_feed` |',
+        )
+
+        summary = feedback._render_local_reference_match(match)
+
+        self.assertIn("Possible cross-repo drift detected", summary)
+        self.assertNotIn('/notification_events', summary)
 
 
 if __name__ == "__main__":

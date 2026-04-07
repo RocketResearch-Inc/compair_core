@@ -11,6 +11,7 @@ from .logger import log_event
 from .local_summary import (
     ReferenceText,
     best_reference_match,
+    extract_artifacts,
     reference_payload_texts,
     summarize_reference_feedback,
 )
@@ -40,6 +41,10 @@ def _openai_api_key() -> str | None:
     return os.getenv("COMPAIR_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 
 
+def _openai_base_url() -> str | None:
+    return os.getenv("COMPAIR_OPENAI_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+
+
 def _openai_sdk_max_retries() -> int:
     raw = os.getenv("COMPAIR_OPENAI_SDK_MAX_RETRIES") or os.getenv("OPENAI_SDK_MAX_RETRIES")
     try:
@@ -52,6 +57,9 @@ def _make_openai_client(api_key: str | None) -> Any:
     kwargs: dict[str, Any] = {"max_retries": _openai_sdk_max_retries()}
     if api_key:
         kwargs["api_key"] = api_key
+    base_url = _openai_base_url()
+    if base_url:
+        kwargs["base_url"] = base_url
     try:  # pragma: no cover - optional dependency differences
         return openai.OpenAI(**kwargs)  # type: ignore[attr-defined]
     except TypeError:
@@ -302,6 +310,99 @@ def _grounded_reference_context(
     return "\n".join(lines).strip()
 
 
+def _compact_local_excerpt(text: str, *, limit: int = 140) -> str:
+    excerpt = " ".join((text or "").split())
+    if len(excerpt) <= limit:
+        return excerpt
+    return excerpt[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _generic_local_quality_note(reference_label: str) -> str:
+    return (
+        f"Possible cross-repo drift detected between the changed excerpt and {reference_label}, "
+        "but the bundled local review path could not ground a more specific summary."
+    )
+
+
+def _render_local_reference_match(match: Any) -> str | None:
+    relation = getattr(match, "relation", None)
+    reference_label = getattr(match, "reference_label", "a related reference")
+    target_excerpt = getattr(match, "target_excerpt", "") or ""
+    peer_excerpt = getattr(match, "peer_excerpt", "") or ""
+    if relation is None:
+        return _generic_local_quality_note(reference_label)
+
+    kind = getattr(relation, "kind", None)
+    confidence = int(getattr(relation, "confidence", 0) or 0)
+    target_artifact = (getattr(relation, "target_artifact", "") or "").strip()
+    peer_artifact = (getattr(relation, "peer_artifact", "") or "").strip()
+
+    if kind is None or kind == "generic divergence" or confidence <= 1:
+        return _generic_local_quality_note(reference_label)
+
+    if kind == "docs-vs-impl mismatch":
+        return (
+            f'Possible docs-vs-implementation drift: the changed excerpt says '
+            f'"{_compact_local_excerpt(target_excerpt)}", while related implementation or '
+            f'config in {reference_label} indicates otherwise.'
+        )
+
+    if kind == "route/path mismatch" and target_artifact and peer_artifact:
+        return (
+            f'Possible route/path drift: the changed excerpt uses "{target_artifact}", '
+            f'while {reference_label} uses "{peer_artifact}".'
+        )
+
+    if kind == "value mismatch" and target_artifact and peer_artifact:
+        return (
+            f'Possible value drift: the changed excerpt uses "{target_artifact}", '
+            f'while {reference_label} uses "{peer_artifact}".'
+        )
+
+    if kind == "rename" and target_artifact and peer_artifact:
+        return (
+            f'Possible rename drift: the changed excerpt uses "{target_artifact}", '
+            f'while {reference_label} still uses "{peer_artifact}".'
+        )
+
+    if kind == "presence/absence" and target_artifact:
+        target_profile = extract_artifacts(target_excerpt)
+        if target_artifact.startswith("/") and len(target_profile.paths) > 1:
+            return _generic_local_quality_note(reference_label)
+        return (
+            f'Possible cross-repo drift: the changed excerpt includes "{target_artifact}", '
+            f'but {reference_label} does not show a corresponding item.'
+        )
+
+    rendered = summarize_reference_feedback(
+        target_excerpt,
+        [ReferenceText(label=reference_label, text=peer_excerpt)],
+    )
+    if not rendered:
+        return _generic_local_quality_note(reference_label)
+    if len(rendered) > 360:
+        return _generic_local_quality_note(reference_label)
+    return rendered
+
+
+def _local_reference_feedback_text(
+    text: str,
+    references: list[Any],
+    *,
+    focus_text: str = "",
+    change_context: str = "",
+) -> str | None:
+    match = best_reference_match(
+        text,
+        _local_references(references),
+        focus_text=focus_text,
+        change_context=change_context,
+    )
+    if match is None:
+        return None
+    return _render_local_reference_match(match)
+
+
 def _fallback_feedback(
     text: str,
     references: list[Any],
@@ -309,9 +410,8 @@ def _fallback_feedback(
     focus_text: str = "",
     change_context: str = "",
 ) -> str:
-    summary = summarize_reference_feedback(
+    summary = _local_reference_feedback_text(
         text,
-        _local_references(references),
         focus_text=focus_text,
         change_context=change_context,
     )
@@ -328,9 +428,8 @@ def _local_reference_feedback(
     focus_text: str = "",
     change_context: str = "",
 ) -> str | None:
-    return summarize_reference_feedback(
+    return _local_reference_feedback_text(
         text,
-        _local_references(references),
         focus_text=focus_text,
         change_context=change_context,
     )

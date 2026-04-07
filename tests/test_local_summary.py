@@ -159,6 +159,25 @@ class LocalSummaryTests(unittest.TestCase):
         assert summary is not None
         self.assertIn("singleUser", summary)
 
+    def test_snapshot_header_is_stripped_from_summary_excerpt(self) -> None:
+        full_chunk = (
+            "### File: docs/core_quickstart.md (part 1/2, lang markdown)\n"
+            "Google OAuth is available on Core and should appear in /capabilities when client credentials are configured.\n"
+        )
+        reference = local_summary.ReferenceText(
+            label="ref",
+            text=(
+                "### File: compair_core/server/routers/capabilities.py\n"
+                'google_oauth_configured = edition == "cloud"\n'
+            ),
+        )
+        summary = local_summary.summarize_reference_feedback(full_chunk, [reference])
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertNotIn("### File:", summary)
+        self.assertNotIn("part 1/2", summary)
+        self.assertIn("Google OAuth is available on Core", summary)
+
     def test_structured_config_fragments_remain_eligible(self) -> None:
         summary = local_summary.summarize_reference_feedback(
             'feature_flags = ["sync", "reviews"]\napi_base = "https://api.example.com/v2"',

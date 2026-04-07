@@ -110,6 +110,26 @@ class DummyChunk:
 
 
 class MainRetrievalTests(unittest.TestCase):
+    def test_should_reanalyze_existing_chunks_ignores_snapshot_only_new_chunks(self) -> None:
+        self.assertTrue(
+            main._should_reanalyze_existing_chunks(
+                reanalyze_existing=True,
+                meaningful_new_chunk_count=0,
+            )
+        )
+        self.assertFalse(
+            main._should_reanalyze_existing_chunks(
+                reanalyze_existing=False,
+                meaningful_new_chunk_count=0,
+            )
+        )
+        self.assertFalse(
+            main._should_reanalyze_existing_chunks(
+                reanalyze_existing=True,
+                meaningful_new_chunk_count=1,
+            )
+        )
+
     def test_reference_query_text_prefers_focus_window_for_large_snapshot_chunk(self) -> None:
         full_chunk = (
             "### File: docs/api_mapping.md\n"

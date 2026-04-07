@@ -135,6 +135,10 @@ def _is_snapshot_metadata_chunk(chunk: str) -> bool:
     return stripped.startswith("# Compair baseline snapshot") or stripped.startswith("## Snapshot limits")
 
 
+def _should_reanalyze_existing_chunks(*, reanalyze_existing: bool, meaningful_new_chunk_count: int) -> bool:
+    return bool(reanalyze_existing and meaningful_new_chunk_count == 0)
+
+
 def _is_code_review_chunk(doc: Document, text: str) -> bool:
     doc_type = (getattr(doc, "doc_type", "") or "").strip().lower()
     if doc_type == _CODE_REPO_DOC_TYPE:
@@ -616,7 +620,12 @@ def process_document(
 
     existing_indices_to_generate_feedback: list[int] = []
     available_existing_candidate_count = 0
-    if generate_feedback and reanalyze_existing and not new_chunks:
+    should_reanalyze_existing = _should_reanalyze_existing_chunks(
+        reanalyze_existing=reanalyze_existing,
+        meaningful_new_chunk_count=meaningful_new_chunk_count,
+    )
+
+    if generate_feedback and should_reanalyze_existing:
         existing_indices = _existing_feedback_candidate_indices(
             session=session,
             doc=doc,
@@ -625,12 +634,12 @@ def process_document(
             feedback_min_tokens=feedback_min_tokens,
             feedback_fallback_min=feedback_fallback_min,
         )
+        available_existing_candidate_count = len(existing_indices)
         if feedback_limit is None:
             existing_indices_to_generate_feedback = existing_indices
         else:
             remaining_slots = max((feedback_limit - recent_feedback_count - len(indices_to_generate_feedback)), 0)
             existing_indices_to_generate_feedback = existing_indices[:remaining_slots]
-            available_existing_candidate_count = len(existing_indices)
     elif generate_feedback and code_focus and not indices_to_generate_feedback:
         existing_indices = _existing_feedback_candidate_indices(
             session=session,
@@ -662,11 +671,14 @@ def process_document(
             and not indices_to_generate_feedback
             and not existing_indices_to_generate_feedback
         ):
+            skip_reason = "reanalyze_existing_disabled"
+            if reanalyze_existing and meaningful_new_chunk_count > 0:
+                skip_reason = "meaningful_new_chunks_present"
             log_event(
                 "feedback_existing_candidates_skipped",
                 document_id=doc.document_id,
                 available_existing_candidates=available_existing_candidate_count,
-                reason="reanalyze_existing_disabled",
+                reason=skip_reason,
                 new_chunks=len(new_chunks),
                 meaningful_new_chunks=meaningful_new_chunk_count,
             )

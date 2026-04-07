@@ -141,6 +141,10 @@ def _getenv(*names: str, default: Optional[str] = None) -> Optional[str]:
     return default
 
 
+def _openai_base_url() -> Optional[str]:
+    return _getenv("COMPAIR_OPENAI_BASE_URL", "OPENAI_BASE_URL")
+
+
 def _openai_sdk_max_retries() -> int:
     raw = _getenv("COMPAIR_OPENAI_SDK_MAX_RETRIES", "OPENAI_SDK_MAX_RETRIES")
     try:
@@ -457,11 +461,18 @@ class NotificationScorer:
         api_key = _getenv("COMPAIR_OPENAI_API_KEY", "OPENAI_API_KEY")
         self.client = client
         if self.client is None and OpenAI is not None and api_key and cfg.provider.lower() != "heuristic":
+            base_url = _openai_base_url()
             try:
-                self.client = OpenAI(api_key=api_key, max_retries=_openai_sdk_max_retries())
+                kwargs: Dict[str, Any] = {"api_key": api_key, "max_retries": _openai_sdk_max_retries()}
+                if base_url:
+                    kwargs["base_url"] = base_url
+                self.client = OpenAI(**kwargs)
             except TypeError:
                 try:
-                    self.client = OpenAI(api_key=api_key)
+                    kwargs = {"api_key": api_key}
+                    if base_url:
+                        kwargs["base_url"] = base_url
+                    self.client = OpenAI(**kwargs)
                 except Exception:
                     self.client = None
             except Exception:

@@ -27,6 +27,10 @@ def _openai_api_key() -> str | None:
     return os.getenv("COMPAIR_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 
 
+def _openai_base_url() -> str | None:
+    return os.getenv("COMPAIR_OPENAI_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+
+
 class Embedder:
     def __init__(self) -> None:
         self.edition = os.getenv("COMPAIR_EDITION", "core").lower()
@@ -59,11 +63,17 @@ class Embedder:
                     self.provider = "local"
                 else:
                     api_key = _openai_api_key()
+                    base_url = _openai_base_url()
                     if hasattr(openai, "api_key") and api_key:
                         openai.api_key = api_key  # type: ignore[assignment]
                     if hasattr(openai, "OpenAI"):
                         try:  # pragma: no cover - optional runtime dependency
-                            self._openai_client = openai.OpenAI(api_key=api_key)  # type: ignore[attr-defined]
+                            kwargs: dict[str, Any] = {}
+                            if api_key:
+                                kwargs["api_key"] = api_key
+                            if base_url:
+                                kwargs["base_url"] = base_url
+                            self._openai_client = openai.OpenAI(**kwargs)  # type: ignore[attr-defined]
                         except Exception:  # pragma: no cover - if instantiation fails
                             self._openai_client = None
 
@@ -177,8 +187,14 @@ def create_embeddings(embedder: Embedder, texts: list[str], user=None) -> list[l
         client = getattr(embedder, "_openai_client", None)
         if client is None and hasattr(openai, "OpenAI"):
             api_key = _openai_api_key()
+            base_url = _openai_base_url()
             try:  # pragma: no cover - optional client differences
-                client = openai.OpenAI(api_key=api_key) if api_key else openai.OpenAI()  # type: ignore[attr-defined]
+                kwargs: dict[str, Any] = {}
+                if api_key:
+                    kwargs["api_key"] = api_key
+                if base_url:
+                    kwargs["base_url"] = base_url
+                client = openai.OpenAI(**kwargs) if kwargs else openai.OpenAI()  # type: ignore[attr-defined]
             except TypeError:
                 client = openai.OpenAI()
             embedder._openai_client = client  # type: ignore[attr-defined]
@@ -228,8 +244,14 @@ def _openai_embedding(embedder: Embedder, text: str) -> list[float] | None:
     client = getattr(embedder, "_openai_client", None)
     if client is None and hasattr(openai, "OpenAI"):
         api_key = _openai_api_key()
+        base_url = _openai_base_url()
         try:  # pragma: no cover - optional client differences
-            client = openai.OpenAI(api_key=api_key) if api_key else openai.OpenAI()  # type: ignore[attr-defined]
+            kwargs: dict[str, Any] = {}
+            if api_key:
+                kwargs["api_key"] = api_key
+            if base_url:
+                kwargs["base_url"] = base_url
+            client = openai.OpenAI(**kwargs) if kwargs else openai.OpenAI()  # type: ignore[attr-defined]
         except TypeError:
             client = openai.OpenAI()
         embedder._openai_client = client  # type: ignore[attr-defined]

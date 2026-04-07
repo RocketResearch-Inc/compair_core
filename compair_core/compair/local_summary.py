@@ -122,6 +122,28 @@ def _clean_diff_prefix(line: str) -> str:
     return normalize_text(stripped)
 
 
+def _strip_leading_metadata_lines(text: str) -> str:
+    lines = [line.rstrip() for line in (text or "").splitlines()]
+    if not lines:
+        return ""
+
+    idx = 0
+    while idx < len(lines):
+        stripped = lines[idx].strip()
+        if not stripped:
+            idx += 1
+            continue
+        if stripped.startswith("### File:") or _META_LINE_RE.match(stripped):
+            idx += 1
+            continue
+        break
+
+    cleaned = "\n".join(lines[idx:]).strip()
+    cleaned = cleaned or normalize_text(text)
+    cleaned = re.sub(r"^\s*### File:\s+.+?(?:\s+\(.*?\))?\s+", "", cleaned)
+    return cleaned.strip()
+
+
 def _expand_token(token: str) -> set[str]:
     expanded = {token.lower()}
     for piece in re.split(r"[_./:-]+", token):
@@ -652,6 +674,7 @@ def best_reference_match(
         )
     if not target_excerpt:
         return None
+    target_excerpt = _strip_leading_metadata_lines(target_excerpt)
 
     target_profile = extract_artifacts(target_excerpt)
     best_match: ReferenceMatch | None = None
@@ -665,6 +688,7 @@ def best_reference_match(
         )
         if not peer_excerpt:
             continue
+        peer_excerpt = _strip_leading_metadata_lines(peer_excerpt)
         relation = assess_relation(target_excerpt, peer_excerpt)
         peer_profile = extract_artifacts(peer_excerpt)
         overlap = _overlap_score(target_profile, peer_profile)
