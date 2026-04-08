@@ -292,15 +292,7 @@ class Reviewer:
 
 
 def _reference_snippets(references: Iterable[Any], limit: int = 4) -> List[str]:
-    snippets: List[str] = []
-    for ref in references:
-        snippet = getattr(ref, "content", "") or ""
-        snippet = snippet.replace("\n", " ").strip()
-        if snippet:
-            snippets.append(snippet[:200])
-        if len(snippets) == limit:
-            break
-    return snippets
+    return reference_payload_texts(_local_references(list(references)[:limit]), limit=limit)
 
 
 def _grounded_reference_context(
@@ -464,7 +456,11 @@ def _local_references(references: list[Any]) -> list[ReferenceText]:
             continue
         doc = getattr(ref, "document", None)
         title = getattr(doc, "title", None) or "a related reference"
-        local_references.append(ReferenceText(label=title, text=snippet))
+        path = _extract_snapshot_file_path(snippet)
+        label = path or title
+        if path and title and title != path:
+            label = f"{title} [{path}]"
+        local_references.append(ReferenceText(label=label, text=snippet))
     return local_references
 
 

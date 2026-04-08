@@ -25,6 +25,7 @@ def _load_main_module():
 
     sqlalchemy = types.ModuleType("sqlalchemy")
     sqlalchemy.select = lambda *args, **kwargs: None
+    sqlalchemy.or_ = lambda *args, **kwargs: ("or", args)
     sys.modules["sqlalchemy"] = sqlalchemy
 
     sqlalchemy_orm = types.ModuleType("sqlalchemy.orm")
@@ -110,6 +111,67 @@ class DummyChunk:
 
 
 class MainRetrievalTests(unittest.TestCase):
+    def test_reference_candidate_allowed_excludes_same_document_when_self_feedback_disabled(self) -> None:
+        doc = types.SimpleNamespace(document_id="doc-1")
+        source = DummyChunk(
+            chunk_id="source",
+            document_id="doc-1",
+            content="### File: pyproject.toml\nlicense = { text = \"MIT\" }\n",
+        )
+        candidate = DummyChunk(
+            chunk_id="peer",
+            document_id="doc-1",
+            content="### File: LICENSE\nGNU GENERAL PUBLIC LICENSE\n",
+        )
+
+        allowed = main._reference_candidate_allowed(
+            candidate,
+            doc=doc,
+            source_chunk=source,
+            allow_same_document=False,
+        )
+
+        self.assertFalse(allowed)
+
+    def test_reference_candidate_allowed_allows_same_document_when_self_feedback_enabled(self) -> None:
+        doc = types.SimpleNamespace(document_id="doc-1")
+        source = DummyChunk(
+            chunk_id="source",
+            document_id="doc-1",
+            content="### File: pyproject.toml\nlicense = { text = \"MIT\" }\n",
+        )
+        candidate = DummyChunk(
+            chunk_id="peer",
+            document_id="doc-1",
+            content="### File: LICENSE\nGNU GENERAL PUBLIC LICENSE\n",
+        )
+
+        allowed = main._reference_candidate_allowed(
+            candidate,
+            doc=doc,
+            source_chunk=source,
+            allow_same_document=True,
+        )
+
+        self.assertTrue(allowed)
+
+    def test_reference_candidate_allowed_never_returns_same_chunk(self) -> None:
+        doc = types.SimpleNamespace(document_id="doc-1")
+        source = DummyChunk(
+            chunk_id="source",
+            document_id="doc-1",
+            content="### File: pyproject.toml\nlicense = { text = \"MIT\" }\n",
+        )
+
+        allowed = main._reference_candidate_allowed(
+            source,
+            doc=doc,
+            source_chunk=source,
+            allow_same_document=True,
+        )
+
+        self.assertFalse(allowed)
+
     def test_should_reanalyze_existing_chunks_ignores_snapshot_only_new_chunks(self) -> None:
         self.assertTrue(
             main._should_reanalyze_existing_chunks(
@@ -206,6 +268,31 @@ class MainRetrievalTests(unittest.TestCase):
         ]
         selected = main._lexical_reference_candidates(target, candidates, limit=2, code_focus=True)
         self.assertEqual([chunk.document_id for chunk in selected], ["route"])
+
+    def test_lexical_reference_candidates_prioritize_high_signal_metadata_pairs(self) -> None:
+        target = (
+            "### File: pyproject.toml\n"
+            'license = { text = "MIT" }\n'
+            'name = "compair-core"\n'
+        )
+        candidates = [
+            DummyChunk(
+                document_id="license",
+                content=(
+                    "### File: LICENSE\n"
+                    "GNU GENERAL PUBLIC LICENSE\n"
+                ),
+            ),
+            DummyChunk(
+                document_id="docs",
+                content=(
+                    "### File: README.md\n"
+                    "Compair is a context manager for teams.\n"
+                ),
+            ),
+        ]
+        selected = main._lexical_reference_candidates(target, candidates, limit=2, code_focus=True)
+        self.assertEqual(selected[0].document_id, "license")
 
     def test_rerank_reference_chunks_prioritize_direct_capability_contradiction(self) -> None:
         target = (

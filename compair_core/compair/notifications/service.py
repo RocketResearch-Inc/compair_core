@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import logging
 import os
+import re
 
 from sqlalchemy.orm import Session
 
@@ -52,6 +53,18 @@ _HIGH_IMPACT_TERMS = (
     "env",
     "payload",
 )
+_RATIONALE_PROMOTION_BLOCKERS = (
+    "no explicit disagreement",
+    "no explicit conflicting",
+    "no direct contradiction",
+    "which is consistent",
+    "aligning with",
+    "aligns with",
+    "different surfaces",
+    "unrelated",
+    "no evident schema drift or contradiction",
+)
+_SNAPSHOT_FILE_RE = re.compile(r"^### File:\s+(.+?)(?:\s+\(.*)?$", re.MULTILINE)
 
 
 def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
@@ -144,6 +157,13 @@ def _feedback_focus_text(candidate: NotificationCandidate) -> str:
     return focus_text.strip() if isinstance(focus_text, str) else ""
 
 
+def _extract_snapshot_file_path(text: str) -> str:
+    match = _SNAPSHOT_FILE_RE.search(text or "")
+    if not match:
+        return ""
+    return (match.group(1) or "").strip()
+
+
 def _ground_notification_assessment(
     candidate: NotificationCandidate,
     assessment: ParsedLLMNotificationAssessment,
@@ -207,6 +227,9 @@ def _calibrate_assessment_from_feedback(
 
     lowered = summary.lower()
     if not any(term in lowered for term in _CONFLICT_SUMMARY_TERMS):
+        return assessment
+    rationale_text = " ".join(assessment.rationale).lower()
+    if any(marker in rationale_text for marker in _RATIONALE_PROMOTION_BLOCKERS):
         return assessment
 
     target_excerpt = assessment.evidence_target or best_grounded_excerpt(candidate.target_text, [summary], summary)
@@ -279,6 +302,7 @@ def _build_payload(candidate: NotificationCandidate) -> Dict[str, Any]:
                 "peer_doc_title": p.doc_title,
                 "peer_doc_type": p.doc_type,
                 "peer_chunk_id": p.chunk_id,
+                "peer_file_path": _extract_snapshot_file_path(p.chunk_text),
                 "peer_chunk_text": _cap_text(p.chunk_text, 1600),
                 "peer_excerpt": peer_excerpt,
                 "peer_author_role": p.author_role,
@@ -306,6 +330,7 @@ def _build_payload(candidate: NotificationCandidate) -> Dict[str, Any]:
             "doc_type": candidate.target_doc_type,
             "doc_last_modified_utc": candidate.target_last_modified_utc,
             "chunk_id": candidate.target_chunk_id,
+            "chunk_file_path": _extract_snapshot_file_path(candidate.target_text),
             "chunk_text": _cap_text(candidate.target_text, 2000),
             "chunk_excerpt": target_excerpt,
         },

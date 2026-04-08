@@ -87,9 +87,16 @@ class Chunk(BaseModel):
 class Reference(BaseModel):
     reference_id: str
     source_chunk_id: str
-    reference_document_id: str
-    document: Document
-    document_author: str
+    reference_document_id: str | None = None
+    reference_note_id: str | None = None
+    reference_type: str = "document"
+    reference_chunk_id: str | None = None
+    document: Document | None = None
+    document_author: str | None = None
+    title: str | None = None
+    author: str | None = None
+    content: str | None = None
+    file_path: str | None = None
 
 
 class Feedback(BaseModel):

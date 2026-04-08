@@ -97,10 +97,28 @@ def _ensure_notification_preferences_delivery_columns() -> None:
         print(f"[compair_core] notification delivery email migration skipped: {exc}", file=sys.stderr)
 
 
+def _ensure_reference_chunk_id_column() -> None:
+    try:
+        from sqlalchemy import inspect, text
+
+        insp = inspect(engine)
+        if "reference" not in insp.get_table_names():
+            return
+        cols = {c["name"] for c in insp.get_columns("reference")}
+        if "reference_chunk_id" in cols:
+            return
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE reference ADD COLUMN reference_chunk_id VARCHAR(36)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_reference_reference_chunk_id ON reference (reference_chunk_id)"))
+    except Exception as exc:
+        print(f"[compair_core] reference_chunk_id migration skipped: {exc}", file=sys.stderr)
+
+
 def initialize_database() -> None:
     models.Base.metadata.create_all(engine)
     _ensure_user_retrial_count_default()
     _ensure_notification_preferences_delivery_columns()
+    _ensure_reference_chunk_id_column()
     if edition == "core":
         _ensure_topic_tags_column()
     if initialize_database_override:

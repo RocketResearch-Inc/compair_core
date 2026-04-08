@@ -482,7 +482,10 @@ class NotificationScorerConfig:
 class NotificationScorer:
     def __init__(self, config: Optional[NotificationScorerConfig] = None, client: Optional[OpenAI] = None):
         cfg = config or NotificationScorerConfig()
-        model_env = _getenv("COMPAIR_OPENAI_NOTIF_MODEL", "OPENAI_NOTIF_MODEL")
+        model_env = (
+            _getenv("COMPAIR_OPENAI_NOTIF_MODEL", "OPENAI_NOTIF_MODEL")
+            or _getenv("COMPAIR_OPENAI_MODEL", "OPENAI_MODEL")
+        )
         provider_env = _getenv("COMPAIR_NOTIFICATION_SCORING_PROVIDER", "NOTIFICATION_SCORING_PROVIDER")
         temp_env = _getenv("COMPAIR_OPENAI_NOTIF_TEMPERATURE", "OPENAI_NOTIF_TEMPERATURE")
         max_retries_env = _env_int(

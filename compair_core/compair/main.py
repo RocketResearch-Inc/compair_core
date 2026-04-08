@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Mapping, Optional
 
 import Levenshtein
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm.attributes import get_history
 from sqlalchemy.orm import Session as SASession
 
@@ -53,6 +53,20 @@ _HIGH_SIGNAL_PATH_HINTS = (
     "/main.",
     "/app.",
 )
+_HIGH_SIGNAL_METADATA_BASENAMES = {
+    "pyproject.toml",
+    "package.json",
+    "go.mod",
+    "cargo.toml",
+    "setup.py",
+    "setup.cfg",
+    "license",
+    "license.txt",
+    "copying",
+    "copying.txt",
+    "notice",
+    "notice.txt",
+}
 _REFERENCE_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
 _REFERENCE_SUBTOKEN_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+")
 _REFERENCE_TOKEN_STOPWORDS = {
@@ -121,7 +135,7 @@ def _chunk_priority_key(chunk: str, idx: int, code_focus: bool) -> tuple[int, in
 
     path_rank = 2
     if path:
-        if any(hint in path for hint in _HIGH_SIGNAL_PATH_HINTS):
+        if any(hint in path for hint in _HIGH_SIGNAL_PATH_HINTS) or _is_high_signal_metadata_path(path):
             path_rank = 0
         else:
             path_rank = 1
@@ -282,6 +296,14 @@ def _is_doc_like_path(path: str) -> bool:
     return base in doc_basenames or "/docs/" in normalized or "/doc/" in normalized
 
 
+def _is_high_signal_metadata_path(path: str) -> bool:
+    normalized = (path or "").strip().lower().replace("\\", "/")
+    if not normalized:
+        return False
+    base = os.path.basename(normalized)
+    return base in _HIGH_SIGNAL_METADATA_BASENAMES
+
+
 def _chunk_relevance_score(
     chunk: str,
     idx: int,
@@ -298,6 +320,8 @@ def _chunk_relevance_score(
     relevance += token_score
     relevance += max(0.0, 1.2 - (0.4 * float(category)))
     relevance += max(0.0, 0.7 - (0.35 * float(path_rank)))
+    if _is_high_signal_metadata_path(path):
+        relevance += 0.65
     if "```" in chunk:
         relevance += 0.4
     if "diff --git" in chunk or "@@" in chunk or "+++ b/" in chunk:
@@ -333,6 +357,33 @@ def _reference_chunk_key(chunk: Chunk) -> str:
     source_key = _reference_source_key(chunk)
     content = getattr(chunk, "content", "") or ""
     return f"{source_key}:{stable_chunk_hash(content)}"
+
+
+def _allow_same_document_feedback(user: User | None) -> bool:
+    return bool(getattr(user, "include_own_documents_in_feedback", False))
+
+
+def _reference_candidate_allowed(
+    candidate: Chunk,
+    *,
+    doc: Document,
+    source_chunk: Chunk,
+    allow_same_document: bool,
+) -> bool:
+    if getattr(candidate, "chunk_type", "") != "document":
+        return False
+    if _reference_chunk_key(candidate) == _reference_chunk_key(source_chunk):
+        return False
+    candidate_doc_id = getattr(candidate, "document_id", None)
+    if candidate_doc_id != getattr(doc, "document_id", None):
+        return True
+    if not allow_same_document:
+        return False
+    source_content = getattr(source_chunk, "content", "") or ""
+    candidate_content = getattr(candidate, "content", "") or ""
+    if source_content and candidate_content and source_content == candidate_content:
+        return False
+    return True
 
 
 def _merge_reference_candidates(
@@ -383,12 +434,15 @@ def _lexical_reference_candidates(
         diff_bonus = 0.25 if "diff --git" in content or "@@" in content or "+++ b/" in content else 0.0
         doc_penalty = 0.0
         doc_bonus = 0.0
+        metadata_bonus = 0.0
         if code_focus:
             candidate_is_doc_like = _is_doc_like_path(candidate_path)
             if target_is_doc_like and candidate_is_doc_like:
                 doc_bonus = 0.75
             elif not target_is_doc_like and candidate_is_doc_like:
                 doc_penalty = 0.75
+            if _is_high_signal_metadata_path(target_path) and _is_high_signal_metadata_path(candidate_path):
+                metadata_bonus = 0.85
         score = (
             (lexical_score * 5.0)
             + artifact_score
@@ -396,6 +450,7 @@ def _lexical_reference_candidates(
             + code_bonus
             + diff_bonus
             + doc_bonus
+            + metadata_bonus
             - doc_penalty
         )
         if score <= 0.0:
@@ -448,8 +503,11 @@ def _rerank_reference_chunks(target_text: str, candidates: list[Chunk], code_foc
             artifact_score = min(_artifact_overlap_score(target_text, content), 4.0)
             code_bonus = 0.4 if "```" in content else 0.0
             doc_bonus = 0.0
+            metadata_bonus = 0.0
             if target_is_doc_like and _is_doc_like_path(candidate_path):
                 doc_bonus = 0.75
+            if _is_high_signal_metadata_path(target_path) and _is_high_signal_metadata_path(candidate_path):
+                metadata_bonus = 0.85
             diversity_penalty = 0.0
             if selected_tokens:
                 diversity_penalty = max(_token_overlap_ratio(candidate_tokens, prev) for prev in selected_tokens)
@@ -461,6 +519,7 @@ def _rerank_reference_chunks(target_text: str, candidates: list[Chunk], code_foc
                 + path_score
                 + code_bonus
                 + doc_bonus
+                + metadata_bonus
                 - (diversity_penalty * 2.5)
                 - source_penalty
             )
@@ -1099,6 +1158,7 @@ def process_text(
         doc_group_ids = [g.group_id for g in doc.groups]
         target_embedding = existing_chunk.embedding
         code_focus = _is_code_review_chunk(doc, text)
+        allow_same_document = _allow_same_document_feedback(user)
         query_text = _reference_query_text(text, focus_text, change_context, code_focus=code_focus)
         query_vector = query_embedding or target_embedding
         if query_vector is None and query_text:
@@ -1109,20 +1169,38 @@ def process_text(
         if query_vector is not None:
             lexical_candidates: list[Chunk] = []
             candidate_count = 0
-            base_query = (
-                session.query(Chunk)
-                .join(Chunk.document)
-                .join(Document.groups)
-                .filter(
-                    Document.is_published.is_(True),
-                    Document.document_id != doc.document_id,
-                    Chunk.chunk_type == "document",
-                    Group.group_id.in_(doc_group_ids),
+            base_query = None
+            if doc_group_ids:
+                base_query = (
+                    session.query(Chunk)
+                    .join(Chunk.document)
+                    .join(Document.groups)
+                    .filter(Group.group_id.in_(doc_group_ids))
                 )
-            )
+            elif allow_same_document:
+                base_query = (
+                    session.query(Chunk)
+                    .join(Chunk.document)
+                    .filter(Document.document_id == doc.document_id)
+                )
 
             all_candidates: list[Chunk] | None = None
-            if VECTOR_BACKEND == "pgvector":
+            if base_query is None:
+                candidates = []
+            else:
+                published_filter = Document.is_published.is_(True)
+                if allow_same_document:
+                    published_filter = or_(Document.is_published.is_(True), Document.document_id == doc.document_id)
+                else:
+                    base_query = base_query.filter(Document.document_id != doc.document_id)
+                base_query = base_query.filter(
+                    published_filter,
+                    Chunk.chunk_type == "document",
+                )
+
+            if base_query is None:
+                candidates = []
+            elif VECTOR_BACKEND == "pgvector":
                 candidates = (
                     base_query.order_by(
                         Chunk.embedding.cosine_distance(query_vector)
@@ -1144,6 +1222,28 @@ def process_text(
                         scored.append((score, candidate))
                 scored.sort(key=lambda item: item[0], reverse=True)
                 candidates = [chunk for _, chunk in scored[:candidate_limit]]
+            if all_candidates is not None:
+                all_candidates = [
+                    candidate
+                    for candidate in all_candidates
+                    if _reference_candidate_allowed(
+                        candidate,
+                        doc=doc,
+                        source_chunk=existing_chunk,
+                        allow_same_document=allow_same_document,
+                    )
+                ]
+            candidates = [
+                candidate
+                for candidate in candidates
+                if _reference_candidate_allowed(
+                    candidate,
+                    doc=doc,
+                    source_chunk=existing_chunk,
+                    allow_same_document=allow_same_document,
+                )
+            ]
+            candidate_count = len(all_candidates) if all_candidates is not None else len(candidates)
             if code_focus:
                 lexical_candidates = _lexical_reference_candidates(
                     query_text,
@@ -1160,6 +1260,7 @@ def process_text(
                     source_chunk_id=existing_chunk.chunk_id,
                     group_ids=doc_group_ids,
                     code_focus=code_focus,
+                    allow_same_document=allow_same_document,
                     candidate_count=candidate_count,
                     lexical_candidate_count=len(lexical_candidates),
                 )
@@ -1170,6 +1271,7 @@ def process_text(
                     source_chunk_id=existing_chunk.chunk_id,
                     group_ids=doc_group_ids,
                     code_focus=code_focus,
+                    allow_same_document=allow_same_document,
                     candidate_count=candidate_count,
                     lexical_candidate_count=len(lexical_candidates),
                     selected_reference_count=len(references),
@@ -1180,6 +1282,7 @@ def process_text(
             sql_references.append(
                 Reference(
                     source_chunk_id=existing_chunk.chunk_id,
+                    reference_chunk_id=ref_chunk.chunk_id,
                     reference_type="document",
                     reference_document_id=ref_chunk.document_id,
                     reference_note_id=None,

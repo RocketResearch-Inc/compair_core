@@ -77,6 +77,7 @@ redis_client = redis.Redis.from_url(redis_url) if (redis and redis_url) else Non
 #from compair.main import process_document
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_SNAPSHOT_FILE_RE = re.compile(r"^### File:\s+(.+?)(?:\s+\(.*)?$", re.MULTILINE)
 DEFAULT_NOTIFICATION_DIGEST_FREQUENCY = "daily"
 DEFAULT_NOTIFICATION_BUCKETS = ["conflicts", "updates", "overlaps", "validation"]
 logger = logging.getLogger("compair.core.api")
@@ -98,6 +99,34 @@ def _clean_email(value: Optional[str]) -> Optional[str]:
     if not _EMAIL_RE.match(cleaned):
         return None
     return cleaned
+
+
+def _extract_snapshot_file_path(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    match = _SNAPSHOT_FILE_RE.search(text)
+    if not match:
+        return None
+    candidate = (match.group(1) or "").strip()
+    return candidate or None
+
+
+def _reference_content(ref: models.Reference) -> Optional[str]:
+    chunk = getattr(ref, "reference_chunk", None)
+    if chunk is not None and getattr(chunk, "content", None):
+        return chunk.content
+    if ref.document is not None and getattr(ref.document, "content", None):
+        return ref.document.content
+    if ref.note is not None and getattr(ref.note, "content", None):
+        return ref.note.content
+    return None
+
+
+def _reference_file_path(ref: models.Reference) -> Optional[str]:
+    chunk = getattr(ref, "reference_chunk", None)
+    if chunk is None or not getattr(chunk, "content", None):
+        return None
+    return _extract_snapshot_file_path(chunk.content)
 
 
 def _notification_pref_payload_value(payload: Optional[dict[str, Any]], key: str, fallback: Any) -> Any:
@@ -2533,6 +2562,9 @@ def list_document_feedback(
                 .joinedload(models.Chunk.references)
                 .joinedload(models.Reference.note)
                 .joinedload(models.Note.author),
+                joinedload(models.Feedback.chunk)
+                .joinedload(models.Chunk.references)
+                .joinedload(models.Reference.reference_chunk),
             )
             .filter(models.Chunk.document_id == document_id)
             .order_by(models.Feedback.timestamp.desc())
@@ -2555,12 +2587,14 @@ def list_document_feedback(
                             "type": ref.reference_type,
                             "document_id": ref.reference_document_id,
                             "note_id": ref.reference_note_id,
+                            "reference_chunk_id": ref.reference_chunk_id,
                             "title": getattr(ref.document, "title", None) if ref.document else getattr(ref.note, "title", None),
                             "author": (
                                 getattr(getattr(ref.document, "user", None), "name", None)
                                 if ref.document else getattr(getattr(ref.note, "author", None), "name", None)
                             ),
-                            "content": getattr(ref.document, "content", None) if ref.document else getattr(ref.note, "content", None),
+                            "content": _reference_content(ref),
+                            "file_path": _reference_file_path(ref),
                         }
                         for ref in getattr(f.chunk, "references", []) or []
                     ],
@@ -2574,14 +2608,24 @@ def load_references(
     chunk_id: str,
 ) -> list[schema.Reference]:
     with compair.Session() as session:
-        references = session.query(models.Reference).filter(
-            models.Reference.source_chunk_id==chunk_id
-        ).all()
+        references = (
+            session.query(models.Reference)
+            .options(
+                joinedload(models.Reference.document).joinedload(models.Document.user),
+                joinedload(models.Reference.note).joinedload(models.Note.author),
+                joinedload(models.Reference.reference_chunk),
+            )
+            .filter(models.Reference.source_chunk_id == chunk_id)
+            .all()
+        )
         returned_references: list[schema.Reference] = [
             schema.Reference(
                 reference_id=r.reference_id,
                 source_chunk_id=r.source_chunk_id,
+                reference_type=r.reference_type,
+                reference_chunk_id=r.reference_chunk_id,
                 reference_document_id=r.reference_document_id,
+                reference_note_id=r.reference_note_id,
                 document=schema.Document(
                     document_id=r.document.document_id,
                     user_id=r.document.user_id,
@@ -2602,8 +2646,16 @@ def load_references(
                         status=r.document.user.status
                     )
                 ),
-                document_author=r.document.user.username
+                document_author=r.document.user.username,
+                title=getattr(r.document, "title", None) if r.document else getattr(r.note, "title", None),
+                author=(
+                    getattr(getattr(r.document, "user", None), "name", None)
+                    if r.document else getattr(getattr(r.note, "author", None), "name", None)
+                ),
+                content=_reference_content(r),
+                file_path=_reference_file_path(r),
             ) for r in references
+            if r.document is not None
         ]
         return returned_references
 

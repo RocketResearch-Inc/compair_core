@@ -359,6 +359,7 @@ class Chunk(Base):
         back_populates="chunk",
         cascade="all, delete",
         passive_deletes=True,
+        foreign_keys="Reference.source_chunk_id",
     )
     feedbacks = relationship(
         "Feedback",
@@ -374,11 +375,13 @@ class Reference(Base):
 
     reference_id: Mapped[str] = mapped_column(String(36), primary_key=True, init=False, default=lambda: str(uuid4()))
     source_chunk_id: Mapped[str] = mapped_column(ForeignKey("chunk.chunk_id", ondelete="CASCADE"), index=True)
+    reference_chunk_id: Mapped[str | None] = mapped_column(ForeignKey("chunk.chunk_id", ondelete="CASCADE"), index=True, nullable=True)
     reference_document_id: Mapped[str | None] = mapped_column(ForeignKey("document.document_id", ondelete="CASCADE"), index=True, nullable=True)
     reference_note_id: Mapped[str | None] = mapped_column(ForeignKey("note.note_id", ondelete="CASCADE"), index=True, nullable=True)
     reference_type: Mapped[str] = mapped_column(String(16), default="document")
 
-    chunk = relationship("Chunk", back_populates="references")
+    chunk = relationship("Chunk", back_populates="references", foreign_keys=[source_chunk_id])
+    reference_chunk = relationship("Chunk", foreign_keys=[reference_chunk_id])
     document = relationship("Document", back_populates="references")
     note = relationship("Note", back_populates="references")
 

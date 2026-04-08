@@ -186,6 +186,28 @@ class FeedbackPromptTests(unittest.TestCase):
         self.assertIn("Possible cross-repo drift detected", summary)
         self.assertNotIn('/notification_events', summary)
 
+    def test_local_references_prefer_file_path_in_label(self) -> None:
+        ref = SimpleNamespace(
+            content="### File: docs/api_mapping.md\n| `activity` | `GET /activity_feed` |",
+            document=SimpleNamespace(title="RocketResearch-Inc/compair_cli"),
+        )
+
+        refs = feedback._local_references([ref])
+
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0].label, "RocketResearch-Inc/compair_cli [docs/api_mapping.md]")
+
+    def test_reference_snippets_include_path_aware_label(self) -> None:
+        ref = SimpleNamespace(
+            content="### File: LICENSE\nGNU GENERAL PUBLIC LICENSE",
+            document=SimpleNamespace(title="RocketResearch-Inc/compair_core"),
+        )
+
+        snippets = feedback._reference_snippets([ref], limit=1)
+
+        self.assertEqual(len(snippets), 1)
+        self.assertIn("RocketResearch-Inc/compair_core [LICENSE]", snippets[0])
+
 
 if __name__ == "__main__":
     unittest.main()
