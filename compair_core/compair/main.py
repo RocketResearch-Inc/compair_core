@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import difflib
 from functools import lru_cache
 import logging
@@ -69,6 +70,28 @@ _HIGH_SIGNAL_METADATA_BASENAMES = {
 }
 _REFERENCE_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
 _REFERENCE_SUBTOKEN_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+")
+_HTTP_METHOD_PATH_RE = re.compile(
+    r"\b(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\s+((?:/[A-Za-z0-9._~%:+-]+)+(?:/[A-Za-z0-9._~%:+-]*)?)",
+    re.IGNORECASE,
+)
+_ENV_VAR_RE = re.compile(r"\b[A-Z][A-Z0-9]*_[A-Z0-9_]{2,}\b")
+_LICENSE_TERM_RE = re.compile(
+    r"\b(?:"
+    r"MIT|"
+    r"Apache(?:[- ]?2(?:\.0)?)?|"
+    r"BSD(?:[- ]?(?:2|3)(?:[- ]Clause)?)?|"
+    r"GPL(?:[- ]?(?:v)?(?:2|3)(?:\.0)?)?|"
+    r"AGPL(?:[- ]?(?:v)?(?:3)(?:\.0)?)?|"
+    r"LGPL(?:[- ]?(?:v)?(?:2|3)(?:\.0)?)?|"
+    r"MPL(?:[- ]?2(?:\.0)?)?|"
+    r"ISC|"
+    r"Proprietary|"
+    r"GNU General Public License|"
+    r"GNU Affero General Public License|"
+    r"Mozilla Public License"
+    r")\b",
+    re.IGNORECASE,
+)
 _REFERENCE_TOKEN_STOPWORDS = {
     "the",
     "and",
@@ -100,6 +123,29 @@ _REFERENCE_TOKEN_STOPWORDS = {
     "document",
     "note",
 }
+_ENV_VAR_EXCLUDE = {
+    "HTTP",
+    "HTTPS",
+    "JSON",
+    "HTML",
+    "NULL",
+    "NONE",
+    "TRUE",
+    "FALSE",
+}
+
+
+@dataclass(frozen=True)
+class ReferenceAnchorProfile:
+    endpoint_pairs: frozenset[str]
+    endpoint_paths: frozenset[str]
+    methods: frozenset[str]
+    env_vars: frozenset[str]
+    license_terms: frozenset[str]
+    key_names: frozenset[str]
+    quoted_norm: frozenset[str]
+    path_tokens: frozenset[str]
+    basename: str
 
 
 def is_code_review_document(doc: Document, chunk_mode: Optional[str]) -> bool:
@@ -212,6 +258,19 @@ def _reference_selection_config(code_focus: bool) -> tuple[int, int, int]:
     )
 
 
+def _reference_trace_enabled() -> bool:
+    return _bool_env("COMPAIR_REFERENCE_TRACE", False)
+
+
+def _reference_trace_max_candidates() -> int:
+    raw = os.getenv("COMPAIR_REFERENCE_TRACE_MAX_CANDIDATES", "0").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 0
+    return max(0, value)
+
+
 def _identifier_tokens(text: str, limit: int = 64) -> set[str]:
     tokens: set[str] = set()
     for raw in _REFERENCE_TOKEN_RE.findall(text or ""):
@@ -294,6 +353,170 @@ def _artifact_overlap_score(left_text: str, right_text: str) -> float:
         score += min(1.0, 0.25 * float(len(compound_overlap)))
 
     return score
+
+
+def _normalize_license_term(value: str) -> str:
+    lowered = (value or "").strip().lower()
+    compact = lowered.replace(" ", "").replace("-", "")
+    if "gnuafferogeneralpubliclicense" in compact or compact.startswith("agpl"):
+        return "agpl"
+    if "gnugeneralpubliclicense" in compact or compact.startswith("gpl"):
+        return "gpl"
+    if compact.startswith("lgpl"):
+        return "lgpl"
+    if lowered == "mit":
+        return "mit"
+    if lowered.startswith("apache"):
+        return "apache"
+    if lowered.startswith("bsd"):
+        return "bsd"
+    if lowered.startswith("mozilla public license") or lowered.startswith("mpl"):
+        return "mpl"
+    if lowered == "isc":
+        return "isc"
+    if lowered == "proprietary":
+        return "proprietary"
+    return lowered
+
+
+def _extract_license_terms(text: str) -> frozenset[str]:
+    terms = {
+        _normalize_license_term(match.group(0))
+        for match in _LICENSE_TERM_RE.finditer(text or "")
+    }
+    return frozenset(term for term in terms if term)
+
+
+def _extract_env_vars(text: str) -> frozenset[str]:
+    out: set[str] = set()
+    for raw in _ENV_VAR_RE.findall(text or ""):
+        candidate = raw.strip().upper()
+        if candidate in _ENV_VAR_EXCLUDE or candidate in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+            continue
+        out.add(candidate)
+    return frozenset(out)
+
+
+@lru_cache(maxsize=2048)
+def _reference_anchor_profile(text: str) -> ReferenceAnchorProfile:
+    artifact_profile = extract_artifacts(text or "")
+    endpoint_pairs: set[str] = set()
+    endpoint_paths: set[str] = set()
+    methods: set[str] = set()
+    for match in _HTTP_METHOD_PATH_RE.finditer(text or ""):
+        method = match.group(1).strip().lower()
+        path = match.group(2).strip().lower()
+        if not path:
+            continue
+        endpoint_pairs.add(f"{method} {path}")
+        endpoint_paths.add(path)
+        methods.add(method)
+    for path in artifact_profile.paths:
+        normalized = path.strip().lower()
+        if normalized.startswith("/"):
+            endpoint_paths.add(normalized)
+
+    snapshot_path = _extract_snapshot_file_path(text).lower().replace("\\", "/")
+    basename = os.path.basename(snapshot_path) if snapshot_path else ""
+    return ReferenceAnchorProfile(
+        endpoint_pairs=frozenset(endpoint_pairs),
+        endpoint_paths=frozenset(endpoint_paths),
+        methods=frozenset(methods),
+        env_vars=_extract_env_vars(text or ""),
+        license_terms=_extract_license_terms(text or ""),
+        key_names=artifact_profile.key_names,
+        quoted_norm=artifact_profile.quoted_norm,
+        path_tokens=artifact_profile.path_tokens,
+        basename=basename,
+    )
+
+
+@lru_cache(maxsize=2048)
+def _assignment_contrast_score(left_text: str, right_text: str) -> float:
+    left = extract_artifacts(left_text or "")
+    right = extract_artifacts(right_text or "")
+    if not left.assignments or not right.assignments:
+        return 0.0
+
+    right_by_key: dict[str, list] = {}
+    for assignment in right.assignments:
+        right_by_key.setdefault(assignment.key, []).append(assignment)
+
+    score = 0.0
+    for assignment in left.assignments:
+        for peer in right_by_key.get(assignment.key, []):
+            if assignment.normalized_value == peer.normalized_value:
+                continue
+            score += 1.6
+            if assignment.paths or peer.paths:
+                score += 0.7
+            if assignment.value_tokens and peer.value_tokens and not (assignment.value_tokens & peer.value_tokens):
+                score += 0.9
+            if assignment.normalized_value in {"true", "false"} or peer.normalized_value in {"true", "false"}:
+                score += 0.4
+    return min(score, 4.5)
+
+
+@lru_cache(maxsize=2048)
+def _reference_anchor_overlap_score(left_text: str, right_text: str) -> float:
+    left = _reference_anchor_profile(left_text or "")
+    right = _reference_anchor_profile(right_text or "")
+    score = 0.0
+    shared_endpoint_pairs = left.endpoint_pairs & right.endpoint_pairs
+    if shared_endpoint_pairs:
+        score += 4.0 + min(1.0, 0.25 * float(max(len(shared_endpoint_pairs) - 1, 0)))
+    shared_endpoint_paths = left.endpoint_paths & right.endpoint_paths
+    if shared_endpoint_paths:
+        score += 2.5 + min(1.0, 0.25 * float(max(len(shared_endpoint_paths) - 1, 0)))
+    shared_env_vars = left.env_vars & right.env_vars
+    if shared_env_vars:
+        score += min(2.5, 0.9 * float(len(shared_env_vars)))
+    shared_keys = left.key_names & right.key_names
+    if shared_keys:
+        score += min(2.0, 0.45 * float(len(shared_keys)))
+    shared_quotes = left.quoted_norm & right.quoted_norm
+    if shared_quotes:
+        score += min(1.8, 0.6 * float(len(shared_quotes)))
+    shared_licenses = left.license_terms & right.license_terms
+    if shared_licenses:
+        score += min(1.8, 0.9 * float(len(shared_licenses)))
+    shared_path_tokens = left.path_tokens & right.path_tokens
+    if shared_path_tokens:
+        score += min(1.5, 0.25 * float(len(shared_path_tokens)))
+    if left.basename and left.basename == right.basename:
+        score += 1.0
+    return score
+
+
+@lru_cache(maxsize=2048)
+def _reference_anchor_conflict_score(left_text: str, right_text: str) -> float:
+    left = _reference_anchor_profile(left_text or "")
+    right = _reference_anchor_profile(right_text or "")
+    score = _assignment_contrast_score(left_text, right_text)
+
+    shared_endpoint_paths = left.endpoint_paths & right.endpoint_paths
+    if shared_endpoint_paths:
+        same_method_pairs = left.endpoint_pairs & right.endpoint_pairs
+        if not same_method_pairs and left.methods and right.methods and left.methods != right.methods:
+            score += 3.2 + min(0.8, 0.2 * float(len(shared_endpoint_paths)))
+
+    if left.license_terms and right.license_terms and left.license_terms != right.license_terms:
+        score += 2.8
+    elif (
+        ("license" in left.key_names and right.license_terms)
+        or ("license" in right.key_names and left.license_terms)
+    ):
+        score += 1.8
+
+    if left.env_vars and right.env_vars and left.env_vars != right.env_vars:
+        shared_prefixes = {
+            env.split("_", 1)[0]
+            for env in left.env_vars | right.env_vars
+            if "_" in env
+        }
+        if shared_prefixes and not (left.env_vars & right.env_vars):
+            score += 0.8
+    return min(score, 6.0)
 
 
 def _is_doc_like_path(path: str) -> bool:
@@ -535,8 +758,11 @@ def _lexical_reference_candidates(
         candidate_tokens = _identifier_tokens(content, limit=96)
         candidate_path = _extract_snapshot_file_path(content)
         lexical_score = _token_overlap_ratio(target_tokens, candidate_tokens)
+        path_theme_score = _token_overlap_ratio(target_tokens, _path_token_set(candidate_path))
         path_score = _path_overlap_score(target_path, candidate_path)
         artifact_score = min(_artifact_overlap_score(target_text, content), 4.0)
+        anchor_overlap = _reference_anchor_overlap_score(target_text, content)
+        anchor_conflict = _reference_anchor_conflict_score(target_text, content)
         code_bonus = 0.35 if "```" in content else 0.0
         diff_bonus = 0.25 if "diff --git" in content or "@@" in content or "+++ b/" in content else 0.0
         doc_penalty = 0.0
@@ -550,9 +776,14 @@ def _lexical_reference_candidates(
                 doc_penalty = 0.75
             if _is_high_signal_metadata_path(target_path) and _is_high_signal_metadata_path(candidate_path):
                 metadata_bonus = 0.85
+            if anchor_overlap > 0.0 and target_is_doc_like != candidate_is_doc_like:
+                doc_bonus += 0.45
         score = (
             (lexical_score * 5.0)
+            + (path_theme_score * 2.5)
             + artifact_score
+            + (anchor_overlap * 2.5)
+            + (anchor_conflict * 3.0)
             + (path_score * 1.5)
             + code_bonus
             + diff_bonus
@@ -562,6 +793,48 @@ def _lexical_reference_candidates(
         )
         if score <= 0.0:
             continue
+        scored.append((score, idx, candidate))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [candidate for _, _, candidate in scored[:limit]]
+
+
+def _anchor_reference_candidates(
+    target_text: str,
+    candidates: list[Chunk],
+    *,
+    limit: int,
+    code_focus: bool,
+) -> list[Chunk]:
+    if not candidates or limit <= 0:
+        return []
+
+    target_path = _extract_snapshot_file_path(target_text)
+    target_is_doc_like = code_focus and _is_doc_like_path(target_path)
+    scored: list[tuple[float, int, Chunk]] = []
+    for idx, candidate in enumerate(candidates):
+        if getattr(candidate, "chunk_type", "") != "document":
+            continue
+        content = getattr(candidate, "content", "") or ""
+        if not content or _is_snapshot_metadata_chunk(content):
+            continue
+
+        candidate_path = _extract_snapshot_file_path(content)
+        candidate_is_doc_like = _is_doc_like_path(candidate_path)
+        anchor_overlap = _reference_anchor_overlap_score(target_text, content)
+        anchor_conflict = _reference_anchor_conflict_score(target_text, content)
+        if anchor_overlap <= 0.0 and anchor_conflict <= 0.0:
+            continue
+        artifact_score = min(_artifact_overlap_score(target_text, content), 4.0)
+        path_score = _path_overlap_score(target_path, candidate_path)
+        score = (anchor_overlap * 3.5) + (anchor_conflict * 4.0) + artifact_score + (path_score * 0.8)
+        if code_focus:
+            if _is_high_signal_metadata_path(target_path) and _is_high_signal_metadata_path(candidate_path):
+                score += 1.0
+            if target_is_doc_like != candidate_is_doc_like:
+                score += 0.6
+            if target_is_doc_like and candidate_is_doc_like:
+                score += 0.25
         scored.append((score, idx, candidate))
 
     scored.sort(key=lambda item: (-item[0], item[1]))
@@ -606,13 +879,19 @@ def _rerank_reference_chunks(target_text: str, candidates: list[Chunk], code_foc
             candidate_path = _extract_snapshot_file_path(content)
             base_score = float(len(trimmed) - idx) / float(max(1, len(trimmed)))
             lexical_score = _token_overlap_ratio(target_tokens, candidate_tokens)
+            path_theme_score = _token_overlap_ratio(target_tokens, _path_token_set(candidate_path))
             path_score = _path_overlap_score(target_path, candidate_path)
             artifact_score = min(_artifact_overlap_score(target_text, content), 4.0)
+            anchor_overlap = _reference_anchor_overlap_score(target_text, content)
+            anchor_conflict = _reference_anchor_conflict_score(target_text, content)
             code_bonus = 0.4 if "```" in content else 0.0
             doc_bonus = 0.0
             metadata_bonus = 0.0
-            if target_is_doc_like and _is_doc_like_path(candidate_path):
+            candidate_is_doc_like = _is_doc_like_path(candidate_path)
+            if target_is_doc_like and candidate_is_doc_like:
                 doc_bonus = 0.75
+            elif target_is_doc_like != candidate_is_doc_like and (anchor_overlap > 0.0 or anchor_conflict > 0.0):
+                doc_bonus = 0.55
             if _is_high_signal_metadata_path(target_path) and _is_high_signal_metadata_path(candidate_path):
                 metadata_bonus = 0.85
             diversity_penalty = 0.0
@@ -622,7 +901,10 @@ def _rerank_reference_chunks(target_text: str, candidates: list[Chunk], code_foc
             score = (
                 (base_score * 3.0)
                 + (lexical_score * 4.0)
+                + (path_theme_score * 2.0)
                 + artifact_score
+                + (anchor_overlap * 3.5)
+                + (anchor_conflict * 4.0)
                 + path_score
                 + code_bonus
                 + doc_bonus
@@ -670,6 +952,104 @@ def _reference_query_text(text: str, focus_text: str, change_context: str, *, co
     if (focus_tokens * 4) > (target_tokens * 3) and (len(query) * 4) > (len(target) * 3):
         return text
     return query
+
+
+def _reference_trace_entries(
+    *,
+    query_text: str,
+    source_chunk: Chunk,
+    doc: Document,
+    raw_candidates: list[Chunk],
+    raw_vector_candidates: list[Chunk],
+    allow_same_document: bool,
+    code_focus: bool,
+    lexical_candidates: list[Chunk],
+    anchor_candidates: list[Chunk],
+    selected_references: list[Chunk],
+) -> list[dict[str, object]]:
+    if not raw_candidates:
+        return []
+
+    query_tokens = _identifier_tokens(query_text)
+    source_document_id = getattr(doc, "document_id", None)
+    target_path = _extract_snapshot_file_path(query_text)
+    vector_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(raw_vector_candidates)}
+    lexical_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(lexical_candidates)}
+    anchor_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(anchor_candidates)}
+    selected_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(selected_references)}
+
+    def _sort_key(entry: dict[str, object]) -> tuple[int, int, int, float]:
+        status = str(entry.get("selection_status") or "")
+        status_rank = {"selected": 0, "candidate": 1, "filtered": 2}.get(status, 3)
+        best_rank = min(
+            int(entry.get("selected_rank") or 9999),
+            int(entry.get("anchor_rank") or 9999),
+            int(entry.get("lexical_rank") or 9999),
+            int(entry.get("vector_rank") or 9999),
+        )
+        same_doc_rank = 0 if entry.get("same_document") else 1
+        combined = float(entry.get("combined_signal") or 0.0)
+        return (status_rank, best_rank, same_doc_rank, -combined)
+
+    entries: list[dict[str, object]] = []
+    for candidate in raw_candidates:
+        key = _reference_chunk_key(candidate)
+        content = getattr(candidate, "content", "") or ""
+        path = _extract_snapshot_file_path(content)
+        allowed, reason = _reference_candidate_decision(
+            candidate,
+            doc=doc,
+            source_chunk=source_chunk,
+            allow_same_document=allow_same_document,
+            code_focus=code_focus,
+        )
+        lexical_score = _token_overlap_ratio(query_tokens, _identifier_tokens(content))
+        path_theme_score = _token_overlap_ratio(query_tokens, _path_token_set(path))
+        path_score = _path_overlap_score(target_path, path)
+        artifact_score = min(_artifact_overlap_score(query_text, content), 4.0)
+        anchor_overlap = _reference_anchor_overlap_score(query_text, content)
+        anchor_conflict = _reference_anchor_conflict_score(query_text, content)
+        if key in selected_rank:
+            selection_status = "selected"
+        elif allowed:
+            selection_status = "candidate"
+        else:
+            selection_status = "filtered"
+        combined_signal = (
+            (lexical_score * 4.0)
+            + (path_theme_score * 2.0)
+            + artifact_score
+            + (anchor_overlap * 3.0)
+            + (anchor_conflict * 3.5)
+            + path_score
+        )
+        entries.append(
+            {
+                "chunk_id": getattr(candidate, "chunk_id", None),
+                "document_id": getattr(candidate, "document_id", None),
+                "path": path,
+                "same_document": getattr(candidate, "document_id", None) == source_document_id,
+                "selection_status": selection_status,
+                "drop_reason": None if allowed else reason,
+                "vector_rank": vector_rank.get(key),
+                "lexical_rank": lexical_rank.get(key),
+                "anchor_rank": anchor_rank.get(key),
+                "selected_rank": selected_rank.get(key),
+                "lexical_score": round(lexical_score, 4),
+                "path_theme_score": round(path_theme_score, 4),
+                "path_score": round(path_score, 4),
+                "artifact_score": round(artifact_score, 4),
+                "anchor_overlap": round(anchor_overlap, 4),
+                "anchor_conflict": round(anchor_conflict, 4),
+                "combined_signal": round(combined_signal, 4),
+            }
+        )
+
+    entries.sort(key=_sort_key)
+    trace_max = _reference_trace_max_candidates()
+    if trace_max > 0:
+        return entries[:trace_max]
+    return entries
 
 
 def process_document(
@@ -1271,16 +1651,19 @@ def process_text(
         if query_vector is None and query_text:
             query_vector = create_embedding(embedder, query_text, user=user)
         candidate_limit, _, _ = _reference_selection_config(code_focus)
-        merge_limit = max(candidate_limit, candidate_limit * 2)
+        merge_limit = max(candidate_limit * 3, 24 if code_focus else candidate_limit * 2)
         vector_fetch_limit = candidate_limit
         if code_focus:
-            vector_fetch_limit = max(candidate_limit * 4, merge_limit)
+            vector_fetch_limit = max(candidate_limit * 6, merge_limit)
 
         if query_vector is not None:
             lexical_candidates: list[Chunk] = []
+            anchor_candidates: list[Chunk] = []
             candidate_count = 0
             filtered_counts: dict[str, int] = {}
             raw_candidate_count = 0
+            raw_all_candidates: list[Chunk] = []
+            raw_vector_candidates: list[Chunk] = []
             base_query = None
             if doc_group_ids:
                 base_query = (
@@ -1320,12 +1703,15 @@ def process_text(
                     .limit(vector_fetch_limit)
                     .all()
                 )
+                raw_vector_candidates = list(candidates)
                 raw_candidate_count = len(candidates)
                 if code_focus:
                     all_candidates = base_query.all()
+                    raw_all_candidates = list(all_candidates)
                     raw_candidate_count = len(all_candidates)
             else:
                 all_candidates = base_query.all()
+                raw_all_candidates = list(all_candidates)
                 raw_candidate_count = len(all_candidates)
                 scored: list[tuple[float, Chunk]] = []
                 for candidate in all_candidates:
@@ -1334,6 +1720,9 @@ def process_text(
                         scored.append((score, candidate))
                 scored.sort(key=lambda item: item[0], reverse=True)
                 candidates = [chunk for _, chunk in scored[:vector_fetch_limit]]
+                raw_vector_candidates = list(candidates)
+            if not raw_all_candidates:
+                raw_all_candidates = list(all_candidates or candidates)
             if all_candidates is not None:
                 all_candidates, filtered_counts = _filter_reference_candidates(
                     all_candidates,
@@ -1359,8 +1748,42 @@ def process_text(
                     limit=candidate_limit,
                     code_focus=True,
                 )
+                anchor_candidates = _anchor_reference_candidates(
+                    query_text,
+                    all_candidates or [],
+                    limit=candidate_limit * 2,
+                    code_focus=True,
+                )
                 candidates = _merge_reference_candidates(candidates, lexical_candidates, merge_limit)
+                candidates = _merge_reference_candidates(candidates, anchor_candidates, merge_limit)
             references = _rerank_reference_chunks(query_text, candidates, code_focus=code_focus)
+            if _reference_trace_enabled():
+                log_event(
+                    "feedback_reference_trace",
+                    document_id=doc.document_id,
+                    source_chunk_id=existing_chunk.chunk_id,
+                    source_path=_extract_snapshot_file_path(text),
+                    query_path=_extract_snapshot_file_path(query_text),
+                    code_focus=code_focus,
+                    allow_same_document=allow_same_document,
+                    raw_candidate_count=raw_candidate_count,
+                    candidate_count=candidate_count,
+                    lexical_candidate_count=len(lexical_candidates),
+                    anchor_candidate_count=len(anchor_candidates),
+                    selected_reference_count=len(references),
+                    candidates=_reference_trace_entries(
+                        query_text=query_text,
+                        source_chunk=existing_chunk,
+                        doc=doc,
+                        raw_candidates=raw_all_candidates,
+                        raw_vector_candidates=raw_vector_candidates,
+                        allow_same_document=allow_same_document,
+                        code_focus=code_focus,
+                        lexical_candidates=lexical_candidates,
+                        anchor_candidates=anchor_candidates,
+                        selected_references=references,
+                    ),
+                )
             if not references:
                 log_event(
                     "feedback_no_references",
@@ -1372,6 +1795,7 @@ def process_text(
                     raw_candidate_count=raw_candidate_count,
                     candidate_count=candidate_count,
                     lexical_candidate_count=len(lexical_candidates),
+                    anchor_candidate_count=len(anchor_candidates),
                     filtered_header_only=filtered_counts.get("header_only", 0),
                     filtered_same_file=filtered_counts.get("same_file", 0),
                     filtered_same_document=filtered_counts.get("same_document_disabled", 0),
@@ -1388,6 +1812,7 @@ def process_text(
                     raw_candidate_count=raw_candidate_count,
                     candidate_count=candidate_count,
                     lexical_candidate_count=len(lexical_candidates),
+                    anchor_candidate_count=len(anchor_candidates),
                     selected_reference_count=len(references),
                     filtered_header_only=filtered_counts.get("header_only", 0),
                     filtered_same_file=filtered_counts.get("same_file", 0),

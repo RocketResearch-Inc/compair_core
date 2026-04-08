@@ -383,6 +383,84 @@ class MainRetrievalTests(unittest.TestCase):
         selected = main._lexical_reference_candidates(target, candidates, limit=2, code_focus=True)
         self.assertEqual(selected[0].document_id, "license")
 
+    def test_anchor_reference_candidates_prioritize_route_method_conflict(self) -> None:
+        target = (
+            "### File: desktop-app/src/main.js\n"
+            'await fetch(`${base}/delete_group?group_id=${groupId}`, { method: "GET" })\n'
+        )
+        candidates = [
+            DummyChunk(
+                document_id="route-conflict",
+                content=(
+                    "### File: compair_core/api.py\n"
+                    '@router.delete("/delete_group")\n'
+                    "def delete_group(group_id: str):\n"
+                ),
+            ),
+            DummyChunk(
+                document_id="generic",
+                content=(
+                    "### File: docs/groups.md\n"
+                    "Group folders can be deleted from the desktop app.\n"
+                ),
+            ),
+        ]
+        selected = main._anchor_reference_candidates(target, candidates, limit=2, code_focus=True)
+        self.assertEqual([chunk.document_id for chunk in selected], ["route-conflict"])
+
+    def test_anchor_reference_candidates_prioritize_license_realm_conflict(self) -> None:
+        target = (
+            "### File: pyproject.toml\n"
+            'license = { text = "MIT" }\n'
+            'name = "compair-core"\n'
+        )
+        candidates = [
+            DummyChunk(
+                document_id="license",
+                content=(
+                    "### File: LICENSE\n"
+                    "GNU GENERAL PUBLIC LICENSE\n"
+                    "Version 3, 29 June 2007\n"
+                ),
+            ),
+            DummyChunk(
+                document_id="readme",
+                content=(
+                    "### File: README.md\n"
+                    "Compair is a context manager for teams.\n"
+                ),
+            ),
+        ]
+        selected = main._anchor_reference_candidates(target, candidates, limit=2, code_focus=True)
+        self.assertEqual(selected[0].document_id, "license")
+
+    def test_rerank_reference_chunks_prioritize_structured_delivery_settings_pair(self) -> None:
+        target = (
+            "### File: compair_ui/components/settings.py\n"
+            '"notification_delivery_email_effective": prefs.get("notification_delivery_email_effective"),\n'
+            'delivery_endpoint = "/notification_preferences/delivery_email"\n'
+        )
+        candidates = [
+            DummyChunk(
+                document_id="generic",
+                content=(
+                    "### File: README.md\n"
+                    "Notification delivery can be configured through the browser UI and CLI.\n"
+                ),
+            ),
+            DummyChunk(
+                document_id="api-surface",
+                content=(
+                    "### File: compair_core/api.py\n"
+                    '@router.post("/notification_preferences/delivery_email")\n'
+                    'notification_delivery_email_effective = prefs.notification_delivery_email_effective\n'
+                ),
+            ),
+        ]
+        ranked = main._rerank_reference_chunks(target, candidates, code_focus=True)
+        self.assertGreaterEqual(len(ranked), 2)
+        self.assertEqual(ranked[0].document_id, "api-surface")
+
     def test_rerank_reference_chunks_prioritize_direct_capability_contradiction(self) -> None:
         target = (
             "### File: docs/core_quickstart.md\n"
