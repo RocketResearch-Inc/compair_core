@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import importlib.util
+import os
 import pathlib
 import sys
 import types
@@ -129,6 +130,7 @@ class MainRetrievalTests(unittest.TestCase):
             doc=doc,
             source_chunk=source,
             allow_same_document=False,
+            code_focus=True,
         )
 
         self.assertFalse(allowed)
@@ -151,7 +153,70 @@ class MainRetrievalTests(unittest.TestCase):
             doc=doc,
             source_chunk=source,
             allow_same_document=True,
+            code_focus=True,
         )
+
+        self.assertTrue(allowed)
+
+    def test_reference_candidate_allowed_rejects_same_file_self_feedback_by_default(self) -> None:
+        doc = types.SimpleNamespace(document_id="doc-1")
+        source = DummyChunk(
+            chunk_id="source",
+            document_id="doc-1",
+            content="### File: src/layouts/BaseLayout.astro (part 2/2)\nconst body = payload;\n",
+        )
+        candidate = DummyChunk(
+            chunk_id="peer",
+            document_id="doc-1",
+            content="### File: src/layouts/BaseLayout.astro (part 1/2)\nconst sendTrackToEndpoint = () => {};\n",
+        )
+
+        allowed = main._reference_candidate_allowed(
+            candidate,
+            doc=doc,
+            source_chunk=source,
+            allow_same_document=True,
+            code_focus=True,
+        )
+
+        self.assertFalse(allowed)
+
+    def test_reference_candidate_allowed_allows_same_file_when_opted_in_and_not_adjacent(self) -> None:
+        doc = types.SimpleNamespace(document_id="doc-1")
+        source = DummyChunk(
+            chunk_id="source",
+            document_id="doc-1",
+            content=(
+                "### File: docs/architecture.md (part 5/9)\n"
+                "API tokens are short-lived and rotated by the server.\n"
+                "Client caching is disabled.\n"
+            ),
+        )
+        candidate = DummyChunk(
+            chunk_id="peer",
+            document_id="doc-1",
+            content=(
+                "### File: docs/architecture.md (part 8/9)\n"
+                "API tokens are short-lived and rotated by the server.\n"
+                "Clients may cache tokens for 24 hours.\n"
+            ),
+        )
+
+        original = os.environ.get("COMPAIR_ALLOW_SAME_FILE_SELF_FEEDBACK")
+        os.environ["COMPAIR_ALLOW_SAME_FILE_SELF_FEEDBACK"] = "1"
+        try:
+            allowed = main._reference_candidate_allowed(
+                candidate,
+                doc=doc,
+                source_chunk=source,
+                allow_same_document=True,
+                code_focus=True,
+            )
+        finally:
+            if original is None:
+                os.environ.pop("COMPAIR_ALLOW_SAME_FILE_SELF_FEEDBACK", None)
+            else:
+                os.environ["COMPAIR_ALLOW_SAME_FILE_SELF_FEEDBACK"] = original
 
         self.assertTrue(allowed)
 
@@ -168,6 +233,30 @@ class MainRetrievalTests(unittest.TestCase):
             doc=doc,
             source_chunk=source,
             allow_same_document=True,
+            code_focus=True,
+        )
+
+        self.assertFalse(allowed)
+
+    def test_reference_candidate_allowed_rejects_header_only_snapshot_peer(self) -> None:
+        doc = types.SimpleNamespace(document_id="doc-1")
+        source = DummyChunk(
+            chunk_id="source",
+            document_id="doc-1",
+            content="### File: docs/CLOUDFLARE_INTEGRATION.md (part 1/2)\n# Cloudflare integration\n",
+        )
+        candidate = DummyChunk(
+            chunk_id="peer",
+            document_id="doc-2",
+            content="### File: docs/CLOUDFLARE_INTEGRATION.md (part 2/2)\n",
+        )
+
+        allowed = main._reference_candidate_allowed(
+            candidate,
+            doc=doc,
+            source_chunk=source,
+            allow_same_document=True,
+            code_focus=True,
         )
 
         self.assertFalse(allowed)

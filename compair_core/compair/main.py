@@ -115,6 +115,29 @@ def _extract_snapshot_file_path(chunk: str) -> str:
     return match.group(1).strip()
 
 
+def _extract_snapshot_part(chunk: str) -> tuple[int, int] | None:
+    match = re.search(r"^### File:\s+[^\n]+\(part\s+(\d+)/(\d+)\)", chunk, re.MULTILINE)
+    if not match:
+        return None
+    try:
+        return (int(match.group(1)), int(match.group(2)))
+    except ValueError:
+        return None
+
+
+def _is_header_only_snapshot_chunk(chunk: str) -> bool:
+    stripped = (chunk or "").strip()
+    if not stripped.startswith("### File:"):
+        return False
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return True
+    body_lines = [line for line in lines[1:] if not line.startswith("```")]
+    if not body_lines:
+        return True
+    return len(body_lines) == 1 and len(body_lines[0]) <= 24
+
+
 def _chunk_priority_key(chunk: str, idx: int, code_focus: bool) -> tuple[int, int, int, int, int]:
     if not code_focus:
         return (0, 0, 0, -len(chunk), idx)
@@ -166,6 +189,13 @@ def _int_env(name: str, default: int) -> int:
     except ValueError:
         return default
     return value if value > 0 else default
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _reference_selection_config(code_focus: bool) -> tuple[int, int, int]:
@@ -363,27 +393,104 @@ def _allow_same_document_feedback(user: User | None) -> bool:
     return bool(getattr(user, "include_own_documents_in_feedback", False))
 
 
+def _same_file_self_reference_allowed(source_text: str, candidate_text: str, *, code_focus: bool) -> bool:
+    source_path = _extract_snapshot_file_path(source_text).lower().replace("\\", "/")
+    candidate_path = _extract_snapshot_file_path(candidate_text).lower().replace("\\", "/")
+    if not source_path or not candidate_path or source_path != candidate_path:
+        return True
+    if _is_header_only_snapshot_chunk(candidate_text):
+        return False
+
+    source_part = _extract_snapshot_part(source_text)
+    candidate_part = _extract_snapshot_part(candidate_text)
+    if (
+        source_part
+        and candidate_part
+        and source_part[1] == candidate_part[1]
+        and abs(source_part[0] - candidate_part[0]) <= 1
+    ):
+        return False
+
+    if not _bool_env("COMPAIR_ALLOW_SAME_FILE_SELF_FEEDBACK", False):
+        return False
+
+    if code_focus and _artifact_overlap_score(source_text, candidate_text) < 4.0:
+        return False
+    return True
+
+
+def _reference_candidate_decision(
+    candidate: Chunk,
+    *,
+    doc: Document,
+    source_chunk: Chunk,
+    allow_same_document: bool,
+    code_focus: bool,
+) -> tuple[bool, str | None]:
+    if getattr(candidate, "chunk_type", "") != "document":
+        return False, "non_document"
+    if _reference_chunk_key(candidate) == _reference_chunk_key(source_chunk):
+        return False, "same_chunk"
+
+    source_content = getattr(source_chunk, "content", "") or ""
+    candidate_content = getattr(candidate, "content", "") or ""
+    if _is_header_only_snapshot_chunk(candidate_content):
+        return False, "header_only"
+
+    candidate_doc_id = getattr(candidate, "document_id", None)
+    if candidate_doc_id != getattr(doc, "document_id", None):
+        return True, None
+    if not allow_same_document:
+        return False, "same_document_disabled"
+    if source_content and candidate_content and source_content == candidate_content:
+        return False, "duplicate_content"
+    if not _same_file_self_reference_allowed(source_content, candidate_content, code_focus=code_focus):
+        return False, "same_file"
+    return True, None
+
+
 def _reference_candidate_allowed(
     candidate: Chunk,
     *,
     doc: Document,
     source_chunk: Chunk,
     allow_same_document: bool,
+    code_focus: bool,
 ) -> bool:
-    if getattr(candidate, "chunk_type", "") != "document":
-        return False
-    if _reference_chunk_key(candidate) == _reference_chunk_key(source_chunk):
-        return False
-    candidate_doc_id = getattr(candidate, "document_id", None)
-    if candidate_doc_id != getattr(doc, "document_id", None):
-        return True
-    if not allow_same_document:
-        return False
-    source_content = getattr(source_chunk, "content", "") or ""
-    candidate_content = getattr(candidate, "content", "") or ""
-    if source_content and candidate_content and source_content == candidate_content:
-        return False
-    return True
+    allowed, _ = _reference_candidate_decision(
+        candidate,
+        doc=doc,
+        source_chunk=source_chunk,
+        allow_same_document=allow_same_document,
+        code_focus=code_focus,
+    )
+    return allowed
+
+
+def _filter_reference_candidates(
+    candidates: list[Chunk],
+    *,
+    doc: Document,
+    source_chunk: Chunk,
+    allow_same_document: bool,
+    code_focus: bool,
+) -> tuple[list[Chunk], dict[str, int]]:
+    kept: list[Chunk] = []
+    counts: dict[str, int] = {}
+    for candidate in candidates:
+        allowed, reason = _reference_candidate_decision(
+            candidate,
+            doc=doc,
+            source_chunk=source_chunk,
+            allow_same_document=allow_same_document,
+            code_focus=code_focus,
+        )
+        if allowed:
+            kept.append(candidate)
+            continue
+        if reason:
+            counts[reason] = counts.get(reason, 0) + 1
+    return kept, counts
 
 
 def _merge_reference_candidates(
@@ -1165,10 +1272,15 @@ def process_text(
             query_vector = create_embedding(embedder, query_text, user=user)
         candidate_limit, _, _ = _reference_selection_config(code_focus)
         merge_limit = max(candidate_limit, candidate_limit * 2)
+        vector_fetch_limit = candidate_limit
+        if code_focus:
+            vector_fetch_limit = max(candidate_limit * 4, merge_limit)
 
         if query_vector is not None:
             lexical_candidates: list[Chunk] = []
             candidate_count = 0
+            filtered_counts: dict[str, int] = {}
+            raw_candidate_count = 0
             base_query = None
             if doc_group_ids:
                 base_query = (
@@ -1205,44 +1317,40 @@ def process_text(
                     base_query.order_by(
                         Chunk.embedding.cosine_distance(query_vector)
                     )
-                    .limit(candidate_limit)
+                    .limit(vector_fetch_limit)
                     .all()
                 )
-                candidate_count = len(candidates)
+                raw_candidate_count = len(candidates)
                 if code_focus:
                     all_candidates = base_query.all()
-                    candidate_count = len(all_candidates)
+                    raw_candidate_count = len(all_candidates)
             else:
                 all_candidates = base_query.all()
-                candidate_count = len(all_candidates)
+                raw_candidate_count = len(all_candidates)
                 scored: list[tuple[float, Chunk]] = []
                 for candidate in all_candidates:
                     score = cosine_similarity(candidate.embedding, query_vector)
                     if score is not None:
                         scored.append((score, candidate))
                 scored.sort(key=lambda item: item[0], reverse=True)
-                candidates = [chunk for _, chunk in scored[:candidate_limit]]
+                candidates = [chunk for _, chunk in scored[:vector_fetch_limit]]
             if all_candidates is not None:
-                all_candidates = [
-                    candidate
-                    for candidate in all_candidates
-                    if _reference_candidate_allowed(
-                        candidate,
-                        doc=doc,
-                        source_chunk=existing_chunk,
-                        allow_same_document=allow_same_document,
-                    )
-                ]
-            candidates = [
-                candidate
-                for candidate in candidates
-                if _reference_candidate_allowed(
-                    candidate,
+                all_candidates, filtered_counts = _filter_reference_candidates(
+                    all_candidates,
                     doc=doc,
                     source_chunk=existing_chunk,
                     allow_same_document=allow_same_document,
+                    code_focus=code_focus,
                 )
-            ]
+            candidates, candidate_filtered_counts = _filter_reference_candidates(
+                candidates,
+                doc=doc,
+                source_chunk=existing_chunk,
+                allow_same_document=allow_same_document,
+                code_focus=code_focus,
+            )
+            for reason, count in candidate_filtered_counts.items():
+                filtered_counts[reason] = max(filtered_counts.get(reason, 0), count)
             candidate_count = len(all_candidates) if all_candidates is not None else len(candidates)
             if code_focus:
                 lexical_candidates = _lexical_reference_candidates(
@@ -1261,8 +1369,13 @@ def process_text(
                     group_ids=doc_group_ids,
                     code_focus=code_focus,
                     allow_same_document=allow_same_document,
+                    raw_candidate_count=raw_candidate_count,
                     candidate_count=candidate_count,
                     lexical_candidate_count=len(lexical_candidates),
+                    filtered_header_only=filtered_counts.get("header_only", 0),
+                    filtered_same_file=filtered_counts.get("same_file", 0),
+                    filtered_same_document=filtered_counts.get("same_document_disabled", 0),
+                    filtered_same_chunk=filtered_counts.get("same_chunk", 0),
                 )
             else:
                 log_event(
@@ -1272,9 +1385,14 @@ def process_text(
                     group_ids=doc_group_ids,
                     code_focus=code_focus,
                     allow_same_document=allow_same_document,
+                    raw_candidate_count=raw_candidate_count,
                     candidate_count=candidate_count,
                     lexical_candidate_count=len(lexical_candidates),
                     selected_reference_count=len(references),
+                    filtered_header_only=filtered_counts.get("header_only", 0),
+                    filtered_same_file=filtered_counts.get("same_file", 0),
+                    filtered_same_document=filtered_counts.get("same_document_disabled", 0),
+                    filtered_same_chunk=filtered_counts.get("same_chunk", 0),
                 )
 
         sql_references: list[Reference] = []
