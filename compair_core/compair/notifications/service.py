@@ -54,6 +54,7 @@ _HIGH_IMPACT_TERMS = (
     "payload",
 )
 _RATIONALE_PROMOTION_BLOCKERS = (
+    "no explicit contradiction",
     "no explicit disagreement",
     "no explicit conflicting",
     "no direct contradiction",
@@ -63,6 +64,19 @@ _RATIONALE_PROMOTION_BLOCKERS = (
     "different surfaces",
     "unrelated",
     "no evident schema drift or contradiction",
+)
+_RATIONALE_CONFLICT_DOWNGRADE_MARKERS = _RATIONALE_PROMOTION_BLOCKERS + (
+    "not directly confirming or contradicting",
+    "different files rather than conflicting behavior",
+    "overlap without clear contradiction",
+    "peer reinforces target",
+    "peer reinforces the target",
+    "aligning with target",
+)
+_RATIONALE_WEAK_EVIDENCE_MARKERS = (
+    "incomplete",
+    "truncated",
+    "appears truncated",
 )
 _SNAPSHOT_FILE_RE = re.compile(r"^### File:\s+(.+?)(?:\s+\(.*)?$", re.MULTILINE)
 
@@ -263,6 +277,46 @@ def _calibrate_assessment_from_feedback(
         evidence_target=target_excerpt or assessment.evidence_target,
         evidence_peer=peer_excerpt or assessment.evidence_peer,
     )
+
+
+def _enforce_assessment_consistency(
+    candidate: NotificationCandidate,
+    assessment: ParsedLLMNotificationAssessment,
+) -> ParsedLLMNotificationAssessment:
+    rationale_text = " ".join(assessment.rationale).lower()
+    summary = _feedback_summary(candidate)
+    lowered_summary = summary.lower()
+    denies_conflict = any(marker in rationale_text for marker in _RATIONALE_CONFLICT_DOWNGRADE_MARKERS)
+    weak_evidence = any(marker in rationale_text for marker in _RATIONALE_WEAK_EVIDENCE_MARKERS)
+    summary_signals_conflict = any(term in lowered_summary for term in _CONFLICT_SUMMARY_TERMS)
+
+    if assessment.intent == "potential_conflict" and denies_conflict:
+        downgraded_intent = "relevant_update" if summary_signals_conflict else "hidden_overlap"
+        max_severity = "MEDIUM" if summary_signals_conflict and not weak_evidence else "LOW"
+        max_relevance = "MEDIUM" if summary_signals_conflict else "LOW"
+        max_novelty = "MEDIUM" if summary_signals_conflict else "LOW"
+        return replace(
+            assessment,
+            intent=downgraded_intent,
+            severity=_cap_bucket(assessment.severity, max_severity),
+            relevance=_cap_bucket(assessment.relevance, max_relevance),
+            novelty=_cap_bucket(assessment.novelty, max_novelty),
+            certainty=_cap_bucket(assessment.certainty, "MEDIUM"),
+            delivery="digest",
+        )
+
+    if assessment.intent == "potential_conflict" and weak_evidence and not summary_signals_conflict:
+        return replace(
+            assessment,
+            intent="relevant_update",
+            severity=_cap_bucket(assessment.severity, "LOW"),
+            relevance=_cap_bucket(assessment.relevance, "LOW"),
+            novelty=_cap_bucket(assessment.novelty, "LOW"),
+            certainty=_cap_bucket(assessment.certainty, "MEDIUM"),
+            delivery="digest",
+        )
+
+    return assessment
 
 
 def _build_payload(candidate: NotificationCandidate) -> Dict[str, Any]:
@@ -499,6 +553,7 @@ def score_and_route_candidate(
     assessment = scorer.score(payload)
     assessment = _ground_notification_assessment(candidate, assessment)
     assessment = _calibrate_assessment_from_feedback(candidate, assessment)
+    assessment = _enforce_assessment_consistency(candidate, assessment)
 
     ctx = CandidateContext(
         user_id=candidate.user_id,

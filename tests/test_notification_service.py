@@ -90,6 +90,74 @@ service = _load_service_module()
 
 
 class NotificationServiceTests(unittest.TestCase):
+    def test_consistency_guard_downgrades_conflict_when_rationale_denies_explicit_contradiction(self) -> None:
+        candidate = service.NotificationCandidate(
+            user_id="u1",
+            group_id="g1",
+            target_doc_id="d1",
+            target_chunk_id="c1",
+            target_text="target excerpt",
+            peer_candidates=(),
+            generated_feedback={"summary": "There is a concrete mismatch/drift in the same surface."},
+        )
+        assessment = service.ParsedLLMNotificationAssessment(
+            intent="potential_conflict",
+            relevance="HIGH",
+            novelty="HIGH",
+            severity="HIGH",
+            certainty="HIGH",
+            delivery="push",
+            rationale=[
+                "Both excerpts concern the same configuration surface.",
+                "There is no explicit contradiction in the provided excerpts.",
+            ],
+            evidence_target="target excerpt",
+            evidence_peer="peer excerpt",
+            parse_mode="json_schema_rubric",
+            raw_extracted=None,
+            errors=[],
+        )
+
+        normalized = service._enforce_assessment_consistency(candidate, assessment)
+
+        self.assertEqual(normalized.intent, "relevant_update")
+        self.assertEqual(normalized.severity, "MEDIUM")
+        self.assertEqual(normalized.delivery, "digest")
+
+    def test_consistency_guard_downgrades_truncated_conflict_without_strong_summary_signal(self) -> None:
+        candidate = service.NotificationCandidate(
+            user_id="u1",
+            group_id="g1",
+            target_doc_id="d1",
+            target_chunk_id="c1",
+            target_text="target excerpt",
+            peer_candidates=(),
+            generated_feedback={"summary": "The peer discusses a related topic."},
+        )
+        assessment = service.ParsedLLMNotificationAssessment(
+            intent="potential_conflict",
+            relevance="MEDIUM",
+            novelty="MEDIUM",
+            severity="MEDIUM",
+            certainty="HIGH",
+            delivery="digest",
+            rationale=[
+                "The changed excerpt appears truncated.",
+                "The evidence is incomplete.",
+            ],
+            evidence_target="target excerpt",
+            evidence_peer="peer excerpt",
+            parse_mode="json_schema_rubric",
+            raw_extracted=None,
+            errors=[],
+        )
+
+        normalized = service._enforce_assessment_consistency(candidate, assessment)
+
+        self.assertEqual(normalized.intent, "relevant_update")
+        self.assertEqual(normalized.severity, "LOW")
+        self.assertEqual(normalized.relevance, "LOW")
+
     def test_calibration_does_not_promote_when_rationale_explicitly_denies_disagreement(self) -> None:
         candidate = service.NotificationCandidate(
             user_id="u1",
