@@ -487,6 +487,48 @@ class MainRetrievalTests(unittest.TestCase):
         self.assertGreaterEqual(len(ranked), 2)
         self.assertEqual(ranked[0].document_id, "contradiction")
 
+    def test_chunk_relevance_score_boosts_structured_doc_chunks(self) -> None:
+        generic_doc = (
+            "### File: docs/overview.md\n"
+            "Compair helps teams understand changes across projects.\n"
+            "It reduces drift and helps reviewers stay aligned.\n"
+        )
+        structured_doc = (
+            "### File: docs/api_mapping.md\n"
+            "| `notifications` | `GET /notification_events` |\n"
+            "| `activity` | `GET /activity_feed` |\n"
+            "Set COMPAIR_NOTIFICATION_DELIVERY=email to enable email delivery.\n"
+        )
+
+        generic_score = main._chunk_relevance_score(generic_doc, 0, True, 1.0)
+        structured_score = main._chunk_relevance_score(structured_doc, 1, True, 1.0)
+
+        self.assertGreater(structured_score, generic_score)
+
+    def test_prioritize_chunks_prefers_structured_public_surface_chunks(self) -> None:
+        chunks = [
+            (
+                "### File: docs/overview.md\n"
+                "Compair helps teams understand changes across projects.\n"
+                "It reduces drift and helps reviewers stay aligned.\n"
+            ),
+            (
+                "### File: docs/api_mapping.md\n"
+                "| `notifications` | `GET /notification_events` |\n"
+                "| `activity` | `GET /activity_feed` |\n"
+                "Set COMPAIR_NOTIFICATION_DELIVERY=email to enable email delivery.\n"
+            ),
+            (
+                "### File: docs/architecture.md\n"
+                "The app contains a frontend, backend, and worker.\n"
+                "Deployments can be local or hosted.\n"
+            ),
+        ]
+
+        selected = main.prioritize_chunks([0, 1, 2], chunks, limit=1, code_focus=True)
+
+        self.assertEqual(selected, [1])
+
 
 if __name__ == "__main__":
     unittest.main()

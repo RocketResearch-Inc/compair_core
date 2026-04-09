@@ -322,6 +322,62 @@ def _token_overlap_ratio(left: set[str], right: set[str]) -> float:
     return len(left & right) / float(max(1, min(len(left), len(right))))
 
 
+@lru_cache(maxsize=4096)
+def _structured_source_signal_score(text: str, *, code_focus: bool) -> float:
+    if not code_focus:
+        return 0.0
+
+    chunk = text or ""
+    if not chunk or _is_snapshot_metadata_chunk(chunk):
+        return 0.0
+
+    path = _extract_snapshot_file_path(chunk)
+    profile = _reference_anchor_profile(chunk)
+    artifacts = extract_artifacts(chunk)
+
+    score = 0.0
+    if profile.endpoint_pairs:
+        score += min(3.0, 1.35 * float(len(profile.endpoint_pairs)))
+    elif profile.endpoint_paths:
+        score += min(2.0, 0.85 * float(len(profile.endpoint_paths)))
+
+    if profile.env_vars:
+        score += min(1.8, 0.45 * float(len(profile.env_vars)))
+
+    if profile.license_terms:
+        score += min(1.8, 0.9 * float(len(profile.license_terms)))
+
+    if artifacts.assignments:
+        score += min(2.0, 0.3 * float(len(artifacts.assignments)))
+
+    if artifacts.key_names:
+        score += min(1.2, 0.15 * float(len(artifacts.key_names)))
+
+    if profile.quoted_norm:
+        score += min(1.0, 0.1 * float(len(profile.quoted_norm)))
+
+    if _is_high_signal_metadata_path(path):
+        score += 1.0
+
+    # Structured docs such as API guides and config references are often the
+    # best source chunk for cross-repo contradictions even though they are docs.
+    if _is_doc_like_path(path) and (
+        profile.endpoint_pairs
+        or profile.endpoint_paths
+        or profile.env_vars
+        or profile.license_terms
+        or artifacts.assignments
+    ):
+        score += 1.2
+
+    if "```" in chunk:
+        score += 0.25
+    if "diff --git" in chunk or "@@" in chunk or "+++ b/" in chunk:
+        score += 0.35
+
+    return min(score, 7.5)
+
+
 @lru_cache(maxsize=2048)
 def _artifact_overlap_score(left_text: str, right_text: str) -> float:
     left = extract_artifacts(left_text or "")
@@ -570,7 +626,9 @@ def _chunk_relevance_score(
 
     category, path_rank, _, _, _ = _chunk_priority_key(chunk, idx, code_focus)
     path = _extract_snapshot_file_path(chunk)
+    structured_signal = _structured_source_signal_score(chunk, code_focus=code_focus)
     relevance += token_score
+    relevance += structured_signal
     relevance += max(0.0, 1.2 - (0.4 * float(category)))
     relevance += max(0.0, 0.7 - (0.35 * float(path_rank)))
     if _is_high_signal_metadata_path(path):
@@ -580,7 +638,10 @@ def _chunk_relevance_score(
     if "diff --git" in chunk or "@@" in chunk or "+++ b/" in chunk:
         relevance += 0.45
     if _is_doc_like_path(path):
-        relevance -= 0.8
+        doc_penalty = 0.8
+        if structured_signal > 0.0:
+            doc_penalty = max(0.15, doc_penalty - min(0.65, structured_signal * 0.35))
+        relevance -= doc_penalty
     return relevance - (0.015 * float(min(idx, 50)))
 
 
