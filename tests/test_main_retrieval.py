@@ -505,6 +505,48 @@ class MainRetrievalTests(unittest.TestCase):
 
         self.assertGreater(structured_score, generic_score)
 
+    def test_chunk_relevance_score_boosts_behavioral_docs_with_runtime_claims(self) -> None:
+        generic_doc = (
+            "### File: README.md\n"
+            "Compair keeps teams aligned across projects.\n"
+            "It helps reduce drift during reviews.\n"
+        )
+        behavioral_doc = (
+            "### File: docs/user-guide.md\n"
+            "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development.\n"
+            "Core uses the configured backend to send verification emails.\n"
+            "The API returns delivery status in the notifications response.\n"
+        )
+
+        generic_score = main._chunk_relevance_score(generic_doc, 0, True, 1.0)
+        behavioral_score = main._chunk_relevance_score(behavioral_doc, 1, True, 1.0)
+
+        self.assertGreater(behavioral_score, generic_score)
+
+    def test_chunk_relevance_score_boosts_legal_and_manifest_chunks(self) -> None:
+        generic_doc = (
+            "### File: docs/architecture.md\n"
+            "The app contains a frontend, backend, and worker.\n"
+            "Deployments can be local or hosted.\n"
+        )
+        manifest_chunk = (
+            "### File: pyproject.toml\n"
+            'name = "compair-core"\n'
+            'license = { text = "MIT" }\n'
+        )
+        license_chunk = (
+            "### File: LICENSE\n"
+            "GNU GENERAL PUBLIC LICENSE\n"
+            "Version 3, 29 June 2007\n"
+        )
+
+        generic_score = main._chunk_relevance_score(generic_doc, 0, True, 1.0)
+        manifest_score = main._chunk_relevance_score(manifest_chunk, 1, True, 1.0)
+        license_score = main._chunk_relevance_score(license_chunk, 2, True, 1.0)
+
+        self.assertGreater(manifest_score, generic_score)
+        self.assertGreater(license_score, generic_score)
+
     def test_prioritize_chunks_prefers_structured_public_surface_chunks(self) -> None:
         chunks = [
             (
@@ -528,6 +570,52 @@ class MainRetrievalTests(unittest.TestCase):
         selected = main.prioritize_chunks([0, 1, 2], chunks, limit=1, code_focus=True)
 
         self.assertEqual(selected, [1])
+
+    def test_prioritize_chunks_prefers_behavioral_docs_over_generic_docs(self) -> None:
+        chunks = [
+            (
+                "### File: README.md\n"
+                "Compair keeps teams aligned across projects.\n"
+                "It helps reduce drift during reviews.\n"
+            ),
+            (
+                "### File: docs/user-guide.md\n"
+                "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development.\n"
+                "Core uses the configured backend to send verification emails.\n"
+                "The API returns delivery status in the notifications response.\n"
+            ),
+            (
+                "### File: docs/quickstart.md\n"
+                "Run `compair login` and configure your API key to begin.\n"
+            ),
+        ]
+
+        selected = main.prioritize_chunks([0, 1, 2], chunks, limit=1, code_focus=True)
+
+        self.assertEqual(selected, [1])
+
+    def test_prioritize_chunks_prefers_manifest_or_license_over_generic_docs(self) -> None:
+        chunks = [
+            (
+                "### File: docs/overview.md\n"
+                "Compair keeps teams aligned across projects.\n"
+                "It helps reduce drift during reviews.\n"
+            ),
+            (
+                "### File: LICENSE\n"
+                "GNU GENERAL PUBLIC LICENSE\n"
+                "Version 3, 29 June 2007\n"
+            ),
+            (
+                "### File: pyproject.toml\n"
+                'name = "compair-core"\n'
+                'license = { text = "MIT" }\n'
+            ),
+        ]
+
+        selected = main.prioritize_chunks([0, 1, 2], chunks, limit=2, code_focus=True)
+
+        self.assertEqual(selected[:2], [2, 1])
 
 
 if __name__ == "__main__":
