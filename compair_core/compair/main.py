@@ -7,7 +7,7 @@ import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
 
 import Levenshtein
 from sqlalchemy import or_, select
@@ -29,6 +29,7 @@ from .models import (
     VECTOR_BACKEND,
     cosine_similarity,
 )
+from .reference_reranker import load_model as load_reference_reranker_model, score_trace_row as score_reference_trace_row
 from .topic_tags import extract_topic_tags
 from .utils import (
     chunk_text_with_mode,
@@ -68,6 +69,7 @@ _HIGH_SIGNAL_METADATA_BASENAMES = {
     "notice",
     "notice.txt",
 }
+_REFERENCE_RERANKER_DEFAULT_MODEL_PATH = "/opt/compair/reference_reranker.json"
 _REFERENCE_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
 _REFERENCE_SUBTOKEN_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+")
 _HTTP_METHOD_PATH_RE = re.compile(
@@ -123,6 +125,8 @@ _REFERENCE_TOKEN_STOPWORDS = {
     "document",
     "note",
 }
+
+logger = logging.getLogger(__name__)
 _ENV_VAR_EXCLUDE = {
     "HTTP",
     "HTTPS",
@@ -269,6 +273,46 @@ def _reference_trace_max_candidates() -> int:
     except ValueError:
         return 0
     return max(0, value)
+
+
+def _reference_reranker_enabled() -> bool:
+    return _bool_env("COMPAIR_REFERENCE_RERANKER_ENABLED", False)
+
+
+@lru_cache(maxsize=1)
+def _reference_reranker_state() -> tuple[dict[str, Any] | None, str | None]:
+    if not _reference_reranker_enabled():
+        return None, None
+    raw_path = (os.getenv("COMPAIR_REFERENCE_RERANKER_MODEL_PATH") or "").strip()
+    model_path = raw_path or _REFERENCE_RERANKER_DEFAULT_MODEL_PATH
+    if not os.path.exists(model_path):
+        logger.warning(
+            "Reference reranker enabled but model artifact is missing at %s; falling back to heuristic ranking.",
+            model_path,
+        )
+        return None, model_path
+    try:
+        model = load_reference_reranker_model(model_path)
+    except Exception as exc:
+        logger.warning(
+            "Failed to load reference reranker model from %s; falling back to heuristic ranking: %s",
+            model_path,
+            exc,
+        )
+        return None, model_path
+    logger.info(
+        "Loaded reference reranker model %s from %s",
+        str(model.get("version") or "unknown"),
+        model_path,
+    )
+    return model, model_path
+
+
+def _reference_reranker_score(row: Mapping[str, Any]) -> float | None:
+    model, _ = _reference_reranker_state()
+    if not model:
+        return None
+    return float(score_reference_trace_row(row, model))
 
 
 def _identifier_tokens(text: str, limit: int = 64) -> set[str]:
@@ -902,7 +946,16 @@ def _anchor_reference_candidates(
     return [candidate for _, _, candidate in scored[:limit]]
 
 
-def _rerank_reference_chunks(target_text: str, candidates: list[Chunk], code_focus: bool) -> list[Chunk]:
+def _rerank_reference_chunks(
+    target_text: str,
+    candidates: list[Chunk],
+    code_focus: bool,
+    *,
+    doc: Document | None = None,
+    raw_vector_candidates: list[Chunk] | None = None,
+    lexical_candidates: list[Chunk] | None = None,
+    anchor_candidates: list[Chunk] | None = None,
+) -> list[Chunk]:
     candidate_limit, final_limit, max_per_source = _reference_selection_config(code_focus)
     if not candidates:
         return []
@@ -915,6 +968,20 @@ def _rerank_reference_chunks(target_text: str, candidates: list[Chunk], code_foc
     target_path = _extract_snapshot_file_path(target_text)
     target_is_doc_like = _is_doc_like_path(target_path)
     target_tokens = _identifier_tokens(target_text)
+    source_document_id = getattr(doc, "document_id", None)
+    vector_rank = {
+        _reference_chunk_key(chunk): idx + 1
+        for idx, chunk in enumerate(raw_vector_candidates or [])
+    }
+    lexical_rank = {
+        _reference_chunk_key(chunk): idx + 1
+        for idx, chunk in enumerate(lexical_candidates or [])
+    }
+    anchor_rank = {
+        _reference_chunk_key(chunk): idx + 1
+        for idx, chunk in enumerate(anchor_candidates or [])
+    }
+    reranker_enabled = code_focus and _reference_reranker_state()[0] is not None
     used_indices: set[int] = set()
     source_counts: dict[str, int] = {}
     selected: list[Chunk] = []
@@ -937,42 +1004,56 @@ def _rerank_reference_chunks(target_text: str, candidates: list[Chunk], code_foc
                 continue
 
             candidate_tokens = _identifier_tokens(content)
-            candidate_path = _extract_snapshot_file_path(content)
-            base_score = float(len(trimmed) - idx) / float(max(1, len(trimmed)))
-            lexical_score = _token_overlap_ratio(target_tokens, candidate_tokens)
-            path_theme_score = _token_overlap_ratio(target_tokens, _path_token_set(candidate_path))
-            path_score = _path_overlap_score(target_path, candidate_path)
-            artifact_score = min(_artifact_overlap_score(target_text, content), 4.0)
-            anchor_overlap = _reference_anchor_overlap_score(target_text, content)
-            anchor_conflict = _reference_anchor_conflict_score(target_text, content)
-            code_bonus = 0.4 if "```" in content else 0.0
-            doc_bonus = 0.0
-            metadata_bonus = 0.0
-            candidate_is_doc_like = _is_doc_like_path(candidate_path)
-            if target_is_doc_like and candidate_is_doc_like:
-                doc_bonus = 0.75
-            elif target_is_doc_like != candidate_is_doc_like and (anchor_overlap > 0.0 or anchor_conflict > 0.0):
-                doc_bonus = 0.55
-            if _is_high_signal_metadata_path(target_path) and _is_high_signal_metadata_path(candidate_path):
-                metadata_bonus = 0.85
+            feature_row = _reference_candidate_feature_row(
+                query_text=target_text,
+                candidate=candidate,
+                source_document_id=source_document_id,
+                source_path=target_path,
+                vector_rank=vector_rank,
+                lexical_rank=lexical_rank,
+                anchor_rank=anchor_rank,
+            )
             diversity_penalty = 0.0
             if selected_tokens:
                 diversity_penalty = max(_token_overlap_ratio(candidate_tokens, prev) for prev in selected_tokens)
             source_penalty = 0.75 * float(source_counts.get(source_key, 0))
-            score = (
-                (base_score * 3.0)
-                + (lexical_score * 4.0)
-                + (path_theme_score * 2.0)
-                + artifact_score
-                + (anchor_overlap * 3.5)
-                + (anchor_conflict * 4.0)
-                + path_score
-                + code_bonus
-                + doc_bonus
-                + metadata_bonus
-                - (diversity_penalty * 2.5)
-                - source_penalty
-            )
+            if reranker_enabled:
+                reranker_score = float(feature_row.get("reranker_score") or 0.0)
+                base_score = float(len(trimmed) - idx) / float(max(1, len(trimmed)))
+                score = reranker_score + (base_score * 0.05) - (diversity_penalty * 1.35) - source_penalty
+            else:
+                candidate_path = str(feature_row.get("candidate_path") or "")
+                base_score = float(len(trimmed) - idx) / float(max(1, len(trimmed)))
+                lexical_score = float(feature_row.get("lexical_score") or 0.0)
+                path_theme_score = float(feature_row.get("path_theme_score") or 0.0)
+                path_score = float(feature_row.get("path_score") or 0.0)
+                artifact_score = float(feature_row.get("artifact_score") or 0.0)
+                anchor_overlap = float(feature_row.get("anchor_overlap") or 0.0)
+                anchor_conflict = float(feature_row.get("anchor_conflict") or 0.0)
+                code_bonus = 0.4 if "```" in content else 0.0
+                doc_bonus = 0.0
+                metadata_bonus = 0.0
+                candidate_is_doc_like = _is_doc_like_path(candidate_path)
+                if target_is_doc_like and candidate_is_doc_like:
+                    doc_bonus = 0.75
+                elif target_is_doc_like != candidate_is_doc_like and (anchor_overlap > 0.0 or anchor_conflict > 0.0):
+                    doc_bonus = 0.55
+                if _is_high_signal_metadata_path(target_path) and _is_high_signal_metadata_path(candidate_path):
+                    metadata_bonus = 0.85
+                score = (
+                    (base_score * 3.0)
+                    + (lexical_score * 4.0)
+                    + (path_theme_score * 2.0)
+                    + artifact_score
+                    + (anchor_overlap * 3.5)
+                    + (anchor_conflict * 4.0)
+                    + path_score
+                    + code_bonus
+                    + doc_bonus
+                    + metadata_bonus
+                    - (diversity_penalty * 2.5)
+                    - source_penalty
+                )
             if score > best_score:
                 best_score = score
                 best_index = idx
@@ -1015,6 +1096,56 @@ def _reference_query_text(text: str, focus_text: str, change_context: str, *, co
     return query
 
 
+def _reference_candidate_feature_row(
+    *,
+    query_text: str,
+    candidate: Chunk,
+    source_document_id: str | None,
+    source_path: str,
+    vector_rank: Mapping[str, int],
+    lexical_rank: Mapping[str, int],
+    anchor_rank: Mapping[str, int],
+) -> dict[str, object]:
+    key = _reference_chunk_key(candidate)
+    content = getattr(candidate, "content", "") or ""
+    candidate_path = _extract_snapshot_file_path(content)
+    query_tokens = _identifier_tokens(query_text)
+    target_path = source_path or _extract_snapshot_file_path(query_text)
+    lexical_score = _token_overlap_ratio(query_tokens, _identifier_tokens(content))
+    path_theme_score = _token_overlap_ratio(query_tokens, _path_token_set(candidate_path))
+    path_score = _path_overlap_score(target_path, candidate_path)
+    artifact_score = min(_artifact_overlap_score(query_text, content), 4.0)
+    anchor_overlap = _reference_anchor_overlap_score(query_text, content)
+    anchor_conflict = _reference_anchor_conflict_score(query_text, content)
+    combined_signal = (
+        (lexical_score * 4.0)
+        + (path_theme_score * 2.0)
+        + artifact_score
+        + (anchor_overlap * 3.0)
+        + (anchor_conflict * 3.5)
+        + path_score
+    )
+    row: dict[str, object] = {
+        "source_path": source_path,
+        "candidate_path": candidate_path,
+        "same_document": getattr(candidate, "document_id", None) == source_document_id,
+        "vector_rank": vector_rank.get(key),
+        "lexical_rank": lexical_rank.get(key),
+        "anchor_rank": anchor_rank.get(key),
+        "lexical_score": round(lexical_score, 4),
+        "path_theme_score": round(path_theme_score, 4),
+        "path_score": round(path_score, 4),
+        "artifact_score": round(artifact_score, 4),
+        "anchor_overlap": round(anchor_overlap, 4),
+        "anchor_conflict": round(anchor_conflict, 4),
+        "combined_signal": round(combined_signal, 4),
+    }
+    reranker_score = _reference_reranker_score(row)
+    if reranker_score is not None:
+        row["reranker_score"] = round(reranker_score, 6)
+    return row
+
+
 def _reference_trace_entries(
     *,
     query_text: str,
@@ -1031,9 +1162,8 @@ def _reference_trace_entries(
     if not raw_candidates:
         return []
 
-    query_tokens = _identifier_tokens(query_text)
     source_document_id = getattr(doc, "document_id", None)
-    target_path = _extract_snapshot_file_path(query_text)
+    source_path = _extract_snapshot_file_path(query_text)
     vector_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(raw_vector_candidates)}
     lexical_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(lexical_candidates)}
     anchor_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(anchor_candidates)}
@@ -1055,8 +1185,6 @@ def _reference_trace_entries(
     entries: list[dict[str, object]] = []
     for candidate in raw_candidates:
         key = _reference_chunk_key(candidate)
-        content = getattr(candidate, "content", "") or ""
-        path = _extract_snapshot_file_path(content)
         allowed, reason = _reference_candidate_decision(
             candidate,
             doc=doc,
@@ -1064,45 +1192,41 @@ def _reference_trace_entries(
             allow_same_document=allow_same_document,
             code_focus=code_focus,
         )
-        lexical_score = _token_overlap_ratio(query_tokens, _identifier_tokens(content))
-        path_theme_score = _token_overlap_ratio(query_tokens, _path_token_set(path))
-        path_score = _path_overlap_score(target_path, path)
-        artifact_score = min(_artifact_overlap_score(query_text, content), 4.0)
-        anchor_overlap = _reference_anchor_overlap_score(query_text, content)
-        anchor_conflict = _reference_anchor_conflict_score(query_text, content)
+        feature_row = _reference_candidate_feature_row(
+            query_text=query_text,
+            candidate=candidate,
+            source_document_id=source_document_id,
+            source_path=source_path,
+            vector_rank=vector_rank,
+            lexical_rank=lexical_rank,
+            anchor_rank=anchor_rank,
+        )
         if key in selected_rank:
             selection_status = "selected"
         elif allowed:
             selection_status = "candidate"
         else:
             selection_status = "filtered"
-        combined_signal = (
-            (lexical_score * 4.0)
-            + (path_theme_score * 2.0)
-            + artifact_score
-            + (anchor_overlap * 3.0)
-            + (anchor_conflict * 3.5)
-            + path_score
-        )
         entries.append(
             {
                 "chunk_id": getattr(candidate, "chunk_id", None),
                 "document_id": getattr(candidate, "document_id", None),
-                "path": path,
-                "same_document": getattr(candidate, "document_id", None) == source_document_id,
+                "path": feature_row.get("candidate_path"),
+                "same_document": feature_row.get("same_document"),
                 "selection_status": selection_status,
                 "drop_reason": None if allowed else reason,
-                "vector_rank": vector_rank.get(key),
-                "lexical_rank": lexical_rank.get(key),
-                "anchor_rank": anchor_rank.get(key),
+                "vector_rank": feature_row.get("vector_rank"),
+                "lexical_rank": feature_row.get("lexical_rank"),
+                "anchor_rank": feature_row.get("anchor_rank"),
                 "selected_rank": selected_rank.get(key),
-                "lexical_score": round(lexical_score, 4),
-                "path_theme_score": round(path_theme_score, 4),
-                "path_score": round(path_score, 4),
-                "artifact_score": round(artifact_score, 4),
-                "anchor_overlap": round(anchor_overlap, 4),
-                "anchor_conflict": round(anchor_conflict, 4),
-                "combined_signal": round(combined_signal, 4),
+                "lexical_score": feature_row.get("lexical_score"),
+                "path_theme_score": feature_row.get("path_theme_score"),
+                "path_score": feature_row.get("path_score"),
+                "artifact_score": feature_row.get("artifact_score"),
+                "anchor_overlap": feature_row.get("anchor_overlap"),
+                "anchor_conflict": feature_row.get("anchor_conflict"),
+                "combined_signal": feature_row.get("combined_signal"),
+                "reranker_score": feature_row.get("reranker_score"),
             }
         )
 
@@ -1817,7 +1941,15 @@ def process_text(
                 )
                 candidates = _merge_reference_candidates(candidates, lexical_candidates, merge_limit)
                 candidates = _merge_reference_candidates(candidates, anchor_candidates, merge_limit)
-            references = _rerank_reference_chunks(query_text, candidates, code_focus=code_focus)
+            references = _rerank_reference_chunks(
+                query_text,
+                candidates,
+                code_focus=code_focus,
+                doc=doc,
+                raw_vector_candidates=raw_vector_candidates,
+                lexical_candidates=lexical_candidates,
+                anchor_candidates=anchor_candidates,
+            )
             if _reference_trace_enabled():
                 log_event(
                     "feedback_reference_trace",
