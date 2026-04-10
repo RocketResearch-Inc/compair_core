@@ -70,6 +70,7 @@ _HIGH_SIGNAL_METADATA_BASENAMES = {
     "notice.txt",
 }
 _REFERENCE_RERANKER_DEFAULT_MODEL_PATH = "/opt/compair/reference_reranker.json"
+_REFERENCE_RERANKER_DEFAULT_LATEST_PATH = "/opt/compair/reranker/reference_reranker_latest.json"
 _REFERENCE_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
 _REFERENCE_SUBTOKEN_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+")
 _HTTP_METHOD_PATH_RE = re.compile(
@@ -328,7 +329,8 @@ def _reference_reranker_state() -> tuple[dict[str, Any] | None, str | None]:
     if not _reference_reranker_enabled():
         return None, None
     raw_path = (os.getenv("COMPAIR_REFERENCE_RERANKER_MODEL_PATH") or "").strip()
-    model_path = raw_path or _REFERENCE_RERANKER_DEFAULT_MODEL_PATH
+    candidate_paths = [path for path in (raw_path, _REFERENCE_RERANKER_DEFAULT_MODEL_PATH, _REFERENCE_RERANKER_DEFAULT_LATEST_PATH) if path]
+    model_path = next((path for path in candidate_paths if os.path.exists(path)), raw_path or _REFERENCE_RERANKER_DEFAULT_MODEL_PATH)
     if not os.path.exists(model_path):
         logger.warning(
             "Reference reranker enabled but model artifact is missing at %s; falling back to heuristic ranking.",
@@ -346,7 +348,7 @@ def _reference_reranker_state() -> tuple[dict[str, Any] | None, str | None]:
         return None, model_path
     logger.info(
         "Loaded reference reranker model %s from %s",
-        str(model.get("version") or "unknown"),
+        str(model.get("model_version") or model.get("version") or "unknown"),
         model_path,
     )
     return model, model_path
@@ -1073,6 +1075,7 @@ def _rerank_reference_chunks(
     candidates: list[Chunk],
     code_focus: bool,
     *,
+    source_chunk: Chunk | None = None,
     doc: Document | None = None,
     raw_vector_candidates: list[Chunk] | None = None,
     lexical_candidates: list[Chunk] | None = None,
@@ -1128,6 +1131,7 @@ def _rerank_reference_chunks(
             candidate_tokens = _identifier_tokens(content)
             feature_row = _reference_candidate_feature_row(
                 query_text=target_text,
+                source_chunk=source_chunk,
                 candidate=candidate,
                 source_document_id=source_document_id,
                 source_path=target_path,
@@ -1221,6 +1225,7 @@ def _reference_query_text(text: str, focus_text: str, change_context: str, *, co
 def _reference_candidate_feature_row(
     *,
     query_text: str,
+    source_chunk: Chunk | None,
     candidate: Chunk,
     source_document_id: str | None,
     source_path: str,
@@ -1239,6 +1244,9 @@ def _reference_candidate_feature_row(
     artifact_score = min(_artifact_overlap_score(query_text, content), 4.0)
     anchor_overlap = _reference_anchor_overlap_score(query_text, content)
     anchor_conflict = _reference_anchor_conflict_score(query_text, content)
+    source_content = getattr(source_chunk, "content", "") or query_text
+    source_embedding = getattr(source_chunk, "embedding", None) or []
+    candidate_embedding = getattr(candidate, "embedding", None) or []
     combined_signal = (
         (lexical_score * 4.0)
         + (path_theme_score * 2.0)
@@ -1261,6 +1269,10 @@ def _reference_candidate_feature_row(
         "anchor_overlap": round(anchor_overlap, 4),
         "anchor_conflict": round(anchor_conflict, 4),
         "combined_signal": round(combined_signal, 4),
+        "source_preview": source_content[:800],
+        "candidate_preview": content[:800],
+        "source_embedding": list(source_embedding),
+        "candidate_embedding": list(candidate_embedding),
     }
     reranker_score = _reference_reranker_score(row)
     if reranker_score is not None:
@@ -1316,6 +1328,7 @@ def _reference_trace_entries(
         )
         feature_row = _reference_candidate_feature_row(
             query_text=query_text,
+            source_chunk=source_chunk,
             candidate=candidate,
             source_document_id=source_document_id,
             source_path=source_path,
@@ -2067,6 +2080,7 @@ def process_text(
                 query_text,
                 candidates,
                 code_focus=code_focus,
+                source_chunk=existing_chunk,
                 doc=doc,
                 raw_vector_candidates=raw_vector_candidates,
                 lexical_candidates=lexical_candidates,
