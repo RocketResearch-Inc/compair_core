@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session as SASession
 from .embeddings import create_embedding, create_embeddings, Embedder
 from .feedback import get_feedback, Reviewer, split_feedback_items
 from .logger import log_event
-from .local_summary import extract_artifacts
+from .local_summary import ReferenceText, best_reference_match, extract_artifacts
 from .models import (
     Chunk,
     Document,
@@ -293,6 +293,22 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _float_env(name: str, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        value = default
+    else:
+        try:
+            value = float(raw.strip())
+        except ValueError:
+            value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
 def _reference_selection_config(code_focus: bool) -> tuple[int, int, int]:
     if code_focus:
         return (
@@ -322,6 +338,64 @@ def _reference_trace_max_candidates() -> int:
 
 def _reference_reranker_enabled() -> bool:
     return _bool_env("COMPAIR_REFERENCE_RERANKER_ENABLED", False)
+
+
+def _reference_hybrid_enabled() -> bool:
+    return _bool_env("COMPAIR_REFERENCE_HYBRID_ENABLED", False)
+
+
+def _reference_hybrid_rrf_k() -> int:
+    raw = os.getenv("COMPAIR_REFERENCE_HYBRID_RRF_K", "40").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 40
+    return max(5, value)
+
+
+def _reference_adjudicator_enabled() -> bool:
+    return _bool_env("COMPAIR_REFERENCE_ADJUDICATOR_ENABLED", False)
+
+
+def _reference_adjudicator_top_k() -> int:
+    raw = os.getenv("COMPAIR_REFERENCE_ADJUDICATOR_TOP_K", "8").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 8
+    return max(1, value)
+
+
+def _reference_hybrid_reranker_blend() -> float:
+    return _float_env("COMPAIR_REFERENCE_HYBRID_RERANKER_BLEND", 0.45, minimum=0.0, maximum=3.0)
+
+
+def _reference_hybrid_heuristic_blend() -> float:
+    return _float_env("COMPAIR_REFERENCE_HYBRID_HEURISTIC_BLEND", 0.4, minimum=0.0, maximum=3.0)
+
+
+def _reference_adjudicator_preselection_boost() -> float:
+    return _float_env("COMPAIR_REFERENCE_ADJUDICATOR_PRESELECTION_BOOST", 1.2, minimum=0.0, maximum=4.0)
+
+
+def _reference_adjudicator_mismatch_preselection_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_ADJUDICATOR_MISMATCH_PRESELECTION_WEIGHT", 0.15, minimum=0.0, maximum=4.0)
+
+
+def _reference_adjudicator_mismatch_score_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_ADJUDICATOR_MISMATCH_SCORE_WEIGHT", 2.8, minimum=0.0, maximum=6.0)
+
+
+def _reference_adjudicator_docdoc_preselection_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_ADJUDICATOR_DOCDOC_PRESELECTION_WEIGHT", 0.3, minimum=0.0, maximum=4.0)
+
+
+def _reference_adjudicator_docdoc_score_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_ADJUDICATOR_DOCDOC_SCORE_WEIGHT", 0.1, minimum=0.0, maximum=4.0)
+
+
+def _reference_adjudicator_default_score_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_ADJUDICATOR_DEFAULT_SCORE_WEIGHT", 0.1, minimum=0.0, maximum=4.0)
 
 
 @lru_cache(maxsize=1)
@@ -359,6 +433,14 @@ def _reference_reranker_score(row: Mapping[str, Any]) -> float | None:
     if not model:
         return None
     return float(score_reference_trace_row(row, model))
+
+
+def _reference_reranker_metadata() -> tuple[bool, str | None, str | None]:
+    model, model_path = _reference_reranker_state()
+    if not model:
+        return False, None, model_path
+    model_version = str(model.get("model_version") or model.get("version") or "").strip() or None
+    return True, model_version, model_path
 
 
 def _identifier_tokens(text: str, limit: int = 64) -> set[str]:
@@ -767,7 +849,12 @@ def _is_doc_like_path(path: str) -> bool:
         "architecture.rst",
         "architecture.txt",
     }
-    return base in doc_basenames or "/docs/" in normalized or "/doc/" in normalized
+    return (
+        base in doc_basenames
+        or normalized.endswith((".md", ".rst", ".txt", ".adoc"))
+        or "/docs/" in normalized
+        or "/doc/" in normalized
+    )
 
 
 def _is_high_signal_metadata_path(path: str) -> bool:
@@ -1080,6 +1167,7 @@ def _rerank_reference_chunks(
     raw_vector_candidates: list[Chunk] | None = None,
     lexical_candidates: list[Chunk] | None = None,
     anchor_candidates: list[Chunk] | None = None,
+    debug_stats: dict[str, Any] | None = None,
 ) -> list[Chunk]:
     candidate_limit, final_limit, max_per_source = _reference_selection_config(code_focus)
     if not candidates:
@@ -1092,7 +1180,6 @@ def _rerank_reference_chunks(
 
     target_path = _extract_snapshot_file_path(target_text)
     target_is_doc_like = _is_doc_like_path(target_path)
-    target_tokens = _identifier_tokens(target_text)
     source_document_id = getattr(doc, "document_id", None)
     vector_rank = {
         _reference_chunk_key(chunk): idx + 1
@@ -1106,11 +1193,105 @@ def _rerank_reference_chunks(
         _reference_chunk_key(chunk): idx + 1
         for idx, chunk in enumerate(anchor_candidates or [])
     }
-    reranker_enabled = code_focus and _reference_reranker_state()[0] is not None
+    reranker_enabled, reranker_model_version, reranker_model_path = _reference_reranker_metadata()
+    reranker_enabled = code_focus and reranker_enabled
+    hybrid_enabled = code_focus and _reference_hybrid_enabled()
+    adjudicator_enabled = code_focus and _reference_adjudicator_enabled()
     used_indices: set[int] = set()
     source_counts: dict[str, int] = {}
     selected: list[Chunk] = []
     selected_tokens: list[set[str]] = []
+    row_cache: dict[int, dict[str, object]] = {}
+
+    for idx, candidate in enumerate(trimmed):
+        if getattr(candidate, "chunk_type", "") != "document":
+            continue
+        content = getattr(candidate, "content", "") or ""
+        if _is_snapshot_metadata_chunk(content):
+            continue
+        row = _reference_candidate_feature_row(
+            query_text=target_text,
+            source_chunk=source_chunk,
+            candidate=candidate,
+            source_document_id=source_document_id,
+            source_path=target_path,
+            vector_rank=vector_rank,
+            lexical_rank=lexical_rank,
+            anchor_rank=anchor_rank,
+        )
+        row["heuristic_score"] = round(
+            _reference_heuristic_score(
+                row,
+                candidate_index=idx,
+                total_candidates=len(trimmed),
+                target_path=target_path,
+                target_is_doc_like=target_is_doc_like,
+                candidate_text=content,
+            ),
+            6,
+        )
+        preselection_score = float(row.get("heuristic_score") or 0.0)
+        if reranker_enabled:
+            preselection_score = float(row.get("reranker_score") or 0.0)
+            if hybrid_enabled:
+                preselection_score += _reference_hybrid_reranker_blend() * float(row.get("hybrid_score") or 0.0)
+        elif hybrid_enabled:
+            preselection_score += _reference_hybrid_heuristic_blend() * float(row.get("hybrid_score") or 0.0)
+        row["preselection_score"] = round(preselection_score, 6)
+        row_cache[idx] = row
+
+    if adjudicator_enabled and row_cache:
+        top_k = _reference_adjudicator_top_k()
+        ranked_for_adjudication = sorted(
+            row_cache.items(),
+            key=lambda item: float(item[1].get("preselection_score") or 0.0),
+            reverse=True,
+        )[:top_k]
+        positive_count = 0
+        for idx, row in ranked_for_adjudication:
+            candidate = trimmed[idx]
+            content = getattr(candidate, "content", "") or ""
+            payload = _reference_adjudication_payload(
+                target_text=target_text,
+                candidate_text=content,
+                candidate_path=str(row.get("candidate_path") or ""),
+            )
+            row.update(payload)
+            preselection_score = float(row.get("preselection_score") or 0.0) + (
+                _reference_adjudicator_preselection_boost() * float(payload["adjudicator_score"])
+            )
+            row["preselection_score"] = round(preselection_score, 6)
+            if float(payload["adjudicator_score"]) > 0.0:
+                positive_count += 1
+        if debug_stats is not None:
+            debug_stats["adjudicated_candidate_count"] = len(ranked_for_adjudication)
+            debug_stats["positive_adjudication_count"] = positive_count
+
+    if debug_stats is not None:
+        debug_stats["hybrid_enabled"] = hybrid_enabled
+        debug_stats["reranker_enabled"] = reranker_enabled
+        debug_stats["reranker_model_version"] = reranker_model_version
+        debug_stats["reranker_model_path"] = reranker_model_path
+        debug_stats["adjudicator_enabled"] = adjudicator_enabled
+        debug_stats["row_debug_by_chunk_id"] = {
+            str(getattr(trimmed[idx], "chunk_id", "") or ""): {
+                key: value
+                for key, value in row.items()
+                if key
+                in {
+                    "hybrid_score",
+                    "reranker_score",
+                    "heuristic_score",
+                    "preselection_score",
+                    "adjudicator_score",
+                    "adjudicator_kind",
+                    "adjudicator_confidence",
+                    "adjudicator_match_score",
+                }
+            }
+            for idx, row in row_cache.items()
+            if getattr(trimmed[idx], "chunk_id", None)
+        }
 
     while len(selected) < final_limit:
         best_index = -1
@@ -1129,57 +1310,31 @@ def _rerank_reference_chunks(
                 continue
 
             candidate_tokens = _identifier_tokens(content)
-            feature_row = _reference_candidate_feature_row(
-                query_text=target_text,
-                source_chunk=source_chunk,
-                candidate=candidate,
-                source_document_id=source_document_id,
-                source_path=target_path,
-                vector_rank=vector_rank,
-                lexical_rank=lexical_rank,
-                anchor_rank=anchor_rank,
-            )
+            feature_row = row_cache.get(idx)
+            if feature_row is None:
+                continue
             diversity_penalty = 0.0
             if selected_tokens:
                 diversity_penalty = max(_token_overlap_ratio(candidate_tokens, prev) for prev in selected_tokens)
             source_penalty = 0.75 * float(source_counts.get(source_key, 0))
-            if reranker_enabled:
-                reranker_score = float(feature_row.get("reranker_score") or 0.0)
-                base_score = float(len(trimmed) - idx) / float(max(1, len(trimmed)))
-                score = reranker_score + (base_score * 0.05) - (diversity_penalty * 1.35) - source_penalty
-            else:
-                candidate_path = str(feature_row.get("candidate_path") or "")
-                base_score = float(len(trimmed) - idx) / float(max(1, len(trimmed)))
-                lexical_score = float(feature_row.get("lexical_score") or 0.0)
-                path_theme_score = float(feature_row.get("path_theme_score") or 0.0)
-                path_score = float(feature_row.get("path_score") or 0.0)
-                artifact_score = float(feature_row.get("artifact_score") or 0.0)
-                anchor_overlap = float(feature_row.get("anchor_overlap") or 0.0)
-                anchor_conflict = float(feature_row.get("anchor_conflict") or 0.0)
-                code_bonus = 0.4 if "```" in content else 0.0
-                doc_bonus = 0.0
-                metadata_bonus = 0.0
-                candidate_is_doc_like = _is_doc_like_path(candidate_path)
-                if target_is_doc_like and candidate_is_doc_like:
-                    doc_bonus = 0.75
-                elif target_is_doc_like != candidate_is_doc_like and (anchor_overlap > 0.0 or anchor_conflict > 0.0):
-                    doc_bonus = 0.55
-                if _is_high_signal_metadata_path(target_path) and _is_high_signal_metadata_path(candidate_path):
-                    metadata_bonus = 0.85
+            preselection_score = float(feature_row.get("preselection_score") or 0.0)
+            adjudicator_score = float(feature_row.get("adjudicator_score") or 0.0)
+            adjudicator_kind = str(feature_row.get("adjudicator_kind") or "")
+            candidate_is_doc_like = _is_doc_like_path(str(feature_row.get("candidate_path") or ""))
+            diversity_multiplier = 1.35 if reranker_enabled else 2.2
+            if adjudicator_kind in {"docs-vs-impl mismatch", "route/path mismatch", "value mismatch", "rename", "presence/absence"}:
                 score = (
-                    (base_score * 3.0)
-                    + (lexical_score * 4.0)
-                    + (path_theme_score * 2.0)
-                    + artifact_score
-                    + (anchor_overlap * 3.5)
-                    + (anchor_conflict * 4.0)
-                    + path_score
-                    + code_bonus
-                    + doc_bonus
-                    + metadata_bonus
-                    - (diversity_penalty * 2.5)
-                    - source_penalty
+                    _reference_adjudicator_mismatch_preselection_weight() * preselection_score
+                    + _reference_adjudicator_mismatch_score_weight() * adjudicator_score
                 )
+            elif target_is_doc_like and candidate_is_doc_like:
+                score = (
+                    _reference_adjudicator_docdoc_preselection_weight() * preselection_score
+                    + _reference_adjudicator_docdoc_score_weight() * adjudicator_score
+                )
+            else:
+                score = preselection_score + (_reference_adjudicator_default_score_weight() * adjudicator_score)
+            score -= (diversity_penalty * diversity_multiplier) + source_penalty
             if score > best_score:
                 best_score = score
                 best_index = idx
@@ -1220,6 +1375,136 @@ def _reference_query_text(text: str, focus_text: str, change_context: str, *, co
     if (focus_tokens * 4) > (target_tokens * 3) and (len(query) * 4) > (len(target) * 3):
         return text
     return query
+
+
+def _reference_rrf(rank: Any, *, k: int) -> float:
+    value = 0
+    try:
+        value = int(rank or 0)
+    except (TypeError, ValueError):
+        value = 0
+    if value <= 0:
+        return 0.0
+    return 1.0 / float(k + value)
+
+
+def _reference_hybrid_score(feature_row: Mapping[str, object]) -> float:
+    k = _reference_hybrid_rrf_k()
+    vector_rrf = _reference_rrf(feature_row.get("vector_rank"), k=k)
+    lexical_rrf = _reference_rrf(feature_row.get("lexical_rank"), k=k)
+    anchor_rrf = _reference_rrf(feature_row.get("anchor_rank"), k=k)
+    lexical_score = float(feature_row.get("lexical_score") or 0.0)
+    path_theme_score = float(feature_row.get("path_theme_score") or 0.0)
+    path_score = float(feature_row.get("path_score") or 0.0)
+    artifact_score = float(feature_row.get("artifact_score") or 0.0)
+    anchor_overlap = float(feature_row.get("anchor_overlap") or 0.0)
+    anchor_conflict = float(feature_row.get("anchor_conflict") or 0.0)
+    combined_signal = float(feature_row.get("combined_signal") or 0.0)
+    return (
+        (22.0 * vector_rrf)
+        + (30.0 * lexical_rrf)
+        + (36.0 * anchor_rrf)
+        + (0.12 * lexical_score)
+        + (0.10 * path_theme_score)
+        + (0.08 * path_score)
+        + (0.18 * artifact_score)
+        + (0.34 * anchor_overlap)
+        + (0.42 * anchor_conflict)
+        + (0.05 * combined_signal)
+    )
+
+
+def _reference_heuristic_score(
+    feature_row: Mapping[str, object],
+    *,
+    candidate_index: int,
+    total_candidates: int,
+    target_path: str,
+    target_is_doc_like: bool,
+    candidate_text: str,
+) -> float:
+    candidate_path = str(feature_row.get("candidate_path") or "")
+    base_score = float(total_candidates - candidate_index) / float(max(1, total_candidates))
+    lexical_score = float(feature_row.get("lexical_score") or 0.0)
+    path_theme_score = float(feature_row.get("path_theme_score") or 0.0)
+    path_score = float(feature_row.get("path_score") or 0.0)
+    artifact_score = float(feature_row.get("artifact_score") or 0.0)
+    anchor_overlap = float(feature_row.get("anchor_overlap") or 0.0)
+    anchor_conflict = float(feature_row.get("anchor_conflict") or 0.0)
+    code_bonus = 0.4 if "```" in candidate_text else 0.0
+    doc_bonus = 0.0
+    metadata_bonus = 0.0
+    candidate_is_doc_like = _is_doc_like_path(candidate_path)
+    if target_is_doc_like and candidate_is_doc_like:
+        doc_bonus = 0.75
+    elif target_is_doc_like != candidate_is_doc_like and (anchor_overlap > 0.0 or anchor_conflict > 0.0):
+        doc_bonus = 0.55
+    if _is_high_signal_metadata_path(target_path) and _is_high_signal_metadata_path(candidate_path):
+        metadata_bonus = 0.85
+    return (
+        (base_score * 3.0)
+        + (lexical_score * 4.0)
+        + (path_theme_score * 2.0)
+        + artifact_score
+        + (anchor_overlap * 3.5)
+        + (anchor_conflict * 4.0)
+        + path_score
+        + code_bonus
+        + doc_bonus
+        + metadata_bonus
+    )
+
+
+def _reference_adjudication_payload(
+    *,
+    target_text: str,
+    candidate_text: str,
+    candidate_path: str,
+) -> dict[str, object]:
+    label = candidate_path or "a related reference"
+    match = best_reference_match(target_text, [ReferenceText(label=label, text=candidate_text)])
+    if match is None:
+        return {
+            "adjudicator_score": 0.0,
+            "adjudicator_kind": None,
+            "adjudicator_confidence": 0,
+            "adjudicator_match_score": 0,
+        }
+    relation = match.relation
+    kind = getattr(relation, "kind", None)
+    confidence = int(getattr(relation, "confidence", 0) or 0)
+    match_score = int(getattr(match, "score", 0) or 0)
+    target_path = _extract_snapshot_file_path(target_text)
+    target_profile = extract_artifacts(target_text)
+    candidate_profile = extract_artifacts(candidate_text)
+    shared_structured = len((target_profile.tokens | target_profile.quoted_norm) & (candidate_profile.tokens | candidate_profile.quoted_norm))
+    target_is_doc_like = _is_doc_like_path(target_path)
+    candidate_is_doc_like = _is_doc_like_path(candidate_path)
+    looks_implementation = (not candidate_is_doc_like) and (
+        "```" in candidate_text
+        or re.search(r"\b(?:def|class|return|await|fetch|router|mapped_column|function)\b", candidate_text)
+        or bool(candidate_profile.assignments)
+    )
+    if target_is_doc_like and looks_implementation and kind in {None, "generic divergence", "rename", "presence/absence"} and shared_structured >= 2:
+        kind = "docs-vs-impl mismatch"
+        confidence = max(confidence, 4)
+    if kind == "generic divergence":
+        adjudicator_score = 0.0 if target_is_doc_like and candidate_is_doc_like else min(0.45, 0.02 * float(match_score))
+    else:
+        kind_bonus = {
+            "docs-vs-impl mismatch": 2.2,
+            "route/path mismatch": 1.4,
+            "value mismatch": 1.25,
+            "rename": 0.95,
+            "presence/absence": 0.8,
+        }.get(kind, 0.0)
+        adjudicator_score = kind_bonus + min(1.35, 0.14 * float(confidence)) + min(0.9, 0.04 * float(match_score))
+    return {
+        "adjudicator_score": round(adjudicator_score, 6),
+        "adjudicator_kind": kind,
+        "adjudicator_confidence": confidence,
+        "adjudicator_match_score": match_score,
+    }
 
 
 def _reference_candidate_feature_row(
@@ -1274,6 +1559,7 @@ def _reference_candidate_feature_row(
         "source_embedding": list(source_embedding),
         "candidate_embedding": list(candidate_embedding),
     }
+    row["hybrid_score"] = round(_reference_hybrid_score(row), 6)
     reranker_score = _reference_reranker_score(row)
     if reranker_score is not None:
         row["reranker_score"] = round(reranker_score, 6)
@@ -1292,6 +1578,7 @@ def _reference_trace_entries(
     lexical_candidates: list[Chunk],
     anchor_candidates: list[Chunk],
     selected_references: list[Chunk],
+    row_debug: Mapping[str, Mapping[str, object]] | None = None,
 ) -> list[dict[str, object]]:
     if not raw_candidates:
         return []
@@ -1361,9 +1648,14 @@ def _reference_trace_entries(
                 "anchor_overlap": feature_row.get("anchor_overlap"),
                 "anchor_conflict": feature_row.get("anchor_conflict"),
                 "combined_signal": feature_row.get("combined_signal"),
+                "hybrid_score": feature_row.get("hybrid_score"),
                 "reranker_score": feature_row.get("reranker_score"),
             }
         )
+        if row_debug is not None:
+            chunk_id = str(getattr(candidate, "chunk_id", "") or "")
+            if chunk_id and chunk_id in row_debug:
+                entries[-1].update(row_debug[chunk_id])
 
     entries.sort(key=_sort_key)
     trace_max = _reference_trace_max_candidates()
@@ -2076,6 +2368,7 @@ def process_text(
                 )
                 candidates = _merge_reference_candidates(candidates, lexical_candidates, merge_limit)
                 candidates = _merge_reference_candidates(candidates, anchor_candidates, merge_limit)
+            rerank_debug: dict[str, Any] = {}
             references = _rerank_reference_chunks(
                 query_text,
                 candidates,
@@ -2085,6 +2378,7 @@ def process_text(
                 raw_vector_candidates=raw_vector_candidates,
                 lexical_candidates=lexical_candidates,
                 anchor_candidates=anchor_candidates,
+                debug_stats=rerank_debug,
             )
             if _reference_trace_enabled():
                 log_event(
@@ -2100,6 +2394,13 @@ def process_text(
                     lexical_candidate_count=len(lexical_candidates),
                     anchor_candidate_count=len(anchor_candidates),
                     selected_reference_count=len(references),
+                    hybrid_enabled=bool(rerank_debug.get("hybrid_enabled")),
+                    reranker_enabled=bool(rerank_debug.get("reranker_enabled")),
+                    reranker_model_version=rerank_debug.get("reranker_model_version"),
+                    reranker_model_path=rerank_debug.get("reranker_model_path"),
+                    adjudicator_enabled=bool(rerank_debug.get("adjudicator_enabled")),
+                    adjudicated_candidate_count=int(rerank_debug.get("adjudicated_candidate_count") or 0),
+                    positive_adjudication_count=int(rerank_debug.get("positive_adjudication_count") or 0),
                     candidates=_reference_trace_entries(
                         query_text=query_text,
                         source_chunk=existing_chunk,
@@ -2111,6 +2412,7 @@ def process_text(
                         lexical_candidates=lexical_candidates,
                         anchor_candidates=anchor_candidates,
                         selected_references=references,
+                        row_debug=rerank_debug.get("row_debug_by_chunk_id"),
                     ),
                 )
             if not references:
@@ -2125,6 +2427,13 @@ def process_text(
                     candidate_count=candidate_count,
                     lexical_candidate_count=len(lexical_candidates),
                     anchor_candidate_count=len(anchor_candidates),
+                    hybrid_enabled=bool(rerank_debug.get("hybrid_enabled")),
+                    reranker_enabled=bool(rerank_debug.get("reranker_enabled")),
+                    reranker_model_version=rerank_debug.get("reranker_model_version"),
+                    reranker_model_path=rerank_debug.get("reranker_model_path"),
+                    adjudicator_enabled=bool(rerank_debug.get("adjudicator_enabled")),
+                    adjudicated_candidate_count=int(rerank_debug.get("adjudicated_candidate_count") or 0),
+                    positive_adjudication_count=int(rerank_debug.get("positive_adjudication_count") or 0),
                     filtered_header_only=filtered_counts.get("header_only", 0),
                     filtered_same_file=filtered_counts.get("same_file", 0),
                     filtered_same_document=filtered_counts.get("same_document_disabled", 0),
@@ -2143,6 +2452,13 @@ def process_text(
                     lexical_candidate_count=len(lexical_candidates),
                     anchor_candidate_count=len(anchor_candidates),
                     selected_reference_count=len(references),
+                    hybrid_enabled=bool(rerank_debug.get("hybrid_enabled")),
+                    reranker_enabled=bool(rerank_debug.get("reranker_enabled")),
+                    reranker_model_version=rerank_debug.get("reranker_model_version"),
+                    reranker_model_path=rerank_debug.get("reranker_model_path"),
+                    adjudicator_enabled=bool(rerank_debug.get("adjudicator_enabled")),
+                    adjudicated_candidate_count=int(rerank_debug.get("adjudicated_candidate_count") or 0),
+                    positive_adjudication_count=int(rerank_debug.get("positive_adjudication_count") or 0),
                     filtered_header_only=filtered_counts.get("header_only", 0),
                     filtered_same_file=filtered_counts.get("same_file", 0),
                     filtered_same_document=filtered_counts.get("same_document_disabled", 0),

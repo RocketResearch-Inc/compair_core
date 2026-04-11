@@ -487,6 +487,69 @@ class MainRetrievalTests(unittest.TestCase):
         self.assertGreaterEqual(len(ranked), 2)
         self.assertEqual(ranked[0].document_id, "contradiction")
 
+    def test_reference_adjudication_payload_detects_docs_vs_impl_mismatch(self) -> None:
+        payload = main._reference_adjudication_payload(
+            target_text=(
+                "### File: README.md\n"
+                "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development.\n"
+                "Core logs verification emails to stdout.\n"
+            ),
+            candidate_text=(
+                "### File: compair_core/server/providers/console_mailer.py\n"
+                "class ConsoleMailer:\n"
+                "    def send(self, subject, sender, receivers, html):\n"
+                "        print('[MAIL]', subject)\n"
+            ),
+            candidate_path="compair_core/server/providers/console_mailer.py",
+        )
+
+        self.assertEqual(payload["adjudicator_kind"], "docs-vs-impl mismatch")
+        self.assertGreater(float(payload["adjudicator_score"]), 0.0)
+
+    def test_rerank_reference_chunks_promote_docs_to_impl_pair_with_adjudicator(self) -> None:
+        target = (
+            "### File: README.md\n"
+            "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development.\n"
+            "Core logs verification emails to stdout.\n"
+        )
+        candidates = [
+            DummyChunk(
+                document_id="docs-peer",
+                content=(
+                    "### File: docs/quickstart.md\n"
+                    "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development.\n"
+                    "See the user guide for other mailer backends.\n"
+                ),
+            ),
+            DummyChunk(
+                document_id="impl-peer",
+                content=(
+                    "### File: compair_core/server/providers/console_mailer.py\n"
+                    "class ConsoleMailer:\n"
+                    "    def send(self, subject, sender, receivers, html):\n"
+                    "        print('[MAIL]', subject)\n"
+                ),
+            ),
+        ]
+        original_hybrid = os.environ.get("COMPAIR_REFERENCE_HYBRID_ENABLED")
+        original_adjudicator = os.environ.get("COMPAIR_REFERENCE_ADJUDICATOR_ENABLED")
+        try:
+            os.environ["COMPAIR_REFERENCE_HYBRID_ENABLED"] = "1"
+            os.environ["COMPAIR_REFERENCE_ADJUDICATOR_ENABLED"] = "1"
+            ranked = main._rerank_reference_chunks(target, candidates, code_focus=True)
+        finally:
+            if original_hybrid is None:
+                os.environ.pop("COMPAIR_REFERENCE_HYBRID_ENABLED", None)
+            else:
+                os.environ["COMPAIR_REFERENCE_HYBRID_ENABLED"] = original_hybrid
+            if original_adjudicator is None:
+                os.environ.pop("COMPAIR_REFERENCE_ADJUDICATOR_ENABLED", None)
+            else:
+                os.environ["COMPAIR_REFERENCE_ADJUDICATOR_ENABLED"] = original_adjudicator
+
+        self.assertGreaterEqual(len(ranked), 2)
+        self.assertEqual(ranked[0].document_id, "impl-peer")
+
     def test_chunk_relevance_score_boosts_structured_doc_chunks(self) -> None:
         generic_doc = (
             "### File: docs/overview.md\n"
