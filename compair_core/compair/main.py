@@ -336,6 +336,24 @@ def _reference_trace_max_candidates() -> int:
     return max(0, value)
 
 
+def _reference_source_trace_enabled() -> bool:
+    raw = os.getenv("COMPAIR_REFERENCE_SOURCE_TRACE")
+    if raw is None:
+        return _reference_trace_enabled()
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _reference_source_trace_max_candidates() -> int:
+    raw = os.getenv("COMPAIR_REFERENCE_SOURCE_TRACE_MAX_CANDIDATES")
+    if raw is None:
+        return _reference_trace_max_candidates()
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return _reference_trace_max_candidates()
+    return max(0, value)
+
+
 def _reference_reranker_enabled() -> bool:
     return _bool_env("COMPAIR_REFERENCE_RERANKER_ENABLED", False)
 
@@ -366,12 +384,96 @@ def _reference_adjudicator_top_k() -> int:
     return max(1, value)
 
 
+def _reference_hybrid_vector_rank_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HYBRID_VECTOR_RANK_WEIGHT", 22.0, minimum=0.0, maximum=100.0)
+
+
+def _reference_hybrid_lexical_rank_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HYBRID_LEXICAL_RANK_WEIGHT", 30.0, minimum=0.0, maximum=100.0)
+
+
+def _reference_hybrid_anchor_rank_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HYBRID_ANCHOR_RANK_WEIGHT", 36.0, minimum=0.0, maximum=100.0)
+
+
+def _reference_hybrid_lexical_signal_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HYBRID_LEXICAL_SIGNAL_WEIGHT", 0.12, minimum=0.0, maximum=5.0)
+
+
+def _reference_hybrid_path_theme_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HYBRID_PATH_THEME_WEIGHT", 0.10, minimum=0.0, maximum=5.0)
+
+
+def _reference_hybrid_path_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HYBRID_PATH_WEIGHT", 0.08, minimum=0.0, maximum=5.0)
+
+
+def _reference_hybrid_artifact_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HYBRID_ARTIFACT_WEIGHT", 0.18, minimum=0.0, maximum=5.0)
+
+
+def _reference_hybrid_anchor_overlap_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HYBRID_ANCHOR_OVERLAP_WEIGHT", 0.34, minimum=0.0, maximum=5.0)
+
+
+def _reference_hybrid_anchor_conflict_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HYBRID_ANCHOR_CONFLICT_WEIGHT", 0.42, minimum=0.0, maximum=6.0)
+
+
+def _reference_hybrid_combined_signal_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HYBRID_COMBINED_SIGNAL_WEIGHT", 0.05, minimum=0.0, maximum=5.0)
+
+
 def _reference_hybrid_reranker_blend() -> float:
     return _float_env("COMPAIR_REFERENCE_HYBRID_RERANKER_BLEND", 0.45, minimum=0.0, maximum=3.0)
 
 
 def _reference_hybrid_heuristic_blend() -> float:
     return _float_env("COMPAIR_REFERENCE_HYBRID_HEURISTIC_BLEND", 0.4, minimum=0.0, maximum=3.0)
+
+
+def _reference_heuristic_base_rank_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HEURISTIC_BASE_RANK_WEIGHT", 3.0, minimum=0.0, maximum=8.0)
+
+
+def _reference_heuristic_lexical_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HEURISTIC_LEXICAL_WEIGHT", 4.0, minimum=0.0, maximum=8.0)
+
+
+def _reference_heuristic_path_theme_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HEURISTIC_PATH_THEME_WEIGHT", 2.0, minimum=0.0, maximum=8.0)
+
+
+def _reference_heuristic_artifact_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HEURISTIC_ARTIFACT_WEIGHT", 1.0, minimum=0.0, maximum=8.0)
+
+
+def _reference_heuristic_anchor_overlap_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HEURISTIC_ANCHOR_OVERLAP_WEIGHT", 3.5, minimum=0.0, maximum=8.0)
+
+
+def _reference_heuristic_anchor_conflict_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HEURISTIC_ANCHOR_CONFLICT_WEIGHT", 4.0, minimum=0.0, maximum=8.0)
+
+
+def _reference_heuristic_path_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HEURISTIC_PATH_WEIGHT", 1.0, minimum=0.0, maximum=8.0)
+
+
+def _reference_heuristic_code_bonus() -> float:
+    return _float_env("COMPAIR_REFERENCE_HEURISTIC_CODE_BONUS", 0.4, minimum=0.0, maximum=4.0)
+
+
+def _reference_heuristic_docdoc_bonus() -> float:
+    return _float_env("COMPAIR_REFERENCE_HEURISTIC_DOCDOC_BONUS", 0.75, minimum=0.0, maximum=4.0)
+
+
+def _reference_heuristic_doccode_bonus() -> float:
+    return _float_env("COMPAIR_REFERENCE_HEURISTIC_DOCCODE_BONUS", 0.55, minimum=0.0, maximum=4.0)
+
+
+def _reference_heuristic_metadata_bonus() -> float:
+    return _float_env("COMPAIR_REFERENCE_HEURISTIC_METADATA_BONUS", 0.85, minimum=0.0, maximum=4.0)
 
 
 def _reference_adjudicator_preselection_boost() -> float:
@@ -396,6 +498,78 @@ def _reference_adjudicator_docdoc_score_weight() -> float:
 
 def _reference_adjudicator_default_score_weight() -> float:
     return _float_env("COMPAIR_REFERENCE_ADJUDICATOR_DEFAULT_SCORE_WEIGHT", 0.1, minimum=0.0, maximum=4.0)
+
+
+def _reference_reranker_diversity_penalty() -> float:
+    return _float_env("COMPAIR_REFERENCE_RERANKER_DIVERSITY_PENALTY", 1.35, minimum=0.0, maximum=6.0)
+
+
+def _reference_heuristic_diversity_penalty() -> float:
+    return _float_env("COMPAIR_REFERENCE_HEURISTIC_DIVERSITY_PENALTY", 2.2, minimum=0.0, maximum=6.0)
+
+
+def _reference_source_penalty_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_SOURCE_PENALTY_WEIGHT", 0.75, minimum=0.0, maximum=6.0)
+
+
+def _source_significance_threshold() -> float:
+    return _float_env("COMPAIR_CODE_REPO_SOURCE_SIGNIFICANCE_THRESHOLD", 0.5, minimum=0.0, maximum=1.0)
+
+
+def _source_redundancy_penalty() -> float:
+    return _float_env("COMPAIR_CODE_REPO_SOURCE_REDUNDANCY_PENALTY", 2.6, minimum=0.0, maximum=8.0)
+
+
+def _source_min_selection_score() -> float:
+    return _float_env("COMPAIR_CODE_REPO_SOURCE_MIN_SELECTION_SCORE", 1.8, minimum=0.0, maximum=8.0)
+
+
+def _reference_merge_limit(code_focus: bool, candidate_limit: int) -> int:
+    if code_focus:
+        raw = os.getenv("COMPAIR_CODE_REPO_REFERENCE_MERGE_LIMIT")
+        default = max(candidate_limit * 3, 24)
+    else:
+        raw = os.getenv("COMPAIR_REFERENCE_MERGE_LIMIT")
+        default = max(candidate_limit * 2, candidate_limit)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return default
+    return max(candidate_limit, value)
+
+
+def _reference_trim_limit(code_focus: bool, candidate_limit: int, merge_limit: int) -> int:
+    if code_focus:
+        raw = os.getenv("COMPAIR_CODE_REPO_REFERENCE_TRIM_LIMIT")
+        default = max(candidate_limit, min(merge_limit, candidate_limit * 2))
+    else:
+        raw = os.getenv("COMPAIR_REFERENCE_TRIM_LIMIT")
+        default = max(candidate_limit, min(merge_limit, candidate_limit * 2))
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return default
+    return max(candidate_limit, min(merge_limit, value))
+
+
+def _reference_vector_fetch_limit(code_focus: bool, candidate_limit: int, merge_limit: int) -> int:
+    if code_focus:
+        raw = os.getenv("COMPAIR_CODE_REPO_REFERENCE_VECTOR_FETCH_LIMIT")
+        default = max(candidate_limit * 6, merge_limit)
+    else:
+        raw = os.getenv("COMPAIR_REFERENCE_VECTOR_FETCH_LIMIT")
+        default = candidate_limit
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return default
+    return max(candidate_limit, value)
 
 
 @lru_cache(maxsize=1)
@@ -871,33 +1045,152 @@ def _chunk_relevance_score(
     code_focus: bool,
     novelty_score: float,
 ) -> float:
+    return float(_chunk_relevance_features(chunk, idx, code_focus, novelty_score)["relevance_score"])
+
+
+def _chunk_relevance_features(
+    chunk: str,
+    idx: int,
+    code_focus: bool,
+    novelty_score: float,
+) -> dict[str, object]:
     token_score = min(float(count_tokens(chunk)) / 240.0, 2.0)
+    path = _extract_snapshot_file_path(chunk)
+    features: dict[str, object] = {
+        "path": path,
+        "token_score": round(token_score, 6),
+        "novelty_score": round(max(0.0, novelty_score), 6),
+        "is_doc_like": _is_doc_like_path(path),
+        "is_metadata_path": _is_high_signal_metadata_path(path),
+        "has_code_fence": "```" in chunk,
+        "has_diff_markers": "diff --git" in chunk or "@@" in chunk or "+++ b/" in chunk,
+        "is_snapshot_metadata": _is_snapshot_metadata_chunk(chunk),
+    }
     relevance = max(0.0, novelty_score) * 2.4
     if not code_focus:
-        return relevance + token_score - (0.01 * float(min(idx, 50)))
+        relevance = relevance + token_score - (0.01 * float(min(idx, 50)))
+        features["relevance_score"] = round(relevance, 6)
+        return features
 
     category, path_rank, _, _, _ = _chunk_priority_key(chunk, idx, code_focus)
-    path = _extract_snapshot_file_path(chunk)
     structured_signal = _structured_source_signal_score(chunk, code_focus=code_focus)
     behavioral_doc_signal = _behavioral_doc_signal_score(chunk)
-    relevance += token_score
-    relevance += structured_signal
-    relevance += max(0.0, 1.2 - (0.4 * float(category)))
-    relevance += max(0.0, 0.7 - (0.35 * float(path_rank)))
-    if _is_high_signal_metadata_path(path):
-        relevance += 0.65
-    if "```" in chunk:
-        relevance += 0.4
-    if "diff --git" in chunk or "@@" in chunk or "+++ b/" in chunk:
-        relevance += 0.45
+    metadata_bonus = 0.65 if _is_high_signal_metadata_path(path) else 0.0
+    code_bonus = 0.4 if "```" in chunk else 0.0
+    diff_bonus = 0.45 if "diff --git" in chunk or "@@" in chunk or "+++ b/" in chunk else 0.0
+    category_bonus = max(0.0, 1.2 - (0.4 * float(category)))
+    path_bonus = max(0.0, 0.7 - (0.35 * float(path_rank)))
+    doc_penalty = 0.0
     if _is_doc_like_path(path):
         doc_penalty = 0.8
         if structured_signal > 0.0:
             doc_penalty = max(0.15, doc_penalty - min(0.65, structured_signal * 0.35))
         if behavioral_doc_signal > 0.0:
             doc_penalty = max(0.05, doc_penalty - min(0.45, behavioral_doc_signal * 0.18))
-        relevance -= doc_penalty
-    return relevance - (0.015 * float(min(idx, 50)))
+    relevance += token_score
+    relevance += structured_signal
+    relevance += category_bonus
+    relevance += path_bonus
+    relevance += metadata_bonus
+    relevance += code_bonus
+    relevance += diff_bonus
+    relevance -= doc_penalty
+    relevance -= 0.015 * float(min(idx, 50))
+    features.update(
+        {
+            "structured_signal": round(structured_signal, 6),
+            "behavioral_doc_signal": round(behavioral_doc_signal, 6),
+            "category_rank": category,
+            "path_rank": path_rank,
+            "category_bonus": round(category_bonus, 6),
+            "path_bonus": round(path_bonus, 6),
+            "metadata_bonus": round(metadata_bonus, 6),
+            "code_bonus": round(code_bonus, 6),
+            "diff_bonus": round(diff_bonus, 6),
+            "doc_penalty": round(doc_penalty, 6),
+            "relevance_score": round(relevance, 6),
+        }
+    )
+    return features
+
+
+def _new_chunk_novelty_scores(prev_chunks: list[str], new_chunks: list[str]) -> dict[int, float]:
+    if not new_chunks:
+        return {}
+    if not prev_chunks:
+        return {i: 1.0 for i in range(len(new_chunks))}
+    novelty_scores: dict[int, float] = {}
+    for idx, new_chunk in enumerate(new_chunks):
+        if new_chunk in prev_chunks:
+            continue
+        best_match = max((Levenshtein.ratio(new_chunk, prev_chunk) for prev_chunk in prev_chunks), default=0.0)
+        novelty_scores[idx] = max(0.0, 1.0 - best_match)
+    return novelty_scores
+
+
+def _source_trace_entries(
+    *,
+    new_chunks: list[str],
+    code_focus: bool,
+    novelty_scores: Mapping[int, float],
+    significant_candidate_indices: set[int],
+    prioritized_indices: list[int],
+    selected_indices: list[int],
+    token_lens: list[int],
+    feedback_min_tokens: int,
+    feedback_fallback_min: int,
+) -> list[dict[str, object]]:
+    if not new_chunks:
+        return []
+
+    prioritized_rank = {idx: rank + 1 for rank, idx in enumerate(prioritized_indices)}
+    selected_rank = {idx: rank + 1 for rank, idx in enumerate(selected_indices)}
+    selected_set = set(selected_indices)
+    significant_set = set(significant_candidate_indices)
+    entries: list[dict[str, object]] = []
+    for idx, chunk in enumerate(new_chunks):
+        token_count = token_lens[idx] if idx < len(token_lens) else count_tokens(chunk)
+        metadata_chunk = code_focus and _is_snapshot_metadata_chunk(chunk)
+        token_eligible = token_count >= feedback_min_tokens if feedback_min_tokens > 0 else True
+        fallback_eligible = token_count >= feedback_fallback_min if feedback_fallback_min > 0 else True
+        entry = {
+            "chunk_index": idx,
+            "path": _extract_snapshot_file_path(chunk),
+            "token_count": token_count,
+            "token_eligible": token_eligible,
+            "fallback_eligible": fallback_eligible,
+            "significant_edit": idx in significant_set,
+            "prioritized_rank": prioritized_rank.get(idx),
+            "selected_rank": selected_rank.get(idx),
+            "selection_status": "selected" if idx in selected_set else "candidate" if idx in prioritized_rank else "filtered",
+            "skip_reason": None,
+        }
+        entry.update(_chunk_relevance_features(chunk, idx, code_focus, novelty_scores.get(idx, 1.0)))
+        if idx in selected_set:
+            pass
+        elif metadata_chunk:
+            entry["skip_reason"] = "metadata_chunk"
+        elif idx not in significant_set:
+            entry["skip_reason"] = "below_significance_threshold"
+        elif feedback_min_tokens > 0 and not token_eligible:
+            entry["skip_reason"] = "below_min_tokens"
+        elif idx in prioritized_rank:
+            entry["skip_reason"] = "priority_cutoff"
+        else:
+            entry["skip_reason"] = "not_prioritized"
+        entries.append(entry)
+
+    entries.sort(
+        key=lambda item: (
+            {"selected": 0, "candidate": 1, "filtered": 2}.get(str(item.get("selection_status") or ""), 3),
+            int(item.get("selected_rank") or item.get("prioritized_rank") or 10**9),
+            -float(item.get("relevance_score") or 0.0),
+        )
+    )
+    trace_max = _reference_source_trace_max_candidates()
+    if trace_max > 0:
+        return entries[:trace_max]
+    return entries
 
 
 def _chunk_redundancy_score(left: str, right: str, code_focus: bool) -> float:
@@ -1173,7 +1466,7 @@ def _rerank_reference_chunks(
     if not candidates:
         return []
 
-    trim_limit = max(candidate_limit, min(len(candidates), candidate_limit * 2))
+    trim_limit = _reference_trim_limit(code_focus, candidate_limit, len(candidates))
     trimmed = candidates[:trim_limit]
     if not code_focus:
         return trimmed[:final_limit]
@@ -1316,12 +1609,16 @@ def _rerank_reference_chunks(
             diversity_penalty = 0.0
             if selected_tokens:
                 diversity_penalty = max(_token_overlap_ratio(candidate_tokens, prev) for prev in selected_tokens)
-            source_penalty = 0.75 * float(source_counts.get(source_key, 0))
+            source_penalty = _reference_source_penalty_weight() * float(source_counts.get(source_key, 0))
             preselection_score = float(feature_row.get("preselection_score") or 0.0)
             adjudicator_score = float(feature_row.get("adjudicator_score") or 0.0)
             adjudicator_kind = str(feature_row.get("adjudicator_kind") or "")
             candidate_is_doc_like = _is_doc_like_path(str(feature_row.get("candidate_path") or ""))
-            diversity_multiplier = 1.35 if reranker_enabled else 2.2
+            diversity_multiplier = (
+                _reference_reranker_diversity_penalty()
+                if reranker_enabled
+                else _reference_heuristic_diversity_penalty()
+            )
             if adjudicator_kind in {"docs-vs-impl mismatch", "route/path mismatch", "value mismatch", "rename", "presence/absence"}:
                 score = (
                     _reference_adjudicator_mismatch_preselection_weight() * preselection_score
@@ -1401,16 +1698,16 @@ def _reference_hybrid_score(feature_row: Mapping[str, object]) -> float:
     anchor_conflict = float(feature_row.get("anchor_conflict") or 0.0)
     combined_signal = float(feature_row.get("combined_signal") or 0.0)
     return (
-        (22.0 * vector_rrf)
-        + (30.0 * lexical_rrf)
-        + (36.0 * anchor_rrf)
-        + (0.12 * lexical_score)
-        + (0.10 * path_theme_score)
-        + (0.08 * path_score)
-        + (0.18 * artifact_score)
-        + (0.34 * anchor_overlap)
-        + (0.42 * anchor_conflict)
-        + (0.05 * combined_signal)
+        (_reference_hybrid_vector_rank_weight() * vector_rrf)
+        + (_reference_hybrid_lexical_rank_weight() * lexical_rrf)
+        + (_reference_hybrid_anchor_rank_weight() * anchor_rrf)
+        + (_reference_hybrid_lexical_signal_weight() * lexical_score)
+        + (_reference_hybrid_path_theme_weight() * path_theme_score)
+        + (_reference_hybrid_path_weight() * path_score)
+        + (_reference_hybrid_artifact_weight() * artifact_score)
+        + (_reference_hybrid_anchor_overlap_weight() * anchor_overlap)
+        + (_reference_hybrid_anchor_conflict_weight() * anchor_conflict)
+        + (_reference_hybrid_combined_signal_weight() * combined_signal)
     )
 
 
@@ -1436,20 +1733,20 @@ def _reference_heuristic_score(
     metadata_bonus = 0.0
     candidate_is_doc_like = _is_doc_like_path(candidate_path)
     if target_is_doc_like and candidate_is_doc_like:
-        doc_bonus = 0.75
+        doc_bonus = _reference_heuristic_docdoc_bonus()
     elif target_is_doc_like != candidate_is_doc_like and (anchor_overlap > 0.0 or anchor_conflict > 0.0):
-        doc_bonus = 0.55
+        doc_bonus = _reference_heuristic_doccode_bonus()
     if _is_high_signal_metadata_path(target_path) and _is_high_signal_metadata_path(candidate_path):
-        metadata_bonus = 0.85
+        metadata_bonus = _reference_heuristic_metadata_bonus()
     return (
-        (base_score * 3.0)
-        + (lexical_score * 4.0)
-        + (path_theme_score * 2.0)
-        + artifact_score
-        + (anchor_overlap * 3.5)
-        + (anchor_conflict * 4.0)
-        + path_score
-        + code_bonus
+        (base_score * _reference_heuristic_base_rank_weight())
+        + (lexical_score * _reference_heuristic_lexical_weight())
+        + (path_theme_score * _reference_heuristic_path_theme_weight())
+        + (_reference_heuristic_artifact_weight() * artifact_score)
+        + (_reference_heuristic_anchor_overlap_weight() * anchor_overlap)
+        + (_reference_heuristic_anchor_conflict_weight() * anchor_conflict)
+        + (_reference_heuristic_path_weight() * path_score)
+        + (_reference_heuristic_code_bonus() * (1.0 if code_bonus > 0.0 else 0.0))
         + doc_bonus
         + metadata_bonus
     )
@@ -1704,6 +2001,9 @@ def process_document(
 
     prioritized_chunk_indices: list[int] = []
     code_focus = False
+    novelty_scores_by_new_index: dict[int, float] = {}
+    significance_threshold = _source_significance_threshold()
+    significant_new_chunk_indices: set[int] = set()
     if generate_feedback:
         code_focus = is_code_review_document(doc, chunk_mode)
         meaningful_new_chunk_count = len(
@@ -1713,9 +2013,16 @@ def process_document(
                 if not (code_focus and _is_snapshot_metadata_chunk(chunk))
             ]
         )
+        novelty_scores_by_new_index = _new_chunk_novelty_scores(prev_chunks, new_chunks)
+        significant_new_chunk_indices = {
+            idx
+            for idx, novelty in novelty_scores_by_new_index.items()
+            if idx < len(new_chunks) and (1.0 - novelty) < significance_threshold
+        }
         prioritized_chunk_indices = detect_significant_edits(
             prev_chunks=prev_chunks,
             new_chunks=new_chunks,
+            threshold=significance_threshold,
             code_focus=code_focus,
         )
         if code_focus:
@@ -1823,6 +2130,36 @@ def process_document(
             selected_existing_chunks=len(existing_indices_to_generate_feedback),
             reanalyze_existing=reanalyze_existing,
         )
+        if _reference_source_trace_enabled():
+            log_event(
+                "feedback_source_trace",
+                document_id=doc.document_id,
+                code_focus=code_focus,
+                total_chunks=len(chunks),
+                new_chunks=len(new_chunks),
+                meaningful_new_chunks=meaningful_new_chunk_count,
+                prioritized_new_chunks=len(prioritized_chunk_indices),
+                selected_new_chunks=len(indices_to_generate_feedback),
+                available_existing_candidates=available_existing_candidate_count,
+                selected_existing_chunks=len(existing_indices_to_generate_feedback),
+                reanalyze_existing=reanalyze_existing,
+                recent_feedback_count=recent_feedback_count,
+                feedback_limit=feedback_limit,
+                feedback_min_tokens=feedback_min_tokens,
+                feedback_fallback_min_tokens=feedback_fallback_min,
+                significance_threshold=round(significance_threshold, 6),
+                candidates=_source_trace_entries(
+                    new_chunks=new_chunks,
+                    code_focus=code_focus,
+                    novelty_scores=novelty_scores_by_new_index,
+                    significant_candidate_indices=significant_new_chunk_indices,
+                    prioritized_indices=prioritized_chunk_indices,
+                    selected_indices=indices_to_generate_feedback,
+                    token_lens=token_lens,
+                    feedback_min_tokens=feedback_min_tokens,
+                    feedback_fallback_min=feedback_fallback_min,
+                ),
+            )
         if (
             code_focus
             and available_existing_candidate_count > 0
@@ -1903,23 +2240,19 @@ def detect_significant_edits(
 ) -> list[int]:
     if not new_chunks:
         return []
+    novelty_scores = _new_chunk_novelty_scores(prev_chunks, new_chunks)
     if not prev_chunks:
-        novelty_scores = {i: 1.0 for i in range(len(new_chunks))}
         return prioritize_chunks(
             list(range(len(new_chunks))),
             new_chunks,
             code_focus=code_focus,
             novelty_scores=novelty_scores,
         )
-    candidate_indices: list[int] = []
-    novelty_scores: dict[int, float] = {}
-    for idx, new_chunk in enumerate(new_chunks):
-        if new_chunk in prev_chunks:
-            continue
-        best_match = max((Levenshtein.ratio(new_chunk, prev_chunk) for prev_chunk in prev_chunks), default=0.0)
-        novelty_scores[idx] = max(0.0, 1.0 - best_match)
-        if best_match < threshold:
-            candidate_indices.append(idx)
+    candidate_indices = [
+        idx
+        for idx, novelty in novelty_scores.items()
+        if (1.0 - novelty) < threshold
+    ]
     return prioritize_chunks(
         candidate_indices,
         new_chunks,
@@ -1965,13 +2298,13 @@ def prioritize_chunks(
                     _chunk_redundancy_score(chunks[idx], chunks[chosen_idx], code_focus)
                     for chosen_idx in selected
                 )
-            score = relevance - (2.6 * redundancy)
+            score = relevance - (_source_redundancy_penalty() * redundancy)
             if best_idx < 0 or score > best_score:
                 best_idx = idx
                 best_score = score
         if best_idx < 0:
             break
-        if selected and best_score < 1.8:
+        if selected and best_score < _source_min_selection_score():
             break
         selected.append(best_idx)
         remaining = [idx for idx in remaining if idx != best_idx]
@@ -2263,10 +2596,8 @@ def process_text(
         if query_vector is None and query_text:
             query_vector = create_embedding(embedder, query_text, user=user)
         candidate_limit, _, _ = _reference_selection_config(code_focus)
-        merge_limit = max(candidate_limit * 3, 24 if code_focus else candidate_limit * 2)
-        vector_fetch_limit = candidate_limit
-        if code_focus:
-            vector_fetch_limit = max(candidate_limit * 6, merge_limit)
+        merge_limit = _reference_merge_limit(code_focus, candidate_limit)
+        vector_fetch_limit = _reference_vector_fetch_limit(code_focus, candidate_limit, merge_limit)
 
         if query_vector is not None:
             lexical_candidates: list[Chunk] = []

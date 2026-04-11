@@ -680,6 +680,43 @@ class MainRetrievalTests(unittest.TestCase):
 
         self.assertEqual(selected[:2], [2, 1])
 
+    def test_source_trace_entries_capture_selected_and_filtered_reasons(self) -> None:
+        chunks = [
+            (
+                "### File: docs/overview.md\n"
+                "Compair keeps teams aligned across projects.\n"
+            ),
+            (
+                "### File: docs/user-guide.md\n"
+                "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development.\n"
+                "Core logs verification emails to stdout.\n"
+            ),
+            (
+                "### File: LICENSE\n"
+                "GNU GENERAL PUBLIC LICENSE\n"
+            ),
+        ]
+
+        entries = main._source_trace_entries(
+            new_chunks=chunks,
+            code_focus=True,
+            novelty_scores={0: 0.2, 1: 0.95, 2: 0.9},
+            significant_candidate_indices={1, 2},
+            prioritized_indices=[1, 2],
+            selected_indices=[1],
+            token_lens=[40, 180, 90],
+            feedback_min_tokens=100,
+            feedback_fallback_min=20,
+        )
+
+        by_path = {str(entry.get("path")): entry for entry in entries}
+        self.assertEqual(by_path["docs/user-guide.md"]["selection_status"], "selected")
+        self.assertEqual(by_path["docs/user-guide.md"]["selected_rank"], 1)
+        self.assertEqual(by_path["LICENSE"]["selection_status"], "candidate")
+        self.assertEqual(by_path["LICENSE"]["skip_reason"], "below_min_tokens")
+        self.assertEqual(by_path["docs/overview.md"]["selection_status"], "filtered")
+        self.assertEqual(by_path["docs/overview.md"]["skip_reason"], "below_significance_threshold")
+
 
 if __name__ == "__main__":
     unittest.main()
