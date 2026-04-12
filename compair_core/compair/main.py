@@ -572,6 +572,30 @@ def _reference_vector_fetch_limit(code_focus: bool, candidate_limit: int, merge_
     return max(candidate_limit, value)
 
 
+def _reference_multi_query_enabled() -> bool:
+    return _bool_env("COMPAIR_REFERENCE_MULTI_QUERY_ENABLED", True)
+
+
+def _reference_anchor_query_enabled() -> bool:
+    return _bool_env("COMPAIR_REFERENCE_ANCHOR_QUERY_ENABLED", True)
+
+
+def _reference_adaptive_fetch_enabled() -> bool:
+    return _bool_env("COMPAIR_REFERENCE_ADAPTIVE_FETCH_ENABLED", True)
+
+
+def _reference_behavioral_doc_fetch_multiplier() -> float:
+    return _float_env("COMPAIR_REFERENCE_BEHAVIORAL_DOC_FETCH_MULTIPLIER", 1.75, minimum=1.0, maximum=4.0)
+
+
+def _reference_metadata_fetch_multiplier() -> float:
+    return _float_env("COMPAIR_REFERENCE_METADATA_FETCH_MULTIPLIER", 2.0, minimum=1.0, maximum=4.0)
+
+
+def _reference_structured_fetch_multiplier() -> float:
+    return _float_env("COMPAIR_REFERENCE_STRUCTURED_FETCH_MULTIPLIER", 1.5, minimum=1.0, maximum=4.0)
+
+
 @lru_cache(maxsize=1)
 def _reference_reranker_state() -> tuple[dict[str, Any] | None, str | None]:
     if not _reference_reranker_enabled():
@@ -1343,6 +1367,27 @@ def _merge_reference_candidates(
     return merged
 
 
+def _interleave_reference_candidates(*candidate_sets: list[Chunk], limit: int) -> list[Chunk]:
+    if limit <= 0:
+        return []
+    merged: list[Chunk] = []
+    seen: set[str] = set()
+    max_len = max((len(items) for items in candidate_sets), default=0)
+    for idx in range(max_len):
+        for items in candidate_sets:
+            if idx >= len(items):
+                continue
+            candidate = items[idx]
+            key = _reference_chunk_key(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(candidate)
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
 def _lexical_reference_candidates(
     target_text: str,
     candidates: list[Chunk],
@@ -1672,6 +1717,105 @@ def _reference_query_text(text: str, focus_text: str, change_context: str, *, co
     if (focus_tokens * 4) > (target_tokens * 3) and (len(query) * 4) > (len(target) * 3):
         return text
     return query
+
+
+@lru_cache(maxsize=2048)
+def _reference_anchor_query_text(text: str) -> str:
+    chunk = (text or "").strip()
+    if not chunk or _is_snapshot_metadata_chunk(chunk):
+        return ""
+
+    path = _extract_snapshot_file_path(chunk)
+    profile = _reference_anchor_profile(chunk)
+    artifacts = extract_artifacts(chunk)
+    lines: list[str] = []
+    if path:
+        lines.append(f"### File: {path}")
+    for endpoint in sorted(profile.endpoint_pairs)[:4]:
+        lines.append(endpoint)
+    for endpoint_path in sorted(profile.endpoint_paths)[:4]:
+        lines.append(endpoint_path)
+    for env_var in sorted(profile.env_vars)[:6]:
+        lines.append(env_var)
+    for license_term in sorted(profile.license_terms)[:4]:
+        lines.append(license_term)
+    for key_name in sorted(profile.key_names)[:8]:
+        lines.append(key_name)
+    for quoted in sorted(profile.quoted_norm):
+        if 2 <= len(quoted) <= 64:
+            lines.append(quoted)
+        if len(lines) >= 24:
+            break
+    for assignment in list(artifacts.assignments)[:4]:
+        key = (assignment.key or "").strip()
+        value = (assignment.normalized_value or "").strip()
+        if not key:
+            continue
+        if value:
+            lines.append(f"{key}={value}")
+        else:
+            lines.append(key)
+
+    deduped_lines: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        normalized = line.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped_lines.append(normalized)
+    anchor_query = "\n".join(deduped_lines).strip()
+    if count_tokens(anchor_query) < 3:
+        return ""
+    if anchor_query == chunk:
+        return ""
+    return anchor_query[:1200]
+
+
+def _reference_query_variants(text: str, focus_text: str, change_context: str, *, code_focus: bool) -> list[tuple[str, str]]:
+    primary = _reference_query_text(text, focus_text, change_context, code_focus=code_focus)
+    variants: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add_variant(name: str, value: str) -> None:
+        normalized = (value or "").strip()
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        variants.append((name, normalized))
+
+    add_variant("primary", primary or text)
+    if not code_focus or not _reference_multi_query_enabled():
+        return variants
+
+    target = (text or "").strip()
+    if target and target != variants[0][1]:
+        add_variant("full", target)
+    if _reference_anchor_query_enabled():
+        add_variant("anchor", _reference_anchor_query_text(text))
+    return variants
+
+
+def _reference_effective_vector_fetch_limit(
+    target_text: str,
+    *,
+    code_focus: bool,
+    candidate_limit: int,
+    merge_limit: int,
+) -> int:
+    base_limit = _reference_vector_fetch_limit(code_focus, candidate_limit, merge_limit)
+    if not code_focus or not _reference_adaptive_fetch_enabled():
+        return base_limit
+
+    multiplier = 1.0
+    target_path = _extract_snapshot_file_path(target_text)
+    if _is_high_signal_metadata_path(target_path):
+        multiplier = max(multiplier, _reference_metadata_fetch_multiplier())
+    if _behavioral_doc_signal_score(target_text) > 0.0:
+        multiplier = max(multiplier, _reference_behavioral_doc_fetch_multiplier())
+    if _structured_source_signal_score(target_text, code_focus=True) >= 1.5:
+        multiplier = max(multiplier, _reference_structured_fetch_multiplier())
+    return max(base_limit, int(round(float(base_limit) * multiplier)))
 
 
 def _reference_rrf(rank: Any, *, k: int) -> float:
@@ -2591,15 +2735,29 @@ def process_text(
         target_embedding = existing_chunk.embedding
         code_focus = _is_code_review_chunk(doc, text)
         allow_same_document = _allow_same_document_feedback(user)
-        query_text = _reference_query_text(text, focus_text, change_context, code_focus=code_focus)
-        query_vector = query_embedding or target_embedding
-        if query_vector is None and query_text:
-            query_vector = create_embedding(embedder, query_text, user=user)
+        query_variants = _reference_query_variants(text, focus_text, change_context, code_focus=code_focus)
+        query_text = query_variants[0][1] if query_variants else text
+        query_vectors: list[tuple[str, list[float]]] = []
+        for variant_name, variant_text in query_variants:
+            vector: list[float] | None = None
+            if variant_text == text:
+                vector = target_embedding
+            elif variant_name == "primary" and query_embedding is not None:
+                vector = query_embedding
+            if vector is None and variant_text:
+                vector = create_embedding(embedder, variant_text, user=user)
+            if vector is not None:
+                query_vectors.append((variant_name, vector))
         candidate_limit, _, _ = _reference_selection_config(code_focus)
         merge_limit = _reference_merge_limit(code_focus, candidate_limit)
-        vector_fetch_limit = _reference_vector_fetch_limit(code_focus, candidate_limit, merge_limit)
+        vector_fetch_limit = _reference_effective_vector_fetch_limit(
+            text,
+            code_focus=code_focus,
+            candidate_limit=candidate_limit,
+            merge_limit=merge_limit,
+        )
 
-        if query_vector is not None:
+        if query_vectors:
             lexical_candidates: list[Chunk] = []
             anchor_candidates: list[Chunk] = []
             candidate_count = 0
@@ -2639,15 +2797,21 @@ def process_text(
             if base_query is None:
                 candidates = []
             elif VECTOR_BACKEND == "pgvector":
-                candidates = (
-                    base_query.order_by(
-                        Chunk.embedding.cosine_distance(query_vector)
+                vector_candidate_sets: list[list[Chunk]] = []
+                for _, query_vector in query_vectors:
+                    vector_candidate_sets.append(
+                        base_query.order_by(
+                            Chunk.embedding.cosine_distance(query_vector)
+                        )
+                        .limit(vector_fetch_limit)
+                        .all()
                     )
-                    .limit(vector_fetch_limit)
-                    .all()
+                raw_vector_candidates = _interleave_reference_candidates(
+                    *vector_candidate_sets,
+                    limit=max(vector_fetch_limit * max(1, len(vector_candidate_sets)), vector_fetch_limit),
                 )
-                raw_vector_candidates = list(candidates)
-                raw_candidate_count = len(candidates)
+                candidates = list(raw_vector_candidates)
+                raw_candidate_count = len(raw_vector_candidates)
                 if code_focus:
                     all_candidates = base_query.all()
                     raw_all_candidates = list(all_candidates)
@@ -2658,11 +2822,18 @@ def process_text(
                 raw_candidate_count = len(all_candidates)
                 scored: list[tuple[float, Chunk]] = []
                 for candidate in all_candidates:
-                    score = cosine_similarity(candidate.embedding, query_vector)
-                    if score is not None:
-                        scored.append((score, candidate))
+                    best_score: float | None = None
+                    for _, query_vector in query_vectors:
+                        score = cosine_similarity(candidate.embedding, query_vector)
+                        if score is None:
+                            continue
+                        if best_score is None or score > best_score:
+                            best_score = score
+                    if best_score is not None:
+                        scored.append((best_score, candidate))
                 scored.sort(key=lambda item: item[0], reverse=True)
-                candidates = [chunk for _, chunk in scored[:vector_fetch_limit]]
+                vector_limit = max(vector_fetch_limit, vector_fetch_limit * max(1, len(query_vectors)))
+                candidates = [chunk for _, chunk in scored[:vector_limit]]
                 raw_vector_candidates = list(candidates)
             if not raw_all_candidates:
                 raw_all_candidates = list(all_candidates or candidates)
@@ -2697,8 +2868,12 @@ def process_text(
                     limit=candidate_limit * 2,
                     code_focus=True,
                 )
-                candidates = _merge_reference_candidates(candidates, lexical_candidates, merge_limit)
-                candidates = _merge_reference_candidates(candidates, anchor_candidates, merge_limit)
+                candidates = _interleave_reference_candidates(
+                    candidates,
+                    anchor_candidates,
+                    lexical_candidates,
+                    limit=merge_limit,
+                )
             rerank_debug: dict[str, Any] = {}
             references = _rerank_reference_chunks(
                 query_text,
@@ -2724,6 +2899,9 @@ def process_text(
                     candidate_count=candidate_count,
                     lexical_candidate_count=len(lexical_candidates),
                     anchor_candidate_count=len(anchor_candidates),
+                    query_variant_count=len(query_vectors),
+                    query_variant_names=[name for name, _ in query_vectors],
+                    vector_fetch_limit=vector_fetch_limit,
                     selected_reference_count=len(references),
                     hybrid_enabled=bool(rerank_debug.get("hybrid_enabled")),
                     reranker_enabled=bool(rerank_debug.get("reranker_enabled")),
@@ -2758,6 +2936,9 @@ def process_text(
                     candidate_count=candidate_count,
                     lexical_candidate_count=len(lexical_candidates),
                     anchor_candidate_count=len(anchor_candidates),
+                    query_variant_count=len(query_vectors),
+                    query_variant_names=[name for name, _ in query_vectors],
+                    vector_fetch_limit=vector_fetch_limit,
                     hybrid_enabled=bool(rerank_debug.get("hybrid_enabled")),
                     reranker_enabled=bool(rerank_debug.get("reranker_enabled")),
                     reranker_model_version=rerank_debug.get("reranker_model_version"),
@@ -2782,6 +2963,9 @@ def process_text(
                     candidate_count=candidate_count,
                     lexical_candidate_count=len(lexical_candidates),
                     anchor_candidate_count=len(anchor_candidates),
+                    query_variant_count=len(query_vectors),
+                    query_variant_names=[name for name, _ in query_vectors],
+                    vector_fetch_limit=vector_fetch_limit,
                     selected_reference_count=len(references),
                     hybrid_enabled=bool(rerank_debug.get("hybrid_enabled")),
                     reranker_enabled=bool(rerank_debug.get("reranker_enabled")),

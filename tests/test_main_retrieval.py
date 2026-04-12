@@ -319,6 +319,73 @@ class MainRetrievalTests(unittest.TestCase):
             change_context,
         )
 
+    def test_reference_query_variants_include_full_and_anchor_for_behavioral_docs(self) -> None:
+        full_chunk = (
+            "### File: docs/user-guide.md\n"
+            "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development.\n"
+            "Core uses the configured backend to send verification emails.\n"
+            "The API returns delivery status from `GET /notification_events`.\n"
+        )
+        focus_text = "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development."
+
+        variants = main._reference_query_variants(full_chunk, focus_text, "", code_focus=True)
+
+        names = [name for name, _ in variants]
+        variant_map = {name: text for name, text in variants}
+        self.assertEqual(names[0], "primary")
+        self.assertIn("full", names)
+        self.assertIn("anchor", names)
+        self.assertIn("COMPAIR_EMAIL_BACKEND", variant_map["anchor"])
+        self.assertIn("/notification_events", variant_map["anchor"])
+
+    def test_reference_effective_vector_fetch_limit_boosts_behavioral_docs_and_metadata(self) -> None:
+        candidate_limit = 10
+        merge_limit = 30
+        base_limit = main._reference_vector_fetch_limit(True, candidate_limit, merge_limit)
+        behavioral_doc = (
+            "### File: docs/user-guide.md\n"
+            "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development.\n"
+            "Core uses the configured backend to send verification emails.\n"
+        )
+        metadata_chunk = (
+            "### File: pyproject.toml\n"
+            'name = "compair-core"\n'
+            'license = { text = "MIT" }\n'
+        )
+
+        boosted_doc = main._reference_effective_vector_fetch_limit(
+            behavioral_doc,
+            code_focus=True,
+            candidate_limit=candidate_limit,
+            merge_limit=merge_limit,
+        )
+        boosted_metadata = main._reference_effective_vector_fetch_limit(
+            metadata_chunk,
+            code_focus=True,
+            candidate_limit=candidate_limit,
+            merge_limit=merge_limit,
+        )
+
+        self.assertGreater(boosted_doc, base_limit)
+        self.assertGreater(boosted_metadata, base_limit)
+
+    def test_interleave_reference_candidates_preserves_lane_diversity(self) -> None:
+        vector = [
+            DummyChunk(document_id="vector-1", chunk_id="vector-1", content="### File: docs/a.md\nA\n"),
+            DummyChunk(document_id="vector-2", chunk_id="vector-2", content="### File: docs/b.md\nB\n"),
+            DummyChunk(document_id="vector-3", chunk_id="vector-3", content="### File: docs/c.md\nC\n"),
+        ]
+        anchor = [
+            DummyChunk(document_id="anchor-1", chunk_id="anchor-1", content="### File: api.py\nroute\n"),
+        ]
+        lexical = [
+            DummyChunk(document_id="lexical-1", chunk_id="lexical-1", content="### File: readme.md\nreadme\n"),
+        ]
+
+        merged = main._interleave_reference_candidates(vector, anchor, lexical, limit=4)
+
+        self.assertEqual([chunk.document_id for chunk in merged], ["vector-1", "anchor-1", "lexical-1", "vector-2"])
+
     def test_change_context_for_chunk_captures_before_and_after_lines(self) -> None:
         prev_chunks = [
             "### File: docs/api_mapping.md\n"
