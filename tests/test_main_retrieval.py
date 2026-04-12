@@ -614,6 +614,35 @@ class MainRetrievalTests(unittest.TestCase):
         self.assertEqual(payload["adjudicator_kind"], "value mismatch")
         self.assertGreater(float(payload["adjudicator_score"]), 0.0)
 
+    def test_reference_counterpart_candidates_prioritize_manifest_license_pair(self) -> None:
+        target = (
+            "### File: pyproject.toml\n"
+            'name = "compair-core"\n'
+            'license = { text = "MIT" }\n'
+        )
+        candidates = [
+            DummyChunk(
+                document_id="manifest-peer",
+                content=(
+                    "### File: package.json\n"
+                    '{\n  "name": "compair-ui",\n  "version": "0.1.0"\n}\n'
+                ),
+            ),
+            DummyChunk(
+                document_id="license-peer",
+                content=(
+                    "### File: LICENSE\n"
+                    "GNU GENERAL PUBLIC LICENSE\n"
+                    "Version 3, 29 June 2007\n"
+                ),
+            ),
+        ]
+
+        ranked = main._reference_counterpart_candidates(target, candidates, limit=2, code_focus=True)
+
+        self.assertEqual(len(ranked), 2)
+        self.assertEqual(ranked[0].document_id, "license-peer")
+
     def test_rerank_reference_chunks_promote_docs_to_impl_pair_with_adjudicator(self) -> None:
         target = (
             "### File: README.md\n"

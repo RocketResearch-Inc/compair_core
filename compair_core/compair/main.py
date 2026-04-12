@@ -14,8 +14,8 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm.attributes import get_history
 from sqlalchemy.orm import Session as SASession
 
+from . import feedback as feedback_module
 from .embeddings import create_embedding, create_embeddings, Embedder
-from .feedback import get_feedback, Reviewer, split_feedback_items
 from .logger import log_event
 from .local_summary import ReferenceText, best_reference_match, extract_artifacts
 from .models import (
@@ -37,6 +37,11 @@ from .utils import (
     log_activity,
     stable_chunk_hash,
 )
+
+get_feedback = feedback_module.get_feedback
+Reviewer = feedback_module.Reviewer
+split_feedback_items = feedback_module.split_feedback_items
+generate_now_review = getattr(feedback_module, "review_documents_now", None)
 
 
 _CODE_REPO_DOC_TYPE = "code-repo"
@@ -396,6 +401,10 @@ def _reference_hybrid_anchor_rank_weight() -> float:
     return _float_env("COMPAIR_REFERENCE_HYBRID_ANCHOR_RANK_WEIGHT", 36.0, minimum=0.0, maximum=100.0)
 
 
+def _reference_hybrid_counterpart_rank_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HYBRID_COUNTERPART_RANK_WEIGHT", 28.0, minimum=0.0, maximum=100.0)
+
+
 def _reference_hybrid_lexical_signal_weight() -> float:
     return _float_env("COMPAIR_REFERENCE_HYBRID_LEXICAL_SIGNAL_WEIGHT", 0.12, minimum=0.0, maximum=5.0)
 
@@ -422,6 +431,10 @@ def _reference_hybrid_anchor_conflict_weight() -> float:
 
 def _reference_hybrid_combined_signal_weight() -> float:
     return _float_env("COMPAIR_REFERENCE_HYBRID_COMBINED_SIGNAL_WEIGHT", 0.05, minimum=0.0, maximum=5.0)
+
+
+def _reference_hybrid_counterpart_signal_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HYBRID_COUNTERPART_SIGNAL_WEIGHT", 0.28, minimum=0.0, maximum=6.0)
 
 
 def _reference_hybrid_reranker_blend() -> float:
@@ -474,6 +487,10 @@ def _reference_heuristic_doccode_bonus() -> float:
 
 def _reference_heuristic_metadata_bonus() -> float:
     return _float_env("COMPAIR_REFERENCE_HEURISTIC_METADATA_BONUS", 0.85, minimum=0.0, maximum=4.0)
+
+
+def _reference_heuristic_counterpart_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HEURISTIC_COUNTERPART_WEIGHT", 1.6, minimum=0.0, maximum=6.0)
 
 
 def _reference_adjudicator_preselection_boost() -> float:
@@ -1614,6 +1631,66 @@ def _anchor_reference_candidates(
     return [candidate for _, _, candidate in scored[:limit]]
 
 
+def _reference_counterpart_candidates(
+    target_text: str,
+    candidates: list[Chunk],
+    *,
+    limit: int,
+    code_focus: bool,
+) -> list[Chunk]:
+    if not candidates or limit <= 0 or not code_focus:
+        return []
+
+    target_path = _extract_snapshot_file_path(target_text)
+    target_is_doc_like = _is_doc_like_path(target_path)
+    target_is_metadata = _is_high_signal_metadata_path(target_path)
+    scored: list[tuple[float, int, Chunk]] = []
+    for idx, candidate in enumerate(candidates):
+        if getattr(candidate, "chunk_type", "") != "document":
+            continue
+        content = getattr(candidate, "content", "") or ""
+        if not content or _is_snapshot_metadata_chunk(content):
+            continue
+
+        candidate_path = _extract_snapshot_file_path(content)
+        candidate_is_doc_like = _is_doc_like_path(candidate_path)
+        candidate_is_metadata = _is_high_signal_metadata_path(candidate_path)
+        counterpart_signal = _reference_counterpart_signal(target_text, content)
+        if counterpart_signal <= 0.0:
+            continue
+
+        anchor_overlap = _reference_anchor_overlap_score(target_text, content)
+        anchor_conflict = _reference_anchor_conflict_score(target_text, content)
+        artifact_score = min(_artifact_overlap_score(target_text, content), 4.0)
+        path_theme_score = _token_overlap_ratio(_identifier_tokens(target_text, limit=96), _path_token_set(candidate_path))
+        cross_surface = target_is_doc_like != candidate_is_doc_like
+        metadata_counterpart = target_is_metadata != candidate_is_metadata and (target_is_metadata or candidate_is_metadata)
+        ui_api_counterpart = (
+            (_is_ui_surface_path(target_path) and _is_api_surface_path(candidate_path))
+            or (_is_ui_surface_path(candidate_path) and _is_api_surface_path(target_path))
+        )
+
+        score = (counterpart_signal * 4.0) + (anchor_conflict * 1.1) + (anchor_overlap * 0.7)
+        score += min(1.2, path_theme_score * 2.0)
+        score += min(1.4, artifact_score * 0.35)
+        if cross_surface:
+            score += 0.9
+        elif target_is_doc_like and candidate_is_doc_like:
+            score -= 0.85
+        if metadata_counterpart:
+            score += 1.35
+        if ui_api_counterpart:
+            score += 1.1
+        if not cross_surface and not metadata_counterpart and not ui_api_counterpart:
+            score -= 0.35
+        if score <= 0.0:
+            continue
+        scored.append((score, idx, candidate))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [candidate for _, _, candidate in scored[:limit]]
+
+
 def _rerank_reference_chunks(
     target_text: str,
     candidates: list[Chunk],
@@ -1624,6 +1701,7 @@ def _rerank_reference_chunks(
     raw_vector_candidates: list[Chunk] | None = None,
     lexical_candidates: list[Chunk] | None = None,
     anchor_candidates: list[Chunk] | None = None,
+    counterpart_candidates: list[Chunk] | None = None,
     debug_stats: dict[str, Any] | None = None,
 ) -> list[Chunk]:
     candidate_limit, final_limit, max_per_source = _reference_selection_config(code_focus)
@@ -1649,6 +1727,10 @@ def _rerank_reference_chunks(
     anchor_rank = {
         _reference_chunk_key(chunk): idx + 1
         for idx, chunk in enumerate(anchor_candidates or [])
+    }
+    counterpart_rank = {
+        _reference_chunk_key(chunk): idx + 1
+        for idx, chunk in enumerate(counterpart_candidates or [])
     }
     reranker_enabled, reranker_model_version, reranker_model_path = _reference_reranker_metadata()
     reranker_enabled = code_focus and reranker_enabled
@@ -1676,6 +1758,7 @@ def _rerank_reference_chunks(
             vector_rank=vector_rank,
             lexical_rank=lexical_rank,
             anchor_rank=anchor_rank,
+            counterpart_rank=counterpart_rank,
         )
         row["heuristic_score"] = round(
             _reference_heuristic_score(
@@ -1772,6 +1855,7 @@ def _rerank_reference_chunks(
                     "reranker_score",
                     "heuristic_score",
                     "counterpart_signal",
+                    "counterpart_rank",
                     "preselection_score",
                     "adjudicator_score",
                     "adjudicator_kind",
@@ -1987,23 +2071,27 @@ def _reference_hybrid_score(feature_row: Mapping[str, object]) -> float:
     vector_rrf = _reference_rrf(feature_row.get("vector_rank"), k=k)
     lexical_rrf = _reference_rrf(feature_row.get("lexical_rank"), k=k)
     anchor_rrf = _reference_rrf(feature_row.get("anchor_rank"), k=k)
+    counterpart_rrf = _reference_rrf(feature_row.get("counterpart_rank"), k=k)
     lexical_score = float(feature_row.get("lexical_score") or 0.0)
     path_theme_score = float(feature_row.get("path_theme_score") or 0.0)
     path_score = float(feature_row.get("path_score") or 0.0)
     artifact_score = float(feature_row.get("artifact_score") or 0.0)
     anchor_overlap = float(feature_row.get("anchor_overlap") or 0.0)
     anchor_conflict = float(feature_row.get("anchor_conflict") or 0.0)
+    counterpart_signal = float(feature_row.get("counterpart_signal") or 0.0)
     combined_signal = float(feature_row.get("combined_signal") or 0.0)
     return (
         (_reference_hybrid_vector_rank_weight() * vector_rrf)
         + (_reference_hybrid_lexical_rank_weight() * lexical_rrf)
         + (_reference_hybrid_anchor_rank_weight() * anchor_rrf)
+        + (_reference_hybrid_counterpart_rank_weight() * counterpart_rrf)
         + (_reference_hybrid_lexical_signal_weight() * lexical_score)
         + (_reference_hybrid_path_theme_weight() * path_theme_score)
         + (_reference_hybrid_path_weight() * path_score)
         + (_reference_hybrid_artifact_weight() * artifact_score)
         + (_reference_hybrid_anchor_overlap_weight() * anchor_overlap)
         + (_reference_hybrid_anchor_conflict_weight() * anchor_conflict)
+        + (_reference_hybrid_counterpart_signal_weight() * counterpart_signal)
         + (_reference_hybrid_combined_signal_weight() * combined_signal)
     )
 
@@ -2025,13 +2113,16 @@ def _reference_heuristic_score(
     artifact_score = float(feature_row.get("artifact_score") or 0.0)
     anchor_overlap = float(feature_row.get("anchor_overlap") or 0.0)
     anchor_conflict = float(feature_row.get("anchor_conflict") or 0.0)
+    counterpart_signal = float(feature_row.get("counterpart_signal") or 0.0)
     code_bonus = 0.4 if "```" in candidate_text else 0.0
     doc_bonus = 0.0
     metadata_bonus = 0.0
     candidate_is_doc_like = _is_doc_like_path(candidate_path)
     if target_is_doc_like and candidate_is_doc_like:
         doc_bonus = _reference_heuristic_docdoc_bonus()
-    elif target_is_doc_like != candidate_is_doc_like and (anchor_overlap > 0.0 or anchor_conflict > 0.0):
+    elif target_is_doc_like != candidate_is_doc_like and (
+        anchor_overlap > 0.0 or anchor_conflict > 0.0 or counterpart_signal >= 0.6
+    ):
         doc_bonus = _reference_heuristic_doccode_bonus()
     if _is_high_signal_metadata_path(target_path) and _is_high_signal_metadata_path(candidate_path):
         metadata_bonus = _reference_heuristic_metadata_bonus()
@@ -2043,6 +2134,7 @@ def _reference_heuristic_score(
         + (_reference_heuristic_anchor_overlap_weight() * anchor_overlap)
         + (_reference_heuristic_anchor_conflict_weight() * anchor_conflict)
         + (_reference_heuristic_path_weight() * path_score)
+        + (_reference_heuristic_counterpart_weight() * counterpart_signal)
         + (_reference_heuristic_code_bonus() * (1.0 if code_bonus > 0.0 else 0.0))
         + doc_bonus
         + metadata_bonus
@@ -2139,6 +2231,7 @@ def _reference_candidate_feature_row(
     vector_rank: Mapping[str, int],
     lexical_rank: Mapping[str, int],
     anchor_rank: Mapping[str, int],
+    counterpart_rank: Mapping[str, int],
 ) -> dict[str, object]:
     key = _reference_chunk_key(candidate)
     content = getattr(candidate, "content", "") or ""
@@ -2187,6 +2280,7 @@ def _reference_candidate_feature_row(
         "vector_rank": vector_rank.get(key),
         "lexical_rank": lexical_rank.get(key),
         "anchor_rank": anchor_rank.get(key),
+        "counterpart_rank": counterpart_rank.get(key),
         "lexical_score": round(lexical_score, 4),
         "path_theme_score": round(path_theme_score, 4),
         "path_score": round(path_score, 4),
@@ -2220,6 +2314,7 @@ def _reference_trace_entries(
     code_focus: bool,
     lexical_candidates: list[Chunk],
     anchor_candidates: list[Chunk],
+    counterpart_candidates: list[Chunk],
     selected_references: list[Chunk],
     row_debug: Mapping[str, Mapping[str, object]] | None = None,
 ) -> list[dict[str, object]]:
@@ -2231,6 +2326,7 @@ def _reference_trace_entries(
     vector_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(raw_vector_candidates)}
     lexical_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(lexical_candidates)}
     anchor_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(anchor_candidates)}
+    counterpart_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(counterpart_candidates)}
     selected_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(selected_references)}
 
     def _sort_key(entry: dict[str, object]) -> tuple[int, int, int, float]:
@@ -2239,6 +2335,7 @@ def _reference_trace_entries(
         best_rank = min(
             int(entry.get("selected_rank") or 9999),
             int(entry.get("anchor_rank") or 9999),
+            int(entry.get("counterpart_rank") or 9999),
             int(entry.get("lexical_rank") or 9999),
             int(entry.get("vector_rank") or 9999),
         )
@@ -2265,6 +2362,7 @@ def _reference_trace_entries(
             vector_rank=vector_rank,
             lexical_rank=lexical_rank,
             anchor_rank=anchor_rank,
+            counterpart_rank=counterpart_rank,
         )
         if key in selected_rank:
             selection_status = "selected"
@@ -2283,6 +2381,7 @@ def _reference_trace_entries(
                 "vector_rank": feature_row.get("vector_rank"),
                 "lexical_rank": feature_row.get("lexical_rank"),
                 "anchor_rank": feature_row.get("anchor_rank"),
+                "counterpart_rank": feature_row.get("counterpart_rank"),
                 "selected_rank": selected_rank.get(key),
                 "lexical_score": feature_row.get("lexical_score"),
                 "path_theme_score": feature_row.get("path_theme_score"),
@@ -2963,6 +3062,7 @@ def process_text(
         if query_vectors:
             lexical_candidates: list[Chunk] = []
             anchor_candidates: list[Chunk] = []
+            counterpart_candidates: list[Chunk] = []
             candidate_count = 0
             filtered_counts: dict[str, int] = {}
             raw_candidate_count = 0
@@ -3071,8 +3171,15 @@ def process_text(
                     limit=candidate_limit * 2,
                     code_focus=True,
                 )
+                counterpart_candidates = _reference_counterpart_candidates(
+                    query_text,
+                    all_candidates or [],
+                    limit=max(candidate_limit * 2, candidate_limit + 2),
+                    code_focus=True,
+                )
                 candidates = _interleave_reference_candidates(
                     candidates,
+                    counterpart_candidates,
                     anchor_candidates,
                     lexical_candidates,
                     limit=merge_limit,
@@ -3087,6 +3194,7 @@ def process_text(
                 raw_vector_candidates=raw_vector_candidates,
                 lexical_candidates=lexical_candidates,
                 anchor_candidates=anchor_candidates,
+                counterpart_candidates=counterpart_candidates,
                 debug_stats=rerank_debug,
             )
             if _reference_trace_enabled():
@@ -3102,6 +3210,7 @@ def process_text(
                     candidate_count=candidate_count,
                     lexical_candidate_count=len(lexical_candidates),
                     anchor_candidate_count=len(anchor_candidates),
+                    counterpart_candidate_count=len(counterpart_candidates),
                     query_variant_count=len(query_vectors),
                     query_variant_names=[name for name, _ in query_vectors],
                     vector_fetch_limit=vector_fetch_limit,
@@ -3124,6 +3233,7 @@ def process_text(
                         code_focus=code_focus,
                         lexical_candidates=lexical_candidates,
                         anchor_candidates=anchor_candidates,
+                        counterpart_candidates=counterpart_candidates,
                         selected_references=references,
                         row_debug=rerank_debug.get("row_debug_by_chunk_id"),
                     ),
@@ -3140,6 +3250,7 @@ def process_text(
                     candidate_count=candidate_count,
                     lexical_candidate_count=len(lexical_candidates),
                     anchor_candidate_count=len(anchor_candidates),
+                    counterpart_candidate_count=len(counterpart_candidates),
                     query_variant_count=len(query_vectors),
                     query_variant_names=[name for name, _ in query_vectors],
                     vector_fetch_limit=vector_fetch_limit,
@@ -3168,6 +3279,7 @@ def process_text(
                     candidate_count=candidate_count,
                     lexical_candidate_count=len(lexical_candidates),
                     anchor_candidate_count=len(anchor_candidates),
+                    counterpart_candidate_count=len(counterpart_candidates),
                     query_variant_count=len(query_vectors),
                     query_variant_names=[name for name, _ in query_vectors],
                     vector_fetch_limit=vector_fetch_limit,
@@ -3346,3 +3458,27 @@ def get_all_chunks_for_document(session: SASession, doc: Document) -> list[Chunk
                     session.commit()
                 note_chunks.append(existing)
     return doc_chunks + note_chunks
+
+
+def review_documents_now(
+    user: User,
+    session: SASession,
+    reviewer: Reviewer,
+    documents: list[Document],
+    *,
+    group: Group | None = None,
+    max_findings: int = 12,
+    model_override: str | None = None,
+) -> dict[str, Any]:
+    del session  # Included for parity with other main helpers.
+    if generate_now_review is None:
+        raise RuntimeError("Now review is unavailable in this runtime")
+    group_name = str(getattr(group, "name", "") or getattr(group, "group_id", "") or "Active group")
+    return generate_now_review(
+        reviewer,
+        documents,
+        user,
+        group_name=group_name,
+        max_findings=max_findings,
+        model_override=model_override,
+    )

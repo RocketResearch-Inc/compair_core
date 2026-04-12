@@ -24,6 +24,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import joinedload, Session
 
 from .server.deps import get_analytics, get_billing, get_ocr, get_settings_dependency, get_storage
+from .server.feature_flags import review_now_backend_enabled, review_now_disabled_detail
 from .server.providers.contracts import Analytics, BillingProvider, OCRProvider, StorageProvider
 from .server.settings import Settings
 
@@ -2333,6 +2334,93 @@ async def process_doc(
         except Exception as exc:
             logger.warning("analytics track failed: %s", exc)
     return {"task_id": task_id}
+
+
+@router.post("/review_now")
+def review_now(
+    payload: schema.NowReviewRequest,
+    current_user: models.User = Depends(get_current_user),
+) -> schema.NowReviewResponse:
+    if not review_now_backend_enabled():
+        raise HTTPException(status_code=403, detail=review_now_disabled_detail() or "Now review is disabled.")
+
+    group_id = (payload.group_id or "").strip()
+    if not group_id:
+        raise HTTPException(status_code=422, detail="group_id is required")
+
+    with compair.Session() as session:
+        current_user_db = (
+            session.query(models.User)
+            .options(joinedload(models.User.groups))
+            .filter(models.User.user_id == current_user.user_id)
+            .first()
+        )
+        if current_user_db is None:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        group = (
+            session.query(models.Group)
+            .options(joinedload(models.Group.users))
+            .filter(models.Group.group_id == group_id)
+            .first()
+        )
+        if group is None:
+            raise HTTPException(status_code=404, detail="Group not found")
+
+        is_member = any(member.user_id == current_user_db.user_id for member in (group.users or []))
+        if not is_member and group.visibility != "public":
+            raise HTTPException(status_code=403, detail="User does not belong to the group")
+
+        requested_doc_ids = [doc_id.strip() for doc_id in (payload.document_ids or []) if doc_id and doc_id.strip()]
+        q = (
+            session.query(models.Document)
+            .join(models.Document.groups)
+            .options(joinedload(models.Document.groups), joinedload(models.Document.user))
+            .filter(models.Group.group_id == group_id)
+            .filter(
+                or_(
+                    models.Document.is_published == True,
+                    models.Document.user_id == current_user_db.user_id,
+                )
+            )
+            .order_by(models.Document.datetime_modified.desc(), models.Document.title.asc())
+        )
+        if requested_doc_ids:
+            q = q.filter(models.Document.document_id.in_(requested_doc_ids))
+        documents = q.distinct().all()
+        if requested_doc_ids:
+            by_id = {doc.document_id: doc for doc in documents}
+            documents = [by_id[doc_id] for doc_id in requested_doc_ids if doc_id in by_id]
+        elif any((getattr(doc, "doc_type", "") or "").strip().lower() == "code-repo" for doc in documents):
+            documents = [
+                doc for doc in documents if (getattr(doc, "doc_type", "") or "").strip().lower() == "code-repo"
+            ]
+        if not documents:
+            raise HTTPException(status_code=404, detail="No accessible documents found for now review")
+
+        reviewer = compair.feedback.Reviewer()
+        try:
+            result = compair.main.review_documents_now(
+                current_user_db,
+                session,
+                reviewer,
+                documents,
+                group=group,
+                max_findings=max(1, min(int(payload.max_findings or 12), 12)),
+                model_override=(payload.model or "").strip() or None,
+            )
+        except Exception as exc:
+            logger.warning("review_now failed: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        return schema.NowReviewResponse(
+            group_id=group.group_id,
+            group_name=group.name,
+            document_ids=[doc.document_id for doc in documents],
+            markdown=str(result.get("markdown") or ""),
+            findings=list(result.get("findings") or []),
+            meta=dict(result.get("meta") or {}),
+        )
 
 
 @router.post("/upload/ocr-file")

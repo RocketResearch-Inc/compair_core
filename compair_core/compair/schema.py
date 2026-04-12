@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel
 
@@ -158,3 +158,19 @@ class RemoveMemberRequest(BaseModel):
 
 class LeaveGroupRequest(BaseModel):
     group_id: str
+
+
+class NowReviewRequest(BaseModel):
+    group_id: str
+    document_ids: list[str] | None = None
+    max_findings: int = 12
+    model: str | None = None
+
+
+class NowReviewResponse(BaseModel):
+    group_id: str
+    group_name: str
+    document_ids: list[str]
+    markdown: str
+    findings: list[dict[str, Any]]
+    meta: dict[str, Any]

@@ -9,6 +9,17 @@ from typing import Any, Iterable, List
 
 import requests
 
+from .bundle_review import (
+    FINDINGS_JSON_SCHEMA,
+    SYSTEM_PROMPT_TEMPLATE,
+    USER_PROMPT_TEMPLATE,
+    build_document_bundle,
+    estimate_tokens,
+    estimate_usage_cost,
+    extract_json_object,
+    normalize_findings_payload,
+    render_now_review_markdown,
+)
 from .logger import log_event
 from .local_summary import (
     ReferenceText,
@@ -57,9 +68,12 @@ def _openai_sdk_max_retries() -> int:
 
 def _make_openai_client(api_key: str | None) -> Any:
     kwargs: dict[str, Any] = {"max_retries": _openai_sdk_max_retries()}
-    if api_key:
-        kwargs["api_key"] = api_key
     base_url = _openai_base_url()
+    effective_api_key = api_key
+    if base_url and not effective_api_key:
+        effective_api_key = "compair-local"
+    if effective_api_key:
+        kwargs["api_key"] = effective_api_key
     if base_url:
         kwargs["base_url"] = base_url
     try:  # pragma: no cover - optional dependency differences
@@ -428,6 +442,197 @@ def _fallback_feedback(
         change_context=change_context,
     )
     return summary or "NONE"
+
+
+def _bundle_review_model_name(reviewer: Reviewer, *, override: str | None = None) -> str:
+    if override and override.strip():
+        return override.strip()
+    for candidate in (
+        getattr(reviewer, "code_openai_model", None),
+        getattr(reviewer, "openai_model", None),
+        getattr(reviewer, "code_model", None),
+        getattr(reviewer, "model", None),
+        os.getenv("COMPAIR_OPENAI_CODE_MODEL"),
+        os.getenv("COMPAIR_OPENAI_MODEL"),
+    ):
+        if candidate and str(candidate).strip():
+            return str(candidate).strip()
+    return "gpt-5.4"
+
+
+def _bundle_review_openai_client(reviewer: Reviewer) -> Any:
+    client = getattr(reviewer, "_openai_client", None)
+    if client is not None:
+        return client
+    if openai is None or not hasattr(openai, "OpenAI"):
+        return None
+    try:
+        client = _make_openai_client(_openai_api_key())
+    except Exception:  # pragma: no cover - runtime dependency variance
+        return None
+    reviewer._openai_client = client
+    return client
+
+
+def _completion_text(response: Any) -> str | None:
+    if response is None:
+        return None
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return None
+    choice = choices[0]
+    message = getattr(choice, "message", None)
+    if message is not None:
+        content = getattr(message, "content", None)
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    text = getattr(choice, "text", None)
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    return None
+
+
+def review_documents_now(
+    reviewer: Reviewer,
+    documents: list[Document],
+    user: User,
+    *,
+    group_name: str,
+    max_findings: int = 12,
+    model_override: str | None = None,
+) -> dict[str, Any]:
+    if not documents:
+        raise ValueError("At least one document is required for now review")
+    client = _bundle_review_openai_client(reviewer)
+    if client is None:
+        raise RuntimeError(
+            "Now review requires an OpenAI-compatible generation client. "
+            "Set COMPAIR_OPENAI_MODEL and optionally COMPAIR_OPENAI_BASE_URL."
+        )
+
+    doc_stats, bundle_text = build_document_bundle(documents)
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(max_findings=max(1, min(max_findings, 12)))
+    user_prompt = USER_PROMPT_TEMPLATE.format(bundle=bundle_text)
+    prompt_text = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}"
+    model_name = _bundle_review_model_name(reviewer, override=model_override)
+    uses_reasoning = _is_reasoning_model_name(model_name)
+
+    started_at = time.time()
+    response: Any = None
+    raw_text: str | None = None
+    response_mode = "responses"
+    request_kwargs: dict[str, Any] = {"model": model_name}
+    if uses_reasoning:
+        request_kwargs["input"] = [
+            {"role": "developer", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        if getattr(reviewer, "openai_reasoning_effort", None):
+            request_kwargs["reasoning"] = {"effort": reviewer.openai_reasoning_effort}
+    else:
+        request_kwargs["instructions"] = system_prompt
+        request_kwargs["input"] = user_prompt
+    request_kwargs["text"] = {
+        "format": {
+            "type": "json_schema",
+            "name": "compair_now_review_findings",
+            "schema": FINDINGS_JSON_SCHEMA,
+            "strict": True,
+        }
+    }
+
+    last_exc: Exception | None = None
+    try:
+        if hasattr(client, "responses"):
+            try:
+                response = client.responses.create(**request_kwargs)
+            except Exception as exc:
+                if "reasoning" in request_kwargs and _should_retry_without_reasoning(exc):
+                    reduced = dict(request_kwargs)
+                    reduced.pop("reasoning", None)
+                    response = client.responses.create(**reduced)
+                else:
+                    raise
+            raw_text = _extract_response_text(response, reasoning_mode=uses_reasoning)
+        else:
+            response_mode = "chat"
+    except Exception as exc:
+        last_exc = exc
+        response_mode = "chat"
+
+    if not raw_text and hasattr(client, "chat") and hasattr(client.chat, "completions"):
+        response_mode = "chat"
+        chat_kwargs: dict[str, Any] = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt + "\n\nReturn JSON only."},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 2200,
+        }
+        try:
+            response = client.chat.completions.create(  # type: ignore[call-arg]
+                **chat_kwargs,
+                response_format={"type": "json_object"},
+            )
+        except Exception:
+            response = client.chat.completions.create(**chat_kwargs)  # type: ignore[call-arg]
+        raw_text = _completion_text(response)
+
+    if not raw_text:
+        raise RuntimeError(f"Now review failed to produce content: {last_exc or 'empty response'}")
+
+    parsed = normalize_findings_payload(extract_json_object(raw_text))
+    usage = _get_field(response, "usage")
+    duration_sec = round(time.time() - started_at, 3)
+    meta = {
+        "model": model_name,
+        "response_mode": response_mode,
+        "duration_sec": duration_sec,
+        "response_id": _get_field(response, "id"),
+        "bundle_estimated_tokens": estimate_tokens(bundle_text),
+        "prompt_estimated_tokens": estimate_tokens(prompt_text),
+        "usage": {
+            "input_tokens": _usage_int(usage, "input_tokens"),
+            "output_tokens": _usage_int(usage, "output_tokens"),
+            "total_tokens": _usage_int(usage, "total_tokens"),
+        },
+        "cost_estimate_usd": estimate_usage_cost(
+            model=model_name,
+            input_tokens=_usage_int(usage, "input_tokens"),
+            output_tokens=_usage_int(usage, "output_tokens"),
+            prompt_estimated_tokens=estimate_tokens(prompt_text),
+        ),
+        "created_at": _utc_now(),
+    }
+    markdown = render_now_review_markdown(
+        group_name=group_name,
+        findings=parsed.get("findings", []),
+        meta=meta,
+        document_stats=doc_stats,
+    )
+    log_event(
+        "openai_bundle_review_created",
+        model=model_name,
+        response_mode=response_mode,
+        input_tokens=meta["usage"]["input_tokens"],
+        output_tokens=meta["usage"]["output_tokens"],
+        total_cost_usd=(meta["cost_estimate_usd"] or {}).get("total_cost_usd") if isinstance(meta.get("cost_estimate_usd"), dict) else None,
+        duration_sec=duration_sec,
+        document_count=len(documents),
+        finding_count=len(parsed.get("findings", [])),
+        created_at=_utc_now(),
+        user_id=getattr(user, "user_id", None),
+    )
+    return {
+        "group_name": group_name,
+        "documents": doc_stats,
+        "findings": parsed.get("findings", []),
+        "meta": meta,
+        "markdown": markdown,
+        "bundle_text": bundle_text,
+    }
 
 
 
