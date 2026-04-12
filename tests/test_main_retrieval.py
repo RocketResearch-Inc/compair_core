@@ -573,6 +573,47 @@ class MainRetrievalTests(unittest.TestCase):
         self.assertEqual(payload["adjudicator_kind"], "docs-vs-impl mismatch")
         self.assertGreater(float(payload["adjudicator_score"]), 0.0)
 
+    def test_reference_counterpart_signal_boosts_manifest_license_pair(self) -> None:
+        manifest = (
+            "### File: pyproject.toml\n"
+            'name = "compair-core"\n'
+            'license = { text = "MIT" }\n'
+        )
+        license_text = (
+            "### File: LICENSE\n"
+            "GNU GENERAL PUBLIC LICENSE\n"
+            "Version 3, 29 June 2007\n"
+        )
+        readme = (
+            "### File: README.md\n"
+            "Compair keeps teams aligned across projects.\n"
+            "It reduces drift during review.\n"
+        )
+
+        license_score = main._reference_counterpart_signal(manifest, license_text)
+        readme_score = main._reference_counterpart_signal(manifest, readme)
+
+        self.assertGreater(license_score, readme_score)
+        self.assertGreater(license_score, 1.0)
+
+    def test_reference_adjudication_payload_detects_manifest_license_mismatch(self) -> None:
+        payload = main._reference_adjudication_payload(
+            target_text=(
+                "### File: pyproject.toml\n"
+                'name = "compair-core"\n'
+                'license = { text = "MIT" }\n'
+            ),
+            candidate_text=(
+                "### File: LICENSE\n"
+                "GNU GENERAL PUBLIC LICENSE\n"
+                "Version 3, 29 June 2007\n"
+            ),
+            candidate_path="LICENSE",
+        )
+
+        self.assertEqual(payload["adjudicator_kind"], "value mismatch")
+        self.assertGreater(float(payload["adjudicator_score"]), 0.0)
+
     def test_rerank_reference_chunks_promote_docs_to_impl_pair_with_adjudicator(self) -> None:
         target = (
             "### File: README.md\n"
@@ -615,6 +656,90 @@ class MainRetrievalTests(unittest.TestCase):
                 os.environ["COMPAIR_REFERENCE_ADJUDICATOR_ENABLED"] = original_adjudicator
 
         self.assertGreaterEqual(len(ranked), 2)
+        self.assertEqual(ranked[0].document_id, "impl-peer")
+
+    def test_rerank_reference_chunks_rescue_high_reranker_docs_to_impl_candidate(self) -> None:
+        target = (
+            "### File: docs/user-guide.md\n"
+            "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development.\n"
+            "Core logs verification emails to stdout.\n"
+            "The mailer backend controls how verification emails are delivered.\n"
+        )
+        candidates = [
+            DummyChunk(
+                chunk_id="docs-peer",
+                document_id="docs-peer",
+                content=(
+                    "### File: docs/user_guide.md\n"
+                    "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development.\n"
+                    "See the mailer backend guide for additional options.\n"
+                ),
+            ),
+            DummyChunk(
+                chunk_id="quickstart-peer",
+                document_id="quickstart-peer",
+                content=(
+                    "### File: docs/quickstart.md\n"
+                    "Run `compair login` and configure your API key to begin.\n"
+                ),
+            ),
+            DummyChunk(
+                chunk_id="impl-peer",
+                document_id="impl-peer",
+                content=(
+                    "### File: compair_core/server/providers/console_mailer.py\n"
+                    "class ConsoleMailer:\n"
+                    "    def send(self, subject, sender, receivers, html):\n"
+                    "        print('[MAIL]', subject)\n"
+                ),
+            ),
+        ]
+
+        original_hybrid = os.environ.get("COMPAIR_REFERENCE_HYBRID_ENABLED")
+        original_adjudicator = os.environ.get("COMPAIR_REFERENCE_ADJUDICATOR_ENABLED")
+        original_top_k = os.environ.get("COMPAIR_REFERENCE_ADJUDICATOR_TOP_K")
+        original_rescue_count = os.environ.get("COMPAIR_REFERENCE_RERANKER_RESCUE_COUNT")
+        original_rescue_min = os.environ.get("COMPAIR_REFERENCE_RERANKER_RESCUE_MIN_SCORE")
+        original_metadata = main._reference_reranker_metadata
+        original_score = main._reference_reranker_score
+        try:
+            os.environ["COMPAIR_REFERENCE_HYBRID_ENABLED"] = "1"
+            os.environ["COMPAIR_REFERENCE_ADJUDICATOR_ENABLED"] = "1"
+            os.environ["COMPAIR_REFERENCE_ADJUDICATOR_TOP_K"] = "1"
+            os.environ["COMPAIR_REFERENCE_RERANKER_RESCUE_COUNT"] = "1"
+            os.environ["COMPAIR_REFERENCE_RERANKER_RESCUE_MIN_SCORE"] = "0.5"
+            main._reference_reranker_metadata = lambda: (True, "test-model", "/tmp/test-model.json")
+            main._reference_reranker_score = lambda row: (
+                1.25
+                if str(row.get("candidate_path") or "").endswith("console_mailer.py")
+                else 0.25
+            )
+            ranked = main._rerank_reference_chunks(target, candidates, code_focus=True)
+        finally:
+            main._reference_reranker_metadata = original_metadata
+            main._reference_reranker_score = original_score
+            if original_hybrid is None:
+                os.environ.pop("COMPAIR_REFERENCE_HYBRID_ENABLED", None)
+            else:
+                os.environ["COMPAIR_REFERENCE_HYBRID_ENABLED"] = original_hybrid
+            if original_adjudicator is None:
+                os.environ.pop("COMPAIR_REFERENCE_ADJUDICATOR_ENABLED", None)
+            else:
+                os.environ["COMPAIR_REFERENCE_ADJUDICATOR_ENABLED"] = original_adjudicator
+            if original_top_k is None:
+                os.environ.pop("COMPAIR_REFERENCE_ADJUDICATOR_TOP_K", None)
+            else:
+                os.environ["COMPAIR_REFERENCE_ADJUDICATOR_TOP_K"] = original_top_k
+            if original_rescue_count is None:
+                os.environ.pop("COMPAIR_REFERENCE_RERANKER_RESCUE_COUNT", None)
+            else:
+                os.environ["COMPAIR_REFERENCE_RERANKER_RESCUE_COUNT"] = original_rescue_count
+            if original_rescue_min is None:
+                os.environ.pop("COMPAIR_REFERENCE_RERANKER_RESCUE_MIN_SCORE", None)
+            else:
+                os.environ["COMPAIR_REFERENCE_RERANKER_RESCUE_MIN_SCORE"] = original_rescue_min
+
+        self.assertGreaterEqual(len(ranked), 3)
         self.assertEqual(ranked[0].document_id, "impl-peer")
 
     def test_chunk_relevance_score_boosts_structured_doc_chunks(self) -> None:

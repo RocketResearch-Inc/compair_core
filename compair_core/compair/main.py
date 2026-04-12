@@ -512,6 +512,30 @@ def _reference_source_penalty_weight() -> float:
     return _float_env("COMPAIR_REFERENCE_SOURCE_PENALTY_WEIGHT", 0.75, minimum=0.0, maximum=6.0)
 
 
+def _reference_reranker_rescue_enabled() -> bool:
+    return _bool_env("COMPAIR_REFERENCE_RERANKER_RESCUE_ENABLED", True)
+
+
+def _reference_reranker_rescue_count() -> int:
+    raw = os.getenv("COMPAIR_REFERENCE_RERANKER_RESCUE_COUNT")
+    default = 6
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return default
+    return max(0, min(24, value))
+
+
+def _reference_reranker_rescue_min_score() -> float:
+    return _float_env("COMPAIR_REFERENCE_RERANKER_RESCUE_MIN_SCORE", 0.35, minimum=0.0, maximum=4.0)
+
+
+def _reference_reranker_rescue_counterpart_min() -> float:
+    return _float_env("COMPAIR_REFERENCE_RERANKER_RESCUE_COUNTERPART_MIN", 0.55, minimum=0.0, maximum=6.0)
+
+
 def _source_significance_threshold() -> float:
     return _float_env("COMPAIR_CODE_REPO_SOURCE_SIGNIFICANCE_THRESHOLD", 0.5, minimum=0.0, maximum=1.0)
 
@@ -1018,6 +1042,101 @@ def _reference_anchor_conflict_score(left_text: str, right_text: str) -> float:
         if shared_prefixes and not (left.env_vars & right.env_vars):
             score += 0.8
     return min(score, 6.0)
+
+
+def _is_ui_surface_path(path: str) -> bool:
+    normalized = (path or "").strip().lower().replace("\\", "/")
+    if not normalized:
+        return False
+    return any(
+        marker in normalized
+        for marker in ("/pages/", "/components/", "/ui/", "/frontend/", "/client/", "/views/")
+    )
+
+
+def _is_api_surface_path(path: str) -> bool:
+    normalized = (path or "").strip().lower().replace("\\", "/")
+    if not normalized:
+        return False
+    basename = os.path.basename(normalized)
+    return any(
+        marker in normalized
+        for marker in ("/api", "/service/", "/services/", "/routes/", "/router", "/server/")
+    ) or basename in {"api.py", "api.ts", "api.js", "service.py", "service.ts", "service.js"}
+
+
+@lru_cache(maxsize=4096)
+def _reference_counterpart_signal(left_text: str, right_text: str) -> float:
+    left_profile = _reference_anchor_profile(left_text or "")
+    right_profile = _reference_anchor_profile(right_text or "")
+    left_artifacts = extract_artifacts(left_text or "")
+    right_artifacts = extract_artifacts(right_text or "")
+    left_path = _extract_snapshot_file_path(left_text)
+    right_path = _extract_snapshot_file_path(right_text)
+    left_is_doc_like = _is_doc_like_path(left_path)
+    right_is_doc_like = _is_doc_like_path(right_path)
+    left_is_metadata = _is_high_signal_metadata_path(left_path)
+    right_is_metadata = _is_high_signal_metadata_path(right_path)
+
+    shared_endpoint_pairs = len(left_profile.endpoint_pairs & right_profile.endpoint_pairs)
+    shared_endpoint_paths = len(left_profile.endpoint_paths & right_profile.endpoint_paths)
+    shared_env_vars = len(left_profile.env_vars & right_profile.env_vars)
+    shared_keys = len(left_profile.key_names & right_profile.key_names)
+    shared_quotes = len(left_profile.quoted_norm & right_profile.quoted_norm)
+    shared_path_tokens = len(left_profile.path_tokens & right_profile.path_tokens)
+    shared_tokens = len(left_artifacts.tokens & right_artifacts.tokens)
+    score = 0.0
+
+    if left_is_doc_like != right_is_doc_like:
+        score += min(1.6, 0.85 * float(shared_endpoint_pairs) + 0.45 * float(shared_endpoint_paths))
+        score += min(1.2, 0.5 * float(shared_env_vars) + 0.18 * float(shared_keys))
+        score += min(1.0, 0.2 * float(shared_quotes) + 0.08 * float(shared_tokens))
+        if left_profile.basename and left_profile.basename in right_artifacts.tokens:
+            score += 0.45
+        if right_profile.basename and right_profile.basename in left_artifacts.tokens:
+            score += 0.45
+
+    metadata_license_counterpart = (
+        (
+            left_is_metadata
+            and (
+                "license" in left_profile.key_names
+                or bool(left_profile.license_terms)
+                or any(term in left_profile.quoted_norm for term in {"mit", "apache-2.0", "gpl-3.0", "bsd-3-clause"})
+            )
+            and (
+                bool(right_profile.license_terms)
+                or right_profile.basename in {"license", "license.txt", "copying", "copying.txt", "notice", "notice.txt"}
+            )
+        )
+        or (
+            right_is_metadata
+            and (
+                "license" in right_profile.key_names
+                or bool(right_profile.license_terms)
+                or any(term in right_profile.quoted_norm for term in {"mit", "apache-2.0", "gpl-3.0", "bsd-3-clause"})
+            )
+            and (
+                bool(left_profile.license_terms)
+                or left_profile.basename in {"license", "license.txt", "copying", "copying.txt", "notice", "notice.txt"}
+            )
+        )
+    )
+    if metadata_license_counterpart:
+        score += 2.6
+
+    ui_api_counterpart = (
+        (_is_ui_surface_path(left_path) and _is_api_surface_path(right_path))
+        or (_is_ui_surface_path(right_path) and _is_api_surface_path(left_path))
+    )
+    if ui_api_counterpart:
+        score += min(1.8, 0.15 * float(shared_tokens) + 0.35 * float(shared_path_tokens))
+        score += min(1.4, 0.7 * float(shared_endpoint_paths))
+
+    if not left_is_doc_like and not right_is_doc_like:
+        score += min(0.9, 0.08 * float(shared_tokens) + 0.12 * float(shared_path_tokens))
+
+    return round(score, 6)
 
 
 def _is_doc_like_path(path: str) -> bool:
@@ -1535,6 +1654,7 @@ def _rerank_reference_chunks(
     reranker_enabled = code_focus and reranker_enabled
     hybrid_enabled = code_focus and _reference_hybrid_enabled()
     adjudicator_enabled = code_focus and _reference_adjudicator_enabled()
+    reranker_rescue_enabled = reranker_enabled and adjudicator_enabled and _reference_reranker_rescue_enabled()
     used_indices: set[int] = set()
     source_counts: dict[str, int] = {}
     selected: list[Chunk] = []
@@ -1585,6 +1705,35 @@ def _rerank_reference_chunks(
             key=lambda item: float(item[1].get("preselection_score") or 0.0),
             reverse=True,
         )[:top_k]
+        ranked_indices = {idx for idx, _ in ranked_for_adjudication}
+        rescued_indices: set[int] = set()
+        if reranker_rescue_enabled:
+            rescue_count = _reference_reranker_rescue_count()
+            rescue_min_score = _reference_reranker_rescue_min_score()
+            rescue_counterpart_min = _reference_reranker_rescue_counterpart_min()
+            rescue_candidates: list[tuple[float, int, dict[str, object]]] = []
+            for idx, row in row_cache.items():
+                if idx in ranked_indices:
+                    continue
+                reranker_score = float(row.get("reranker_score") or 0.0)
+                counterpart_signal = float(row.get("counterpart_signal") or 0.0)
+                metadata_counterpart = bool(row.get("metadata_counterpart"))
+                ui_api_counterpart = bool(row.get("ui_api_counterpart"))
+                candidate_is_doc_like = _is_doc_like_path(str(row.get("candidate_path") or ""))
+                cross_surface = target_is_doc_like != candidate_is_doc_like
+                if reranker_score < rescue_min_score and counterpart_signal < rescue_counterpart_min:
+                    continue
+                rescue_score = reranker_score + (0.45 * counterpart_signal)
+                if cross_surface:
+                    rescue_score += 0.18
+                if metadata_counterpart or ui_api_counterpart:
+                    rescue_score += 0.32
+                rescue_candidates.append((rescue_score, idx, row))
+            rescue_candidates.sort(key=lambda item: item[0], reverse=True)
+            for _, idx, row in rescue_candidates[:rescue_count]:
+                row["rescued_for_adjudication"] = True
+                ranked_for_adjudication.append((idx, row))
+                rescued_indices.add(idx)
         positive_count = 0
         for idx, row in ranked_for_adjudication:
             candidate = trimmed[idx]
@@ -1604,6 +1753,7 @@ def _rerank_reference_chunks(
         if debug_stats is not None:
             debug_stats["adjudicated_candidate_count"] = len(ranked_for_adjudication)
             debug_stats["positive_adjudication_count"] = positive_count
+            debug_stats["rescued_adjudication_count"] = len(rescued_indices)
 
     if debug_stats is not None:
         debug_stats["hybrid_enabled"] = hybrid_enabled
@@ -1611,6 +1761,7 @@ def _rerank_reference_chunks(
         debug_stats["reranker_model_version"] = reranker_model_version
         debug_stats["reranker_model_path"] = reranker_model_path
         debug_stats["adjudicator_enabled"] = adjudicator_enabled
+        debug_stats["reranker_rescue_enabled"] = reranker_rescue_enabled
         debug_stats["row_debug_by_chunk_id"] = {
             str(getattr(trimmed[idx], "chunk_id", "") or ""): {
                 key: value
@@ -1620,11 +1771,13 @@ def _rerank_reference_chunks(
                     "hybrid_score",
                     "reranker_score",
                     "heuristic_score",
+                    "counterpart_signal",
                     "preselection_score",
                     "adjudicator_score",
                     "adjudicator_kind",
                     "adjudicator_confidence",
                     "adjudicator_match_score",
+                    "rescued_for_adjudication",
                 }
             }
             for idx, row in row_cache.items()
@@ -1904,14 +2057,7 @@ def _reference_adjudication_payload(
 ) -> dict[str, object]:
     label = candidate_path or "a related reference"
     match = best_reference_match(target_text, [ReferenceText(label=label, text=candidate_text)])
-    if match is None:
-        return {
-            "adjudicator_score": 0.0,
-            "adjudicator_kind": None,
-            "adjudicator_confidence": 0,
-            "adjudicator_match_score": 0,
-        }
-    relation = match.relation
+    relation = getattr(match, "relation", None)
     kind = getattr(relation, "kind", None)
     confidence = int(getattr(relation, "confidence", 0) or 0)
     match_score = int(getattr(match, "score", 0) or 0)
@@ -1921,6 +2067,35 @@ def _reference_adjudication_payload(
     shared_structured = len((target_profile.tokens | target_profile.quoted_norm) & (candidate_profile.tokens | candidate_profile.quoted_norm))
     target_is_doc_like = _is_doc_like_path(target_path)
     candidate_is_doc_like = _is_doc_like_path(candidate_path)
+    counterpart_signal = _reference_counterpart_signal(target_text, candidate_text)
+    metadata_counterpart = (
+        (
+            _is_high_signal_metadata_path(target_path)
+            and (
+                "license" in _reference_anchor_profile(target_text).key_names
+                or bool(_reference_anchor_profile(target_text).license_terms)
+            )
+            and (
+                bool(_reference_anchor_profile(candidate_text).license_terms)
+                or os.path.basename(candidate_path).lower() in {"license", "license.txt", "copying", "copying.txt", "notice", "notice.txt"}
+            )
+        )
+        or (
+            _is_high_signal_metadata_path(candidate_path)
+            and (
+                "license" in _reference_anchor_profile(candidate_text).key_names
+                or bool(_reference_anchor_profile(candidate_text).license_terms)
+            )
+            and (
+                bool(_reference_anchor_profile(target_text).license_terms)
+                or os.path.basename(target_path).lower() in {"license", "license.txt", "copying", "copying.txt", "notice", "notice.txt"}
+            )
+        )
+    )
+    ui_api_counterpart = (
+        (_is_ui_surface_path(target_path) and _is_api_surface_path(candidate_path))
+        or (_is_ui_surface_path(candidate_path) and _is_api_surface_path(target_path))
+    )
     looks_implementation = (not candidate_is_doc_like) and (
         "```" in candidate_text
         or re.search(r"\b(?:def|class|return|await|fetch|router|mapped_column|function)\b", candidate_text)
@@ -1929,6 +2104,12 @@ def _reference_adjudication_payload(
     if target_is_doc_like and looks_implementation and kind in {None, "generic divergence", "rename", "presence/absence"} and shared_structured >= 2:
         kind = "docs-vs-impl mismatch"
         confidence = max(confidence, 4)
+    elif metadata_counterpart and kind in {None, "generic divergence", "rename", "presence/absence"} and counterpart_signal >= 1.4:
+        kind = "value mismatch"
+        confidence = max(confidence, 4)
+    elif ui_api_counterpart and kind in {None, "generic divergence", "rename", "presence/absence"} and (shared_structured >= 2 or counterpart_signal >= 1.2):
+        kind = "route/path mismatch"
+        confidence = max(confidence, 3)
     if kind == "generic divergence":
         adjudicator_score = 0.0 if target_is_doc_like and candidate_is_doc_like else min(0.45, 0.02 * float(match_score))
     else:
@@ -1964,15 +2145,33 @@ def _reference_candidate_feature_row(
     candidate_path = _extract_snapshot_file_path(content)
     query_tokens = _identifier_tokens(query_text)
     target_path = source_path or _extract_snapshot_file_path(query_text)
+    source_content = getattr(source_chunk, "content", "") or query_text
     lexical_score = _token_overlap_ratio(query_tokens, _identifier_tokens(content))
     path_theme_score = _token_overlap_ratio(query_tokens, _path_token_set(candidate_path))
     path_score = _path_overlap_score(target_path, candidate_path)
     artifact_score = min(_artifact_overlap_score(query_text, content), 4.0)
     anchor_overlap = _reference_anchor_overlap_score(query_text, content)
     anchor_conflict = _reference_anchor_conflict_score(query_text, content)
-    source_content = getattr(source_chunk, "content", "") or query_text
     source_embedding = getattr(source_chunk, "embedding", None) or []
     candidate_embedding = getattr(candidate, "embedding", None) or []
+    counterpart_signal = _reference_counterpart_signal(source_content, content)
+    metadata_counterpart = (
+        _is_high_signal_metadata_path(target_path)
+        and (
+            bool(_reference_anchor_profile(content).license_terms)
+            or os.path.basename(candidate_path).lower() in {"license", "license.txt", "copying", "copying.txt", "notice", "notice.txt"}
+        )
+    ) or (
+        _is_high_signal_metadata_path(candidate_path)
+        and (
+            bool(_reference_anchor_profile(source_content).license_terms)
+            or os.path.basename(target_path).lower() in {"license", "license.txt", "copying", "copying.txt", "notice", "notice.txt"}
+        )
+    )
+    ui_api_counterpart = (
+        (_is_ui_surface_path(target_path) and _is_api_surface_path(candidate_path))
+        or (_is_ui_surface_path(candidate_path) and _is_api_surface_path(target_path))
+    )
     combined_signal = (
         (lexical_score * 4.0)
         + (path_theme_score * 2.0)
@@ -1994,6 +2193,9 @@ def _reference_candidate_feature_row(
         "artifact_score": round(artifact_score, 4),
         "anchor_overlap": round(anchor_overlap, 4),
         "anchor_conflict": round(anchor_conflict, 4),
+        "counterpart_signal": round(counterpart_signal, 4),
+        "metadata_counterpart": bool(metadata_counterpart),
+        "ui_api_counterpart": bool(ui_api_counterpart),
         "combined_signal": round(combined_signal, 4),
         "source_preview": source_content[:800],
         "candidate_preview": content[:800],
@@ -2088,6 +2290,7 @@ def _reference_trace_entries(
                 "artifact_score": feature_row.get("artifact_score"),
                 "anchor_overlap": feature_row.get("anchor_overlap"),
                 "anchor_conflict": feature_row.get("anchor_conflict"),
+                "counterpart_signal": feature_row.get("counterpart_signal"),
                 "combined_signal": feature_row.get("combined_signal"),
                 "hybrid_score": feature_row.get("hybrid_score"),
                 "reranker_score": feature_row.get("reranker_score"),
@@ -2910,6 +3113,7 @@ def process_text(
                     adjudicator_enabled=bool(rerank_debug.get("adjudicator_enabled")),
                     adjudicated_candidate_count=int(rerank_debug.get("adjudicated_candidate_count") or 0),
                     positive_adjudication_count=int(rerank_debug.get("positive_adjudication_count") or 0),
+                    rescued_adjudication_count=int(rerank_debug.get("rescued_adjudication_count") or 0),
                     candidates=_reference_trace_entries(
                         query_text=query_text,
                         source_chunk=existing_chunk,
@@ -2946,6 +3150,7 @@ def process_text(
                     adjudicator_enabled=bool(rerank_debug.get("adjudicator_enabled")),
                     adjudicated_candidate_count=int(rerank_debug.get("adjudicated_candidate_count") or 0),
                     positive_adjudication_count=int(rerank_debug.get("positive_adjudication_count") or 0),
+                    rescued_adjudication_count=int(rerank_debug.get("rescued_adjudication_count") or 0),
                     filtered_header_only=filtered_counts.get("header_only", 0),
                     filtered_same_file=filtered_counts.get("same_file", 0),
                     filtered_same_document=filtered_counts.get("same_document_disabled", 0),
@@ -2974,6 +3179,7 @@ def process_text(
                     adjudicator_enabled=bool(rerank_debug.get("adjudicator_enabled")),
                     adjudicated_candidate_count=int(rerank_debug.get("adjudicated_candidate_count") or 0),
                     positive_adjudication_count=int(rerank_debug.get("positive_adjudication_count") or 0),
+                    rescued_adjudication_count=int(rerank_debug.get("rescued_adjudication_count") or 0),
                     filtered_header_only=filtered_counts.get("header_only", 0),
                     filtered_same_file=filtered_counts.get("same_file", 0),
                     filtered_same_document=filtered_counts.get("same_document_disabled", 0),
