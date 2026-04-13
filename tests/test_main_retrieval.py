@@ -335,8 +335,11 @@ class MainRetrievalTests(unittest.TestCase):
         self.assertEqual(names[0], "primary")
         self.assertIn("full", names)
         self.assertIn("anchor", names)
+        self.assertIn("counterpart", names)
         self.assertIn("COMPAIR_EMAIL_BACKEND", variant_map["anchor"])
         self.assertIn("/notification_events", variant_map["anchor"])
+        self.assertIn("terms", variant_map["counterpart"])
+        self.assertIn("email", variant_map["counterpart"].lower())
 
     def test_reference_effective_vector_fetch_limit_boosts_behavioral_docs_and_metadata(self) -> None:
         candidate_limit = 10
@@ -596,6 +599,30 @@ class MainRetrievalTests(unittest.TestCase):
         self.assertGreater(license_score, readme_score)
         self.assertGreater(license_score, 1.0)
 
+    def test_reference_counterpart_signal_boosts_docs_to_mailer_impl_pair(self) -> None:
+        docs = (
+            "### File: docs/user-guide.md\n"
+            "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development.\n"
+            "Core logs verification emails to stdout through the mailer backend.\n"
+        )
+        impl = (
+            "### File: compair_core/server/providers/console_mailer.py\n"
+            "class ConsoleMailer:\n"
+            "    backend = 'stdout'\n"
+            "    def send_verification_email(self, subject, sender, receivers, html):\n"
+            "        print('[MAIL]', subject)\n"
+        )
+        distractor = (
+            "### File: docs/quickstart.md\n"
+            "Run `compair login` and configure your API key to begin.\n"
+        )
+
+        impl_score = main._reference_counterpart_signal(docs, impl)
+        distractor_score = main._reference_counterpart_signal(docs, distractor)
+
+        self.assertGreater(impl_score, distractor_score)
+        self.assertGreater(impl_score, 0.0)
+
     def test_reference_adjudication_payload_detects_manifest_license_mismatch(self) -> None:
         payload = main._reference_adjudication_payload(
             target_text=(
@@ -642,6 +669,38 @@ class MainRetrievalTests(unittest.TestCase):
 
         self.assertEqual(len(ranked), 2)
         self.assertEqual(ranked[0].document_id, "license-peer")
+
+    def test_reference_counterpart_candidates_prioritize_docs_to_mailer_impl_pair(self) -> None:
+        target = (
+            "### File: docs/user-guide.md\n"
+            "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development.\n"
+            "Core logs verification emails to stdout through the mailer backend.\n"
+        )
+        candidates = [
+            DummyChunk(
+                document_id="doc-peer",
+                content=(
+                    "### File: docs/user_guide.md\n"
+                    "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development.\n"
+                    "See the user guide for more details.\n"
+                ),
+            ),
+            DummyChunk(
+                document_id="impl-peer",
+                content=(
+                    "### File: compair_core/server/providers/console_mailer.py\n"
+                    "class ConsoleMailer:\n"
+                    "    backend = 'stdout'\n"
+                    "    def send_verification_email(self, subject, sender, receivers, html):\n"
+                    "        print('[MAIL]', subject)\n"
+                ),
+            ),
+        ]
+
+        ranked = main._reference_counterpart_candidates(target, candidates, limit=2, code_focus=True)
+
+        self.assertEqual(len(ranked), 1)
+        self.assertEqual(ranked[0].document_id, "impl-peer")
 
     def test_rerank_reference_chunks_promote_docs_to_impl_pair_with_adjudicator(self) -> None:
         target = (

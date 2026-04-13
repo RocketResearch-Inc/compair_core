@@ -74,6 +74,22 @@ _HIGH_SIGNAL_METADATA_BASENAMES = {
     "notice",
     "notice.txt",
 }
+_MANIFEST_METADATA_BASENAMES = {
+    "pyproject.toml",
+    "package.json",
+    "go.mod",
+    "cargo.toml",
+    "setup.py",
+    "setup.cfg",
+}
+_LICENSE_METADATA_BASENAMES = {
+    "license",
+    "license.txt",
+    "copying",
+    "copying.txt",
+    "notice",
+    "notice.txt",
+}
 _REFERENCE_RERANKER_DEFAULT_MODEL_PATH = "/opt/compair/reference_reranker.json"
 _REFERENCE_RERANKER_DEFAULT_LATEST_PATH = "/opt/compair/reranker/reference_reranker_latest.json"
 _REFERENCE_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
@@ -621,6 +637,10 @@ def _reference_anchor_query_enabled() -> bool:
     return _bool_env("COMPAIR_REFERENCE_ANCHOR_QUERY_ENABLED", True)
 
 
+def _reference_counterpart_query_enabled() -> bool:
+    return _bool_env("COMPAIR_REFERENCE_COUNTERPART_QUERY_ENABLED", True)
+
+
 def _reference_adaptive_fetch_enabled() -> bool:
     return _bool_env("COMPAIR_REFERENCE_ADAPTIVE_FETCH_ENABLED", True)
 
@@ -709,6 +729,16 @@ def _path_token_set(path: str) -> set[str]:
     }
 
 
+def _reference_subtokens(value: str) -> set[str]:
+    tokens: set[str] = set()
+    for raw in _REFERENCE_SUBTOKEN_RE.findall((value or "").replace("_", " ").replace("-", " ")):
+        token = raw.lower()
+        if len(token) < 3 or token in _REFERENCE_TOKEN_STOPWORDS:
+            continue
+        tokens.add(token)
+    return tokens
+
+
 def _path_overlap_score(target_path: str, candidate_path: str) -> float:
     if not target_path or not candidate_path:
         return 0.0
@@ -731,6 +761,14 @@ def _token_overlap_ratio(left: set[str], right: set[str]) -> float:
     if not left or not right:
         return 0.0
     return len(left & right) / float(max(1, min(len(left), len(right))))
+
+
+def _is_manifest_metadata_path(path: str) -> bool:
+    return os.path.basename((path or "").strip().lower().replace("\\", "/")) in _MANIFEST_METADATA_BASENAMES
+
+
+def _is_license_metadata_path(path: str) -> bool:
+    return os.path.basename((path or "").strip().lower().replace("\\", "/")) in _LICENSE_METADATA_BASENAMES
 
 
 def _doc_body_lines(text: str) -> list[str]:
@@ -973,6 +1011,29 @@ def _reference_anchor_profile(text: str) -> ReferenceAnchorProfile:
     )
 
 
+@lru_cache(maxsize=4096)
+def _reference_counterpart_terms(text: str, path: str) -> frozenset[str]:
+    tokens = set(_identifier_tokens(text or "", limit=128))
+    tokens.update(_path_token_set(path))
+
+    basename = os.path.basename((path or "").strip().lower().replace("\\", "/"))
+    tokens.update(_reference_subtokens(basename))
+
+    profile = _reference_anchor_profile(text or "")
+    for raw in profile.env_vars:
+        tokens.update(_reference_subtokens(raw))
+    for raw in profile.key_names:
+        tokens.update(_reference_subtokens(raw))
+    for raw in profile.quoted_norm:
+        tokens.update(_reference_subtokens(raw))
+    for raw in profile.path_tokens:
+        tokens.update(_reference_subtokens(raw))
+    for raw in profile.license_terms:
+        tokens.update(_reference_subtokens(raw))
+
+    return frozenset(token for token in tokens if len(token) >= 3 and token not in _REFERENCE_TOKEN_STOPWORDS)
+
+
 @lru_cache(maxsize=2048)
 def _assignment_contrast_score(left_text: str, right_text: str) -> float:
     left = extract_artifacts(left_text or "")
@@ -1094,6 +1155,10 @@ def _reference_counterpart_signal(left_text: str, right_text: str) -> float:
     right_is_doc_like = _is_doc_like_path(right_path)
     left_is_metadata = _is_high_signal_metadata_path(left_path)
     right_is_metadata = _is_high_signal_metadata_path(right_path)
+    left_is_manifest = _is_manifest_metadata_path(left_path)
+    right_is_manifest = _is_manifest_metadata_path(right_path)
+    left_is_license = _is_license_metadata_path(left_path)
+    right_is_license = _is_license_metadata_path(right_path)
 
     shared_endpoint_pairs = len(left_profile.endpoint_pairs & right_profile.endpoint_pairs)
     shared_endpoint_paths = len(left_profile.endpoint_paths & right_profile.endpoint_paths)
@@ -1102,12 +1167,21 @@ def _reference_counterpart_signal(left_text: str, right_text: str) -> float:
     shared_quotes = len(left_profile.quoted_norm & right_profile.quoted_norm)
     shared_path_tokens = len(left_profile.path_tokens & right_profile.path_tokens)
     shared_tokens = len(left_artifacts.tokens & right_artifacts.tokens)
+    shared_counterpart_terms = len(
+        _reference_counterpart_terms(left_text or "", left_path)
+        & _reference_counterpart_terms(right_text or "", right_path)
+    )
+    shared_basename_terms = len(
+        _reference_subtokens(os.path.basename(left_path))
+        & _reference_subtokens(os.path.basename(right_path))
+    )
     score = 0.0
 
     if left_is_doc_like != right_is_doc_like:
         score += min(1.6, 0.85 * float(shared_endpoint_pairs) + 0.45 * float(shared_endpoint_paths))
         score += min(1.2, 0.5 * float(shared_env_vars) + 0.18 * float(shared_keys))
         score += min(1.0, 0.2 * float(shared_quotes) + 0.08 * float(shared_tokens))
+        score += min(1.4, 0.18 * float(shared_counterpart_terms) + 0.3 * float(shared_basename_terms))
         if left_profile.basename and left_profile.basename in right_artifacts.tokens:
             score += 0.45
         if right_profile.basename and right_profile.basename in left_artifacts.tokens:
@@ -1141,6 +1215,8 @@ def _reference_counterpart_signal(left_text: str, right_text: str) -> float:
     )
     if metadata_license_counterpart:
         score += 2.6
+    elif (left_is_manifest and right_is_license) or (right_is_manifest and left_is_license):
+        score += 2.1
 
     ui_api_counterpart = (
         (_is_ui_surface_path(left_path) and _is_api_surface_path(right_path))
@@ -1152,6 +1228,13 @@ def _reference_counterpart_signal(left_text: str, right_text: str) -> float:
 
     if not left_is_doc_like and not right_is_doc_like:
         score += min(0.9, 0.08 * float(shared_tokens) + 0.12 * float(shared_path_tokens))
+    if shared_counterpart_terms and (
+        (left_is_doc_like != right_is_doc_like)
+        or (left_is_manifest and right_is_license)
+        or (right_is_manifest and left_is_license)
+        or ui_api_counterpart
+    ):
+        score += min(1.1, 0.12 * float(shared_counterpart_terms))
 
     return round(score, 6)
 
@@ -2009,6 +2092,49 @@ def _reference_anchor_query_text(text: str) -> str:
     return anchor_query[:1200]
 
 
+def _reference_counterpart_query_text(text: str) -> str:
+    chunk = (text or "").strip()
+    if not chunk:
+        return ""
+
+    path = _extract_snapshot_file_path(chunk)
+    profile = _reference_anchor_profile(chunk)
+    counterpart_terms = sorted(_reference_counterpart_terms(chunk, path))
+    lines: list[str] = []
+    basename = os.path.basename(path)
+    if basename:
+        lines.append(f"path {basename}")
+    if _is_manifest_metadata_path(path):
+        lines.append("manifest metadata")
+    if _is_license_metadata_path(path):
+        lines.append("license file")
+    if profile.license_terms:
+        lines.append("license " + " ".join(sorted(profile.license_terms)))
+    if profile.env_vars:
+        lines.append("env " + " ".join(sorted(profile.env_vars)[:8]))
+    if profile.endpoint_paths:
+        lines.append("routes " + " ".join(sorted(profile.endpoint_paths)[:6]))
+    if profile.key_names:
+        lines.append("keys " + " ".join(sorted(profile.key_names)[:12]))
+    if counterpart_terms:
+        lines.append("terms " + " ".join(counterpart_terms[:24]))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        normalized = " ".join((line or "").split()).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    counterpart_query = "\n".join(deduped).strip()
+    if count_tokens(counterpart_query) < 3:
+        return ""
+    if counterpart_query == chunk:
+        return ""
+    return counterpart_query[:1200]
+
+
 def _reference_query_variants(text: str, focus_text: str, change_context: str, *, code_focus: bool) -> list[tuple[str, str]]:
     primary = _reference_query_text(text, focus_text, change_context, code_focus=code_focus)
     variants: list[tuple[str, str]] = []
@@ -2030,6 +2156,8 @@ def _reference_query_variants(text: str, focus_text: str, change_context: str, *
         add_variant("full", target)
     if _reference_anchor_query_enabled():
         add_variant("anchor", _reference_anchor_query_text(text))
+    if _reference_counterpart_query_enabled():
+        add_variant("counterpart", _reference_counterpart_query_text(text))
     return variants
 
 
@@ -3039,6 +3167,7 @@ def process_text(
         allow_same_document = _allow_same_document_feedback(user)
         query_variants = _reference_query_variants(text, focus_text, change_context, code_focus=code_focus)
         query_text = query_variants[0][1] if query_variants else text
+        source_retrieval_text = getattr(existing_chunk, "content", "") or text or query_text
         query_vectors: list[tuple[str, list[float]]] = []
         for variant_name, variant_text in query_variants:
             vector: list[float] | None = None
@@ -3160,19 +3289,19 @@ def process_text(
             candidate_count = len(all_candidates) if all_candidates is not None else len(candidates)
             if code_focus:
                 lexical_candidates = _lexical_reference_candidates(
-                    query_text,
+                    source_retrieval_text,
                     all_candidates or [],
                     limit=candidate_limit,
                     code_focus=True,
                 )
                 anchor_candidates = _anchor_reference_candidates(
-                    query_text,
+                    source_retrieval_text,
                     all_candidates or [],
                     limit=candidate_limit * 2,
                     code_focus=True,
                 )
                 counterpart_candidates = _reference_counterpart_candidates(
-                    query_text,
+                    source_retrieval_text,
                     all_candidates or [],
                     limit=max(candidate_limit * 2, candidate_limit + 2),
                     code_focus=True,
