@@ -6,6 +6,7 @@ from functools import lru_cache
 import logging
 import os
 import re
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
 
@@ -421,6 +422,10 @@ def _reference_hybrid_counterpart_rank_weight() -> float:
     return _float_env("COMPAIR_REFERENCE_HYBRID_COUNTERPART_RANK_WEIGHT", 28.0, minimum=0.0, maximum=100.0)
 
 
+def _reference_hybrid_fts_rank_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_HYBRID_FTS_RANK_WEIGHT", 34.0, minimum=0.0, maximum=100.0)
+
+
 def _reference_hybrid_lexical_signal_weight() -> float:
     return _float_env("COMPAIR_REFERENCE_HYBRID_LEXICAL_SIGNAL_WEIGHT", 0.12, minimum=0.0, maximum=5.0)
 
@@ -655,6 +660,34 @@ def _reference_metadata_fetch_multiplier() -> float:
 
 def _reference_structured_fetch_multiplier() -> float:
     return _float_env("COMPAIR_REFERENCE_STRUCTURED_FETCH_MULTIPLIER", 1.5, minimum=1.0, maximum=4.0)
+
+
+def _reference_fts_enabled() -> bool:
+    return _bool_env("COMPAIR_REFERENCE_FTS_ENABLED", True)
+
+
+def _reference_fts_candidate_limit(code_focus: bool, candidate_limit: int) -> int:
+    raw = os.getenv("COMPAIR_CODE_REPO_REFERENCE_FTS_LIMIT" if code_focus else "COMPAIR_REFERENCE_FTS_LIMIT")
+    default = max(candidate_limit * 2, 20 if code_focus else candidate_limit)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return default
+    return max(candidate_limit, value)
+
+
+def _reference_fts_query_term_limit() -> int:
+    raw = os.getenv("COMPAIR_REFERENCE_FTS_QUERY_TERMS")
+    default = 20
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return default
+    return max(6, min(48, value))
 
 
 @lru_cache(maxsize=1)
@@ -1032,6 +1065,103 @@ def _reference_counterpart_terms(text: str, path: str) -> frozenset[str]:
         tokens.update(_reference_subtokens(raw))
 
     return frozenset(token for token in tokens if len(token) >= 3 and token not in _REFERENCE_TOKEN_STOPWORDS)
+
+
+def _reference_fts_signal_text(text: str, path: str) -> str:
+    normalized_path = (path or "").strip().lower().replace("\\", "/")
+    basename = os.path.basename(normalized_path) if normalized_path else ""
+    profile = _reference_anchor_profile(text or "")
+    tokens: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        token = re.sub(r"[^a-z0-9]+", "", (value or "").strip().lower())
+        if len(token) < 2 or token in _REFERENCE_TOKEN_STOPWORDS or token in seen:
+            return
+        seen.add(token)
+        tokens.append(token)
+
+    for raw in _reference_subtokens(basename):
+        add(raw)
+    for raw in _path_token_set(normalized_path):
+        add(raw)
+    for raw in _reference_counterpart_terms(text or "", normalized_path):
+        add(raw)
+    for raw in profile.env_vars:
+        for token in _reference_subtokens(raw):
+            add(token)
+    for raw in profile.key_names:
+        for token in _reference_subtokens(raw):
+            add(token)
+    for raw in profile.quoted_norm:
+        for token in _reference_subtokens(raw):
+            add(token)
+    for raw in profile.license_terms:
+        for token in _reference_subtokens(raw):
+            add(token)
+    for raw in _identifier_tokens(text or "", limit=128):
+        add(raw)
+
+    parts = [part for part in (normalized_path, basename, " ".join(tokens), text or "") if part]
+    return "\n".join(parts)
+
+
+def _reference_fts_query(text: str, *, code_focus: bool) -> str:
+    path = _extract_snapshot_file_path(text).lower().replace("\\", "/")
+    basename = os.path.basename(path) if path else ""
+    profile = _reference_anchor_profile(text or "")
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        token = re.sub(r"[^a-z0-9]+", "", (value or "").strip().lower())
+        if len(token) < 2 or token in _REFERENCE_TOKEN_STOPWORDS or token in seen:
+            return
+        seen.add(token)
+        ordered.append(token)
+
+    for raw in profile.env_vars:
+        for token in _reference_subtokens(raw):
+            add(token)
+    for raw in profile.license_terms:
+        for token in _reference_subtokens(raw):
+            add(token)
+    for raw in _reference_subtokens(basename):
+        add(raw)
+    for raw in _path_token_set(path):
+        add(raw)
+    for raw in _reference_counterpart_terms(text or "", path):
+        add(raw)
+    for raw in profile.key_names:
+        for token in _reference_subtokens(raw):
+            add(token)
+    for raw in profile.quoted_norm:
+        for token in _reference_subtokens(raw):
+            add(token)
+    for raw in _identifier_tokens(text or "", limit=128):
+        add(raw)
+
+    if code_focus and _is_manifest_metadata_path(path):
+        for raw in ("license", "notice", "copying"):
+            add(raw)
+
+    query_terms = ordered[: _reference_fts_query_term_limit()]
+    return " OR ".join(f"{term}*" for term in query_terms if term)
+
+
+@lru_cache(maxsize=1)
+def _reference_fts_available() -> bool:
+    if not _reference_fts_enabled():
+        return False
+    try:
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute("CREATE VIRTUAL TABLE reference_fts_probe USING fts5(content)")
+            return True
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
 
 
 @lru_cache(maxsize=2048)
@@ -1607,6 +1737,115 @@ def _interleave_reference_candidates(*candidate_sets: list[Chunk], limit: int) -
     return merged
 
 
+def _reference_fts_candidates(
+    target_text: str,
+    query_variants: list[tuple[str, str]],
+    candidates: list[Chunk],
+    *,
+    limit: int,
+    code_focus: bool,
+) -> list[Chunk]:
+    if not candidates or limit <= 0 or not code_focus or not _reference_fts_available():
+        return []
+
+    candidate_by_key: dict[str, Chunk] = {}
+    indexed_rows: list[tuple[str, str, str, str]] = []
+    for candidate in candidates:
+        if getattr(candidate, "chunk_type", "") != "document":
+            continue
+        content = getattr(candidate, "content", "") or ""
+        if not content or _is_snapshot_metadata_chunk(content):
+            continue
+        key = _reference_chunk_key(candidate)
+        path = _extract_snapshot_file_path(content)
+        candidate_by_key[key] = candidate
+        indexed_rows.append((key, path, _reference_fts_signal_text(content, path), content))
+    if not indexed_rows:
+        return []
+
+    queries: list[str] = []
+    seen_queries: set[str] = set()
+    for _, variant_text in query_variants or [("primary", target_text)]:
+        query = _reference_fts_query(variant_text or target_text, code_focus=code_focus)
+        if not query or query in seen_queries:
+            continue
+        seen_queries.add(query)
+        queries.append(query)
+    if not queries:
+        return []
+
+    result_sets: list[list[Chunk]] = []
+    per_query_limit = max(limit, 10)
+    best_rank_by_key: dict[str, int] = {}
+    try:
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute(
+                "CREATE VIRTUAL TABLE reference_candidate_fts USING fts5("
+                "chunk_key UNINDEXED, path, signals, body)"
+            )
+            conn.executemany(
+                "INSERT INTO reference_candidate_fts (chunk_key, path, signals, body) VALUES (?, ?, ?, ?)",
+                indexed_rows,
+            )
+            for query in queries:
+                rows = conn.execute(
+                    "SELECT chunk_key FROM reference_candidate_fts "
+                    "WHERE reference_candidate_fts MATCH ? "
+                    "ORDER BY bm25(reference_candidate_fts, 6.0, 3.5, 1.0), rowid "
+                    "LIMIT ?",
+                    (query, per_query_limit),
+                ).fetchall()
+                query_chunks: list[Chunk] = []
+                for rank, (chunk_key,) in enumerate(rows, start=1):
+                    key = str(chunk_key)
+                    candidate = candidate_by_key.get(key)
+                    if candidate is None:
+                        continue
+                    query_chunks.append(candidate)
+                    prev_rank = best_rank_by_key.get(key)
+                    if prev_rank is None or rank < prev_rank:
+                        best_rank_by_key[key] = rank
+                result_sets.append(query_chunks)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+
+    target_path = _extract_snapshot_file_path(target_text)
+    target_is_doc_like = _is_doc_like_path(target_path)
+    target_is_metadata = _is_high_signal_metadata_path(target_path)
+    combined = _interleave_reference_candidates(*result_sets, limit=max(limit * 3, limit))
+    scored: list[tuple[float, int, Chunk]] = []
+    for idx, candidate in enumerate(combined):
+        key = _reference_chunk_key(candidate)
+        content = getattr(candidate, "content", "") or ""
+        candidate_path = _extract_snapshot_file_path(content)
+        candidate_is_doc_like = _is_doc_like_path(candidate_path)
+        candidate_is_metadata = _is_high_signal_metadata_path(candidate_path)
+        counterpart_signal = _reference_counterpart_signal(target_text, content)
+        anchor_overlap = _reference_anchor_overlap_score(target_text, content)
+        anchor_conflict = _reference_anchor_conflict_score(target_text, content)
+        path_theme_score = _token_overlap_ratio(_identifier_tokens(target_text, limit=96), _path_token_set(candidate_path))
+        metadata_counterpart = target_is_metadata != candidate_is_metadata and (target_is_metadata or candidate_is_metadata)
+        cross_surface = target_is_doc_like != candidate_is_doc_like
+        score = _reference_rrf(best_rank_by_key.get(key), k=10) * 20.0
+        score += counterpart_signal * 4.2
+        score += anchor_conflict * 1.2
+        score += anchor_overlap * 0.6
+        score += min(1.2, path_theme_score * 2.0)
+        if metadata_counterpart:
+            score += 1.6
+        if cross_surface:
+            score += 0.9
+        elif target_is_doc_like and candidate_is_doc_like:
+            score -= 0.95
+        scored.append((score, idx, candidate))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [candidate for _, _, candidate in scored[:limit]]
+
+
 def _lexical_reference_candidates(
     target_text: str,
     candidates: list[Chunk],
@@ -1782,6 +2021,7 @@ def _rerank_reference_chunks(
     source_chunk: Chunk | None = None,
     doc: Document | None = None,
     raw_vector_candidates: list[Chunk] | None = None,
+    fts_candidates: list[Chunk] | None = None,
     lexical_candidates: list[Chunk] | None = None,
     anchor_candidates: list[Chunk] | None = None,
     counterpart_candidates: list[Chunk] | None = None,
@@ -1802,6 +2042,10 @@ def _rerank_reference_chunks(
     vector_rank = {
         _reference_chunk_key(chunk): idx + 1
         for idx, chunk in enumerate(raw_vector_candidates or [])
+    }
+    fts_rank = {
+        _reference_chunk_key(chunk): idx + 1
+        for idx, chunk in enumerate(fts_candidates or [])
     }
     lexical_rank = {
         _reference_chunk_key(chunk): idx + 1
@@ -1839,6 +2083,7 @@ def _rerank_reference_chunks(
             source_document_id=source_document_id,
             source_path=target_path,
             vector_rank=vector_rank,
+            fts_rank=fts_rank,
             lexical_rank=lexical_rank,
             anchor_rank=anchor_rank,
             counterpart_rank=counterpart_rank,
@@ -1937,6 +2182,7 @@ def _rerank_reference_chunks(
                     "hybrid_score",
                     "reranker_score",
                     "heuristic_score",
+                    "fts_rank",
                     "counterpart_signal",
                     "counterpart_rank",
                     "preselection_score",
@@ -2197,6 +2443,7 @@ def _reference_rrf(rank: Any, *, k: int) -> float:
 def _reference_hybrid_score(feature_row: Mapping[str, object]) -> float:
     k = _reference_hybrid_rrf_k()
     vector_rrf = _reference_rrf(feature_row.get("vector_rank"), k=k)
+    fts_rrf = _reference_rrf(feature_row.get("fts_rank"), k=k)
     lexical_rrf = _reference_rrf(feature_row.get("lexical_rank"), k=k)
     anchor_rrf = _reference_rrf(feature_row.get("anchor_rank"), k=k)
     counterpart_rrf = _reference_rrf(feature_row.get("counterpart_rank"), k=k)
@@ -2210,6 +2457,7 @@ def _reference_hybrid_score(feature_row: Mapping[str, object]) -> float:
     combined_signal = float(feature_row.get("combined_signal") or 0.0)
     return (
         (_reference_hybrid_vector_rank_weight() * vector_rrf)
+        + (_reference_hybrid_fts_rank_weight() * fts_rrf)
         + (_reference_hybrid_lexical_rank_weight() * lexical_rrf)
         + (_reference_hybrid_anchor_rank_weight() * anchor_rrf)
         + (_reference_hybrid_counterpart_rank_weight() * counterpart_rrf)
@@ -2357,6 +2605,7 @@ def _reference_candidate_feature_row(
     source_document_id: str | None,
     source_path: str,
     vector_rank: Mapping[str, int],
+    fts_rank: Mapping[str, int],
     lexical_rank: Mapping[str, int],
     anchor_rank: Mapping[str, int],
     counterpart_rank: Mapping[str, int],
@@ -2406,6 +2655,7 @@ def _reference_candidate_feature_row(
         "candidate_path": candidate_path,
         "same_document": getattr(candidate, "document_id", None) == source_document_id,
         "vector_rank": vector_rank.get(key),
+        "fts_rank": fts_rank.get(key),
         "lexical_rank": lexical_rank.get(key),
         "anchor_rank": anchor_rank.get(key),
         "counterpart_rank": counterpart_rank.get(key),
@@ -2440,6 +2690,7 @@ def _reference_trace_entries(
     raw_vector_candidates: list[Chunk],
     allow_same_document: bool,
     code_focus: bool,
+    fts_candidates: list[Chunk],
     lexical_candidates: list[Chunk],
     anchor_candidates: list[Chunk],
     counterpart_candidates: list[Chunk],
@@ -2452,6 +2703,7 @@ def _reference_trace_entries(
     source_document_id = getattr(doc, "document_id", None)
     source_path = _extract_snapshot_file_path(query_text)
     vector_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(raw_vector_candidates)}
+    fts_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(fts_candidates)}
     lexical_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(lexical_candidates)}
     anchor_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(anchor_candidates)}
     counterpart_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(counterpart_candidates)}
@@ -2462,6 +2714,7 @@ def _reference_trace_entries(
         status_rank = {"selected": 0, "candidate": 1, "filtered": 2}.get(status, 3)
         best_rank = min(
             int(entry.get("selected_rank") or 9999),
+            int(entry.get("fts_rank") or 9999),
             int(entry.get("anchor_rank") or 9999),
             int(entry.get("counterpart_rank") or 9999),
             int(entry.get("lexical_rank") or 9999),
@@ -2488,6 +2741,7 @@ def _reference_trace_entries(
             source_document_id=source_document_id,
             source_path=source_path,
             vector_rank=vector_rank,
+            fts_rank=fts_rank,
             lexical_rank=lexical_rank,
             anchor_rank=anchor_rank,
             counterpart_rank=counterpart_rank,
@@ -2507,6 +2761,7 @@ def _reference_trace_entries(
                 "selection_status": selection_status,
                 "drop_reason": None if allowed else reason,
                 "vector_rank": feature_row.get("vector_rank"),
+                "fts_rank": feature_row.get("fts_rank"),
                 "lexical_rank": feature_row.get("lexical_rank"),
                 "anchor_rank": feature_row.get("anchor_rank"),
                 "counterpart_rank": feature_row.get("counterpart_rank"),
@@ -3189,6 +3444,7 @@ def process_text(
         )
 
         if query_vectors:
+            fts_candidates: list[Chunk] = []
             lexical_candidates: list[Chunk] = []
             anchor_candidates: list[Chunk] = []
             counterpart_candidates: list[Chunk] = []
@@ -3288,6 +3544,13 @@ def process_text(
                 filtered_counts[reason] = max(filtered_counts.get(reason, 0), count)
             candidate_count = len(all_candidates) if all_candidates is not None else len(candidates)
             if code_focus:
+                fts_candidates = _reference_fts_candidates(
+                    source_retrieval_text,
+                    query_variants,
+                    all_candidates or [],
+                    limit=_reference_fts_candidate_limit(code_focus, candidate_limit),
+                    code_focus=True,
+                )
                 lexical_candidates = _lexical_reference_candidates(
                     source_retrieval_text,
                     all_candidates or [],
@@ -3308,6 +3571,7 @@ def process_text(
                 )
                 candidates = _interleave_reference_candidates(
                     candidates,
+                    fts_candidates,
                     counterpart_candidates,
                     anchor_candidates,
                     lexical_candidates,
@@ -3321,6 +3585,7 @@ def process_text(
                 source_chunk=existing_chunk,
                 doc=doc,
                 raw_vector_candidates=raw_vector_candidates,
+                fts_candidates=fts_candidates,
                 lexical_candidates=lexical_candidates,
                 anchor_candidates=anchor_candidates,
                 counterpart_candidates=counterpart_candidates,
@@ -3337,6 +3602,7 @@ def process_text(
                     allow_same_document=allow_same_document,
                     raw_candidate_count=raw_candidate_count,
                     candidate_count=candidate_count,
+                    fts_candidate_count=len(fts_candidates),
                     lexical_candidate_count=len(lexical_candidates),
                     anchor_candidate_count=len(anchor_candidates),
                     counterpart_candidate_count=len(counterpart_candidates),
@@ -3360,6 +3626,7 @@ def process_text(
                         raw_vector_candidates=raw_vector_candidates,
                         allow_same_document=allow_same_document,
                         code_focus=code_focus,
+                        fts_candidates=fts_candidates,
                         lexical_candidates=lexical_candidates,
                         anchor_candidates=anchor_candidates,
                         counterpart_candidates=counterpart_candidates,
@@ -3377,6 +3644,7 @@ def process_text(
                     allow_same_document=allow_same_document,
                     raw_candidate_count=raw_candidate_count,
                     candidate_count=candidate_count,
+                    fts_candidate_count=len(fts_candidates),
                     lexical_candidate_count=len(lexical_candidates),
                     anchor_candidate_count=len(anchor_candidates),
                     counterpart_candidate_count=len(counterpart_candidates),

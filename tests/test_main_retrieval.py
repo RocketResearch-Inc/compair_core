@@ -702,6 +702,85 @@ class MainRetrievalTests(unittest.TestCase):
         self.assertEqual(len(ranked), 1)
         self.assertEqual(ranked[0].document_id, "impl-peer")
 
+    def test_reference_fts_candidates_prioritize_manifest_license_pair(self) -> None:
+        if not main._reference_fts_available():
+            self.skipTest("SQLite FTS5 unavailable")
+
+        target = (
+            "### File: pyproject.toml\n"
+            'name = "compair-core"\n'
+            'license = { text = "MIT" }\n'
+        )
+        candidates = [
+            DummyChunk(
+                document_id="manifest-peer",
+                content=(
+                    "### File: package.json\n"
+                    '{\n  "name": "compair-ui",\n  "version": "0.1.0"\n}\n'
+                ),
+            ),
+            DummyChunk(
+                document_id="license-peer",
+                content=(
+                    "### File: LICENSE\n"
+                    "GNU GENERAL PUBLIC LICENSE\n"
+                    "Version 3, 29 June 2007\n"
+                ),
+            ),
+        ]
+
+        ranked = main._reference_fts_candidates(
+            target,
+            main._reference_query_variants(target, "", "", code_focus=True),
+            candidates,
+            limit=2,
+            code_focus=True,
+        )
+
+        self.assertGreaterEqual(len(ranked), 1)
+        self.assertEqual(ranked[0].document_id, "license-peer")
+
+    def test_reference_fts_candidates_prioritize_docs_to_mailer_impl_pair(self) -> None:
+        if not main._reference_fts_available():
+            self.skipTest("SQLite FTS5 unavailable")
+
+        target = (
+            "### File: docs/user-guide.md\n"
+            "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development.\n"
+            "Core logs verification emails to stdout through the mailer backend.\n"
+        )
+        candidates = [
+            DummyChunk(
+                document_id="doc-peer",
+                content=(
+                    "### File: docs/user_guide.md\n"
+                    "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development.\n"
+                    "See the user guide for more details.\n"
+                ),
+            ),
+            DummyChunk(
+                document_id="impl-peer",
+                content=(
+                    "### File: compair_core/server/providers/console_mailer.py\n"
+                    "class ConsoleMailer:\n"
+                    "    backend = 'stdout'\n"
+                    "    def send_verification_email(self, subject, sender, receivers, html):\n"
+                    "        print('[MAIL]', subject)\n"
+                ),
+            ),
+        ]
+
+        ranked = main._reference_fts_candidates(
+            target,
+            main._reference_query_variants(target, "", "", code_focus=True),
+            candidates,
+            limit=2,
+            code_focus=True,
+        )
+
+        self.assertGreaterEqual(len(ranked), 1)
+        self.assertEqual(ranked[0].document_id, "impl-peer")
+
     def test_rerank_reference_chunks_promote_docs_to_impl_pair_with_adjudicator(self) -> None:
         target = (
             "### File: README.md\n"
