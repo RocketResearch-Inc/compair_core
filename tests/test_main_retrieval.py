@@ -702,6 +702,37 @@ class MainRetrievalTests(unittest.TestCase):
         self.assertEqual(len(ranked), 1)
         self.assertEqual(ranked[0].document_id, "impl-peer")
 
+    def test_reference_fts_queries_expand_manifest_to_legal_terms(self) -> None:
+        target = (
+            "### File: pyproject.toml\n"
+            'name = "compair-core"\n'
+            'license = { text = "MIT" }\n'
+        )
+
+        queries = main._reference_fts_queries(target, code_focus=True)
+        joined = " || ".join(queries)
+
+        self.assertTrue(queries)
+        self.assertIn("license*", joined)
+        self.assertIn("notice*", joined)
+        self.assertIn("copying*", joined)
+
+    def test_reference_fts_queries_expand_behavioral_doc_to_backend_terms(self) -> None:
+        target = (
+            "### File: docs/user-guide.md\n"
+            "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development.\n"
+            "Core logs verification emails to stdout through the mailer backend.\n"
+        )
+
+        queries = main._reference_fts_queries(target, code_focus=True)
+        joined = " || ".join(queries)
+
+        self.assertTrue(queries)
+        self.assertIn("email*", joined)
+        self.assertIn("backend*", joined)
+        self.assertIn("mailer*", joined)
+        self.assertIn("provider*", joined)
+
     def test_reference_fts_candidates_prioritize_manifest_license_pair(self) -> None:
         if not main._reference_fts_available():
             self.skipTest("SQLite FTS5 unavailable")

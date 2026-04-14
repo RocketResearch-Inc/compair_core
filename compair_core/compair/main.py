@@ -117,6 +117,27 @@ _LICENSE_TERM_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_REFERENCE_FTS_CONCEPT_EXPANSIONS: dict[str, tuple[str, ...]] = {
+    "email": ("mailer", "mail", "delivery", "smtp", "send", "verification"),
+    "mailer": ("email", "delivery", "smtp", "send", "verification"),
+    "delivery": ("email", "mailer", "send", "receiver", "preferences"),
+    "notification": ("event", "delivery", "preferences", "notify"),
+    "notifications": ("notification", "event", "delivery", "preferences"),
+    "event": ("notification", "events", "delivery"),
+    "backend": ("provider", "service", "adapter", "impl"),
+    "provider": ("backend", "service", "adapter", "impl"),
+    "license": ("licensing", "notice", "copying", "copyright"),
+    "licensing": ("license", "notice", "copying", "copyright"),
+    "oauth": ("auth", "token", "login", "provider"),
+    "auth": ("oauth", "token", "login", "provider"),
+    "route": ("api", "endpoint", "handler"),
+    "endpoint": ("api", "route", "handler"),
+    "api": ("route", "endpoint", "service"),
+    "ui": ("page", "component", "frontend", "client"),
+    "config": ("setting", "option", "preference", "env"),
+    "settings": ("config", "preferences", "option"),
+    "preferences": ("config", "settings", "delivery"),
+}
 _BEHAVIORAL_CLAIM_VERB_RE = re.compile(
     r"\b(?:"
     r"use|uses|used|"
@@ -1067,6 +1088,73 @@ def _reference_counterpart_terms(text: str, path: str) -> frozenset[str]:
     return frozenset(token for token in tokens if len(token) >= 3 and token not in _REFERENCE_TOKEN_STOPWORDS)
 
 
+def _reference_fts_source_roles(text: str, path: str) -> frozenset[str]:
+    normalized_path = (path or "").strip().lower().replace("\\", "/")
+    profile = _reference_anchor_profile(text or "")
+    artifacts = extract_artifacts(text or "")
+    roles: set[str] = set()
+
+    if _is_doc_like_path(normalized_path):
+        roles.add("doc")
+    if _is_high_signal_metadata_path(normalized_path):
+        roles.add("metadata")
+    if _is_manifest_metadata_path(normalized_path):
+        roles.add("manifest")
+    if _is_license_metadata_path(normalized_path):
+        roles.add("license")
+    if _is_ui_surface_path(normalized_path):
+        roles.add("ui")
+    if _is_api_surface_path(normalized_path):
+        roles.add("api")
+    if _behavioral_doc_signal_score(text or "") > 0.0:
+        roles.add("behavioral_doc")
+    if profile.env_vars:
+        roles.add("env_config")
+    if profile.endpoint_pairs or profile.endpoint_paths:
+        roles.add("route_surface")
+    if profile.license_terms or "license" in profile.key_names:
+        roles.add("legal_surface")
+    if artifacts.assignments or ("```" in (text or "")) or any(
+        token in _identifier_tokens(text or "", limit=96)
+        for token in {"function", "return", "class", "router", "service", "provider", "backend"}
+    ):
+        roles.add("implementation")
+    return frozenset(roles)
+
+
+def _reference_fts_expand_terms(terms: list[str], roles: frozenset[str]) -> list[str]:
+    expanded: list[str] = []
+    seen = set(terms)
+
+    def add(value: str) -> None:
+        token = re.sub(r"[^a-z0-9]+", "", (value or "").strip().lower())
+        if len(token) < 2 or token in _REFERENCE_TOKEN_STOPWORDS or token in seen:
+            return
+        seen.add(token)
+        expanded.append(token)
+
+    for term in terms:
+        for related in _REFERENCE_FTS_CONCEPT_EXPANSIONS.get(term, ()):
+            add(related)
+
+    if "manifest" in roles or "legal_surface" in roles:
+        for token in ("license", "notice", "copying", "copyright"):
+            add(token)
+    if "env_config" in roles:
+        for token in ("config", "setting", "backend", "provider", "service", "adapter"):
+            add(token)
+    if "behavioral_doc" in roles:
+        for token in ("implementation", "behavior", "runtime", "flow"):
+            add(token)
+    if "ui" in roles:
+        for token in ("page", "component", "frontend", "client"):
+            add(token)
+    if "api" in roles or "route_surface" in roles:
+        for token in ("api", "route", "endpoint", "handler", "service"):
+            add(token)
+    return expanded
+
+
 def _reference_fts_signal_text(text: str, path: str) -> str:
     normalized_path = (path or "").strip().lower().replace("\\", "/")
     basename = os.path.basename(normalized_path) if normalized_path else ""
@@ -1106,11 +1194,14 @@ def _reference_fts_signal_text(text: str, path: str) -> str:
     return "\n".join(parts)
 
 
-def _reference_fts_query(text: str, *, code_focus: bool) -> str:
+def _reference_fts_queries(text: str, *, code_focus: bool) -> list[str]:
     path = _extract_snapshot_file_path(text).lower().replace("\\", "/")
     basename = os.path.basename(path) if path else ""
     profile = _reference_anchor_profile(text or "")
-    ordered: list[str] = []
+    roles = _reference_fts_source_roles(text or "", path)
+    primary_terms: list[str] = []
+    structural_terms: list[str] = []
+    concept_terms: list[str] = []
     seen: set[str] = set()
 
     def add(value: str) -> None:
@@ -1118,7 +1209,7 @@ def _reference_fts_query(text: str, *, code_focus: bool) -> str:
         if len(token) < 2 or token in _REFERENCE_TOKEN_STOPWORDS or token in seen:
             return
         seen.add(token)
-        ordered.append(token)
+        primary_terms.append(token)
 
     for raw in profile.env_vars:
         for token in _reference_subtokens(raw):
@@ -1141,12 +1232,55 @@ def _reference_fts_query(text: str, *, code_focus: bool) -> str:
     for raw in _identifier_tokens(text or "", limit=128):
         add(raw)
 
-    if code_focus and _is_manifest_metadata_path(path):
-        for raw in ("license", "notice", "copying"):
-            add(raw)
+    concept_terms.extend(_reference_fts_expand_terms(primary_terms, roles))
+    structural_terms.extend(primary_terms)
 
-    query_terms = ordered[: _reference_fts_query_term_limit()]
-    return " OR ".join(f"{term}*" for term in query_terms if term)
+    if "manifest" in roles or "legal_surface" in roles:
+        structural_terms = [
+            *[token for token in structural_terms if token in {"license", "notice", "copying", "copyright", "mit", "apache", "gpl", "bsd", "mpl", "isc", "proprietary"}],
+            *[token for token in concept_terms if token in {"license", "notice", "copying", "copyright"}],
+            *structural_terms,
+        ]
+    elif "behavioral_doc" in roles or "env_config" in roles:
+        structural_terms = [
+            *[token for token in structural_terms if token in {"email", "mailer", "delivery", "backend", "provider", "service", "adapter", "stdout", "smtp", "send", "verification"}],
+            *[token for token in concept_terms if token in {"email", "mailer", "delivery", "backend", "provider", "service", "adapter", "verification"}],
+            *structural_terms,
+        ]
+    elif "ui" in roles or "api" in roles or "route_surface" in roles:
+        structural_terms = [
+            *[token for token in structural_terms if token in {"api", "route", "endpoint", "handler", "service", "notification", "event", "preferences"}],
+            *[token for token in concept_terms if token in {"api", "route", "endpoint", "handler", "notification", "event", "preferences"}],
+            *structural_terms,
+        ]
+
+    def build_query(terms: list[str]) -> str:
+        out: list[str] = []
+        used: set[str] = set()
+        for token in terms:
+            normalized = re.sub(r"[^a-z0-9]+", "", (token or "").strip().lower())
+            if len(normalized) < 2 or normalized in used:
+                continue
+            used.add(normalized)
+            out.append(f"{normalized}*")
+            if len(out) >= _reference_fts_query_term_limit():
+                break
+        return " OR ".join(out)
+
+    queries: list[str] = []
+    for candidate in (
+        build_query(structural_terms),
+        build_query([*primary_terms, *concept_terms]),
+        build_query([*concept_terms, *primary_terms]),
+    ):
+        if candidate and candidate not in queries:
+            queries.append(candidate)
+    return queries
+
+
+def _reference_fts_query(text: str, *, code_focus: bool) -> str:
+    queries = _reference_fts_queries(text, code_focus=code_focus)
+    return queries[0] if queries else ""
 
 
 @lru_cache(maxsize=1)
@@ -1162,6 +1296,46 @@ def _reference_fts_available() -> bool:
             conn.close()
     except sqlite3.Error:
         return False
+
+
+def _reference_fts_candidate_noise_penalty(
+    *,
+    target_text: str,
+    candidate_text: str,
+    candidate_path: str,
+) -> float:
+    target_path = _extract_snapshot_file_path(target_text)
+    target_roles = _reference_fts_source_roles(target_text, target_path)
+    normalized_candidate_path = (candidate_path or "").strip().lower().replace("\\", "/")
+    candidate_roles = _reference_fts_source_roles(candidate_text, normalized_candidate_path)
+
+    penalty = 0.0
+    if any(marker in normalized_candidate_path for marker in ("/tests/", "/test/", "test_", "_test.", "spec.")):
+        penalty += 1.6 if {"manifest", "metadata", "behavioral_doc"} & set(target_roles) else 0.8
+    if any(marker in normalized_candidate_path for marker in ("/.github/workflows/", "/workflows/", "docker-publish", "ci/")):
+        penalty += 1.8 if {"manifest", "metadata"} & set(target_roles) else 0.9
+    if "doc" in target_roles and "doc" in candidate_roles and _reference_counterpart_signal(target_text, candidate_text) < 0.8:
+        penalty += 0.9
+    if {"manifest", "metadata"} & set(target_roles) and not (
+        {"manifest", "license", "metadata", "legal_surface"} & set(candidate_roles)
+    ):
+        penalty += 0.8
+    return penalty
+
+
+def _reference_effective_fts_candidate_limit(target_text: str, *, code_focus: bool, candidate_limit: int) -> int:
+    base_limit = _reference_fts_candidate_limit(code_focus, candidate_limit)
+    if not code_focus:
+        return base_limit
+    roles = _reference_fts_source_roles(target_text, _extract_snapshot_file_path(target_text))
+    multiplier = 1.0
+    if {"manifest", "metadata", "legal_surface"} & set(roles):
+        multiplier = max(multiplier, 2.0)
+    if {"behavioral_doc", "env_config"} & set(roles):
+        multiplier = max(multiplier, 2.0)
+    if {"ui", "api", "route_surface"} & set(roles):
+        multiplier = max(multiplier, 1.5)
+    return max(base_limit, int(round(base_limit * multiplier)))
 
 
 @lru_cache(maxsize=2048)
@@ -1766,16 +1940,18 @@ def _reference_fts_candidates(
     queries: list[str] = []
     seen_queries: set[str] = set()
     for _, variant_text in query_variants or [("primary", target_text)]:
-        query = _reference_fts_query(variant_text or target_text, code_focus=code_focus)
-        if not query or query in seen_queries:
-            continue
-        seen_queries.add(query)
-        queries.append(query)
+        for query in _reference_fts_queries(variant_text or target_text, code_focus=code_focus):
+            if not query or query in seen_queries:
+                continue
+            seen_queries.add(query)
+            queries.append(query)
     if not queries:
         return []
 
     result_sets: list[list[Chunk]] = []
     per_query_limit = max(limit, 10)
+    effective_limit = _reference_effective_fts_candidate_limit(target_text, code_focus=code_focus, candidate_limit=limit)
+    per_query_limit = max(per_query_limit, effective_limit)
     best_rank_by_key: dict[str, int] = {}
     try:
         conn = sqlite3.connect(":memory:")
@@ -1815,7 +1991,7 @@ def _reference_fts_candidates(
     target_path = _extract_snapshot_file_path(target_text)
     target_is_doc_like = _is_doc_like_path(target_path)
     target_is_metadata = _is_high_signal_metadata_path(target_path)
-    combined = _interleave_reference_candidates(*result_sets, limit=max(limit * 3, limit))
+    combined = _interleave_reference_candidates(*result_sets, limit=max(effective_limit * 2, limit))
     scored: list[tuple[float, int, Chunk]] = []
     for idx, candidate in enumerate(combined):
         key = _reference_chunk_key(candidate)
@@ -1840,6 +2016,11 @@ def _reference_fts_candidates(
             score += 0.9
         elif target_is_doc_like and candidate_is_doc_like:
             score -= 0.95
+        score -= _reference_fts_candidate_noise_penalty(
+            target_text=target_text,
+            candidate_text=content,
+            candidate_path=candidate_path,
+        )
         scored.append((score, idx, candidate))
 
     scored.sort(key=lambda item: (-item[0], item[1]))
