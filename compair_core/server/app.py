@@ -107,10 +107,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             print("Warning: R2 credentials not configured. Using local storage fallback.")
 
-        billing_provider = StripeBilling(
-            stripe_key=resolved_settings.stripe_key,
-            endpoint_secret=resolved_settings.stripe_endpoint_secret,
-        )
         mailer_provider = TransactionalMailer()
 
         analytics_provider = None
@@ -121,7 +117,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
         app.dependency_overrides[get_storage] = lambda sp=storage_provider: sp
-        app.dependency_overrides[get_billing] = lambda bp=billing_provider: bp
         if ocr_provider is not None:
             app.dependency_overrides[get_ocr] = lambda op=ocr_provider: op
             object.__setattr__(resolved_settings, "ocr_enabled", True)
@@ -129,6 +124,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             object.__setattr__(resolved_settings, "ocr_enabled", False)
         if analytics_provider is not None:
             app.dependency_overrides[get_analytics] = lambda ap=analytics_provider: ap
+        if resolved_settings.billing_enabled and resolved_settings.stripe_key:
+            billing_provider = StripeBilling(
+                stripe_key=resolved_settings.stripe_key,
+                endpoint_secret=resolved_settings.stripe_endpoint_secret,
+            )
+            app.dependency_overrides[get_billing] = lambda bp=billing_provider: bp
+        else:
+            print("Warning: Stripe billing not configured or disabled. Using no-op billing provider.")
         app.dependency_overrides[get_mailer] = lambda mp=mailer_provider: mp
 
     else:

@@ -85,14 +85,35 @@ def _embedding_column():
     return mapped_column(JSON, nullable=True, default=None)
 
 
+def _embedding_sequence(value: Sequence[float] | None) -> list[float] | None:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return value
+    if hasattr(value, "tolist"):
+        try:
+            converted = value.tolist()
+            if isinstance(converted, list):
+                return converted
+            return list(converted)
+        except Exception:
+            pass
+    try:
+        return list(value)
+    except Exception:
+        return None
+
+
 def cosine_similarity(vec1: Sequence[float] | None, vec2: Sequence[float] | None) -> float | None:
-    if not vec1 or not vec2:
+    left = _embedding_sequence(vec1)
+    right = _embedding_sequence(vec2)
+    if not left or not right:
         return None
-    if len(vec1) != len(vec2):
+    if len(left) != len(right):
         return None
-    dot = sum(a * b for a, b in zip(vec1, vec2))
-    norm1 = sqrt(sum(a * a for a in vec1))
-    norm2 = sqrt(sum(b * b for b in vec2))
+    dot = sum(a * b for a, b in zip(left, right))
+    norm1 = sqrt(sum(a * a for a in left))
+    norm2 = sqrt(sum(b * b for b in right))
     if norm1 == 0 or norm2 == 0:
         return None
     return dot / (norm1 * norm2)

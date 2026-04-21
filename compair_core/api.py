@@ -976,7 +976,7 @@ def load_user_status(
 
 
 @router.get("/load_user_status_date")
-def load_user_status(
+def load_user_status_date(
     current_user: models.User = Depends(get_current_user)
 ) -> datetime:
     if not (HAS_TRIALS or HAS_BILLING) and not IS_CLOUD:
@@ -985,14 +985,27 @@ def load_user_status(
         user_status = current_user.status
         if user_status=='active':
             require_feature(HAS_BILLING, "Billing history")
-            user_status_date = current_user.last_payment_date
+            user_status_date = (
+                getattr(current_user, "last_payment_date", None)
+                or getattr(current_user, "status_change_date", None)
+                or getattr(current_user, "datetime_registered", None)
+            )
         elif user_status=='trial':
             require_feature(HAS_TRIALS, "Trial management")
-            user_status_date = current_user.trial_expiration_date
+            user_status_date = (
+                getattr(current_user, "trial_expiration_date", None)
+                or getattr(current_user, "status_change_date", None)
+                or getattr(current_user, "datetime_registered", None)
+            )
         elif user_status=='suspended':
-            user_status_date = current_user.status_change_date
+            user_status_date = (
+                getattr(current_user, "status_change_date", None)
+                or getattr(current_user, "datetime_registered", None)
+            )
         else:
             raise HTTPException(status_code=403, detail='User Inactive')
+        if user_status_date is None:
+            raise HTTPException(status_code=404, detail="User status date is not available.")
         return user_status_date
 
 
@@ -3477,6 +3490,21 @@ def _get_cloud_metric_model(name: str) -> Any | None:
     return getattr(cloud_models, name, None)
 
 
+def _create_metric_event(metric_model: Any, **values: Any) -> Any:
+    try:
+        return metric_model(**values)
+    except TypeError as exc:
+        created_at = values.pop("created_at", None)
+        if created_at is None or "created_at" not in str(exc):
+            raise
+        event = metric_model(**values)
+        try:
+            event.created_at = created_at
+        except Exception:
+            pass
+        return event
+
+
 @router.post("/desktop-metrics/batch")
 def upload_desktop_metrics_batch(
     request_payload: Mapping[str, Any],
@@ -3553,7 +3581,8 @@ def upload_desktop_metrics_batch(
             if row["client_event_id"] in existing_ids:
                 continue
             inserts.append(
-                metric_model(
+                _create_metric_event(
+                    metric_model,
                     user_id=current_user.user_id,
                     client_event_id=row["client_event_id"],
                     kind=row["kind"],
@@ -3665,7 +3694,8 @@ def upload_anonymous_client_metrics_batch(
             if dedupe_key in existing_pairs:
                 continue
             inserts.append(
-                metric_model(
+                _create_metric_event(
+                    metric_model,
                     install_id=row["install_id"],
                     client_event_id=row["client_event_id"],
                     event_name=row["event_name"],
