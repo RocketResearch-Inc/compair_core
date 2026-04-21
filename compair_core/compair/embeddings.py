@@ -175,6 +175,13 @@ def _combine_embeddings(vectors: list[list[float]], weights: list[int]) -> list[
     return combined
 
 
+def _openai_embedding_request(embedder: Embedder, input_value):
+    request = {"model": embedder.openai_embed_model, "input": input_value}
+    if str(embedder.openai_embed_model).startswith("text-embedding-3") and getattr(embedder, "dimension", None):
+        request["dimensions"] = int(embedder.dimension)
+    return request
+
+
 def create_embedding(embedder: Embedder, text: str, user=None) -> list[float]:
     if embedder.is_cloud and cloud_create_embedding is not None:
         return cloud_create_embedding(embedder._cloud_impl, text, user=user)
@@ -236,8 +243,7 @@ def create_embeddings(embedder: Embedder, texts: list[str], user=None) -> list[l
                 if regular:
                     started_at = time.time()
                     response = client.embeddings.create(
-                        model=embedder.openai_embed_model,
-                        input=[text for _, text in regular],
+                        **_openai_embedding_request(embedder, [text for _, text in regular])
                     )
                     ordered = sorted(
                         list(getattr(response, "data", []) or []),
@@ -260,8 +266,7 @@ def create_embeddings(embedder: Embedder, texts: list[str], user=None) -> list[l
                 if regular:
                     started_at = time.time()
                     response = openai.Embedding.create(  # type: ignore[attr-defined]
-                        model=embedder.openai_embed_model,
-                        input=[text for _, text in regular],
+                        **_openai_embedding_request(embedder, [text for _, text in regular])
                     )
                     data = sorted(response["data"], key=lambda row: row.get("index", 0))  # type: ignore[index]
                     for (item_idx, _), row in zip(regular, data):
@@ -308,15 +313,13 @@ def _openai_embedding(embedder: Embedder, text: str) -> list[float] | None:
             parts = _split_text_for_embedding(text, embedder.openai_embed_model, _embed_max_tokens())
             if client is not None and hasattr(client, "embeddings"):
                 response = client.embeddings.create(
-                    model=embedder.openai_embed_model,
-                    input=[part for part, _ in parts],
+                    **_openai_embedding_request(embedder, [part for part, _ in parts])
                 )
                 data = sorted(list(getattr(response, "data", []) or []), key=lambda row: getattr(row, "index", 0))
                 vectors = [getattr(row, "embedding", None) for row in data]
             elif hasattr(openai, "Embedding"):
                 response = openai.Embedding.create(  # type: ignore[attr-defined]
-                    model=embedder.openai_embed_model,
-                    input=[part for part, _ in parts],
+                    **_openai_embedding_request(embedder, [part for part, _ in parts])
                 )
                 data = sorted(response["data"], key=lambda row: row.get("index", 0))  # type: ignore[index]
                 vectors = [row.get("embedding") for row in data]
@@ -335,8 +338,7 @@ def _openai_embedding(embedder: Embedder, text: str) -> list[float] | None:
                 return _combine_embeddings(vectors, [weight for _, weight in parts])  # type: ignore[arg-type]
         if client is not None and hasattr(client, "embeddings"):
             response = client.embeddings.create(
-                model=embedder.openai_embed_model,
-                input=text,
+                **_openai_embedding_request(embedder, text)
             )
             data = getattr(response, "data", None)
             if data:
@@ -353,8 +355,7 @@ def _openai_embedding(embedder: Embedder, text: str) -> list[float] | None:
                     return vector
         elif hasattr(openai, "Embedding"):
             response = openai.Embedding.create(  # type: ignore[attr-defined]
-                model=embedder.openai_embed_model,
-                input=text,
+                **_openai_embedding_request(embedder, text)
             )
             vector = response["data"][0]["embedding"]  # type: ignore[index]
             if isinstance(vector, list):
