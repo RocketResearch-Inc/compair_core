@@ -261,7 +261,7 @@ class MainRetrievalTests(unittest.TestCase):
 
         self.assertFalse(allowed)
 
-    def test_should_reanalyze_existing_chunks_ignores_snapshot_only_new_chunks(self) -> None:
+    def test_should_reanalyze_existing_chunks_uses_remaining_slots_with_new_chunks(self) -> None:
         self.assertTrue(
             main._should_reanalyze_existing_chunks(
                 reanalyze_existing=True,
@@ -274,7 +274,7 @@ class MainRetrievalTests(unittest.TestCase):
                 meaningful_new_chunk_count=0,
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             main._should_reanalyze_existing_chunks(
                 reanalyze_existing=True,
                 meaningful_new_chunk_count=1,
@@ -557,6 +557,71 @@ class MainRetrievalTests(unittest.TestCase):
         self.assertGreaterEqual(len(ranked), 2)
         self.assertEqual(ranked[0].document_id, "contradiction")
 
+    def test_rerank_reference_chunks_can_diversify_repeated_candidate_paths(self) -> None:
+        target = (
+            "### File: README.md\n"
+            "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development.\n"
+            "Core logs verification emails to stdout through the configured mailer backend.\n"
+        )
+        candidates = [
+            DummyChunk(
+                chunk_id="docs-a",
+                document_id="repo",
+                content=(
+                    "### File: docs/user-guide.md\n"
+                    "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development.\n"
+                    "Verification emails are logged to stdout by the mailer backend.\n"
+                ),
+            ),
+            DummyChunk(
+                chunk_id="docs-b",
+                document_id="repo",
+                content=(
+                    "### File: docs/user-guide.md\n"
+                    "For local development, set `COMPAIR_EMAIL_BACKEND=stdout`.\n"
+                    "The mailer backend writes verification emails to stdout.\n"
+                ),
+            ),
+            DummyChunk(
+                chunk_id="impl",
+                document_id="repo",
+                content=(
+                    "### File: compair_core/server/providers/console_mailer.py\n"
+                    "class ConsoleMailer:\n"
+                    "    backend = 'stdout'\n"
+                    "    def send_verification_email(self, subject, sender, receivers, html):\n"
+                    "        print('[MAIL]', subject)\n"
+                ),
+            ),
+        ]
+
+        env_names = [
+            "COMPAIR_CODE_REPO_REFERENCE_LIMIT",
+            "COMPAIR_REFERENCE_ADJUDICATOR_ENABLED",
+            "COMPAIR_REFERENCE_ADJUDICATOR_TOP_K",
+            "COMPAIR_REFERENCE_PATH_DIVERSITY_PENALTY",
+            "COMPAIR_REFERENCE_SOURCE_PENALTY_WEIGHT",
+        ]
+        original_env = {name: os.environ.get(name) for name in env_names}
+        try:
+            os.environ["COMPAIR_CODE_REPO_REFERENCE_LIMIT"] = "2"
+            os.environ["COMPAIR_REFERENCE_ADJUDICATOR_ENABLED"] = "1"
+            os.environ["COMPAIR_REFERENCE_ADJUDICATOR_TOP_K"] = "3"
+            os.environ["COMPAIR_REFERENCE_PATH_DIVERSITY_PENALTY"] = "8"
+            os.environ["COMPAIR_REFERENCE_SOURCE_PENALTY_WEIGHT"] = "0"
+            ranked = main._rerank_reference_chunks(target, candidates, code_focus=True)
+        finally:
+            for name, value in original_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        selected_paths = [main._extract_snapshot_file_path(chunk.content) for chunk in ranked]
+        self.assertEqual(len(selected_paths), 2)
+        self.assertEqual(selected_paths.count("docs/user-guide.md"), 1)
+        self.assertIn("compair_core/server/providers/console_mailer.py", selected_paths)
+
     def test_reference_adjudication_payload_detects_docs_vs_impl_mismatch(self) -> None:
         payload = main._reference_adjudication_payload(
             target_text=(
@@ -575,6 +640,24 @@ class MainRetrievalTests(unittest.TestCase):
 
         self.assertEqual(payload["adjudicator_kind"], "docs-vs-impl mismatch")
         self.assertGreater(float(payload["adjudicator_score"]), 0.0)
+
+    def test_reference_adjudication_payload_does_not_treat_license_as_runtime_impl(self) -> None:
+        payload = main._reference_adjudication_payload(
+            target_text=(
+                "### File: docs/user-guide.md\n"
+                "Set `COMPAIR_EMAIL_BACKEND=stdout` for local development.\n"
+                "Core logs verification emails to stdout through the mailer backend.\n"
+            ),
+            candidate_text=(
+                "### File: LICENSE\n"
+                "GNU GENERAL PUBLIC LICENSE\n"
+                "Version 3, 29 June 2007\n"
+            ),
+            candidate_path="LICENSE",
+        )
+
+        self.assertNotEqual(payload["adjudicator_kind"], "docs-vs-impl mismatch")
+        self.assertLess(float(payload["adjudicator_score"]), 1.0)
 
     def test_reference_counterpart_signal_boosts_manifest_license_pair(self) -> None:
         manifest = (

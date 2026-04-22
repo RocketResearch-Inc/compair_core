@@ -215,6 +215,24 @@ _REFERENCE_TOKEN_STOPWORDS = {
 }
 
 logger = logging.getLogger(__name__)
+try:
+    from compair_cloud.reference_profile_defaults import apply_reference_profile_defaults as _apply_reference_profile_defaults
+except (ImportError, ModuleNotFoundError):
+    _REFERENCE_PROFILE_DEFAULTS = {"profile_id": None, "artifact_path": None, "applied": {}}
+else:
+    _reference_profile_env = os.environ
+    if not os.environ.get("COMPAIR_EDITION"):
+        _reference_profile_env = {**os.environ, "COMPAIR_EDITION": "core"}
+    _REFERENCE_PROFILE_DEFAULTS = _apply_reference_profile_defaults(_reference_profile_env)
+    if _reference_profile_env is not os.environ:
+        for _key, _value in (_REFERENCE_PROFILE_DEFAULTS.get("applied") or {}).items():
+            os.environ.setdefault(str(_key), str(_value))
+    if _REFERENCE_PROFILE_DEFAULTS.get("profile_id"):
+        logger.info(
+            "Applied reference profile defaults profile_id=%s applied=%d",
+            _REFERENCE_PROFILE_DEFAULTS["profile_id"],
+            len(_REFERENCE_PROFILE_DEFAULTS.get("applied") or {}),
+        )
 _ENV_VAR_EXCLUDE = {
     "HTTP",
     "HTTPS",
@@ -311,7 +329,7 @@ def _is_snapshot_metadata_chunk(chunk: str) -> bool:
 
 
 def _should_reanalyze_existing_chunks(*, reanalyze_existing: bool, meaningful_new_chunk_count: int) -> bool:
-    return bool(reanalyze_existing and meaningful_new_chunk_count == 0)
+    return bool(reanalyze_existing)
 
 
 def _is_code_review_chunk(doc: Document, text: str) -> bool:
@@ -483,6 +501,10 @@ def _reference_hybrid_reranker_blend() -> float:
     return _float_env("COMPAIR_REFERENCE_HYBRID_RERANKER_BLEND", 0.45, minimum=0.0, maximum=3.0)
 
 
+def _reference_reranker_score_weight() -> float:
+    return _float_env("COMPAIR_REFERENCE_RERANKER_SCORE_WEIGHT", 1.0, minimum=0.0, maximum=3.0)
+
+
 def _reference_hybrid_heuristic_blend() -> float:
     return _float_env("COMPAIR_REFERENCE_HYBRID_HEURISTIC_BLEND", 0.4, minimum=0.0, maximum=3.0)
 
@@ -569,6 +591,21 @@ def _reference_heuristic_diversity_penalty() -> float:
 
 def _reference_source_penalty_weight() -> float:
     return _float_env("COMPAIR_REFERENCE_SOURCE_PENALTY_WEIGHT", 0.75, minimum=0.0, maximum=6.0)
+
+
+def _reference_path_diversity_penalty() -> float:
+    return _float_env("COMPAIR_REFERENCE_PATH_DIVERSITY_PENALTY", 0.0, minimum=0.0, maximum=8.0)
+
+
+def _reference_max_per_path() -> int:
+    raw = os.getenv("COMPAIR_REFERENCE_MAX_PER_PATH")
+    if raw is None or not raw.strip():
+        return 0
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return 0
+    return max(0, min(8, value))
 
 
 def _reference_reranker_rescue_enabled() -> bool:
@@ -1759,6 +1796,41 @@ def _reference_source_key(chunk: Chunk) -> str:
     return f"chunk:{getattr(chunk, 'chunk_id', '')}"
 
 
+def _reference_path_key(source_key: str, candidate_path: str) -> str:
+    normalized_path = (candidate_path or "").strip().lower().replace("\\", "/")
+    if not normalized_path:
+        return ""
+    if source_key and not source_key.startswith("chunk:"):
+        return f"{source_key}:{normalized_path}"
+    return normalized_path
+
+
+def _embedding_list(value: object) -> list[float]:
+    """Convert stored embedding containers without relying on truthiness."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, (str, bytes, bytearray)):
+        return []
+    if hasattr(value, "tolist"):
+        try:
+            converted = value.tolist()
+            if isinstance(converted, list):
+                return converted
+            if isinstance(converted, tuple):
+                return list(converted)
+            return list(converted)
+        except Exception:
+            pass
+    try:
+        return list(value)  # type: ignore[arg-type]
+    except Exception:
+        return []
+
+
 def _reference_chunk_key(chunk: Chunk) -> str:
     chunk_id = getattr(chunk, "chunk_id", None)
     if chunk_id:
@@ -2245,11 +2317,15 @@ def _rerank_reference_chunks(
     hybrid_enabled = code_focus and _reference_hybrid_enabled()
     adjudicator_enabled = code_focus and _reference_adjudicator_enabled()
     reranker_rescue_enabled = reranker_enabled and adjudicator_enabled and _reference_reranker_rescue_enabled()
+    reranker_score_weight = _reference_reranker_score_weight() if reranker_enabled else 0.0
     used_indices: set[int] = set()
     source_counts: dict[str, int] = {}
+    path_counts: dict[str, int] = {}
     selected: list[Chunk] = []
     selected_tokens: list[set[str]] = []
     row_cache: dict[int, dict[str, object]] = {}
+    path_diversity_penalty_weight = _reference_path_diversity_penalty()
+    max_per_path = _reference_max_per_path()
 
     for idx, candidate in enumerate(trimmed):
         if getattr(candidate, "chunk_type", "") != "document":
@@ -2282,7 +2358,9 @@ def _rerank_reference_chunks(
         )
         preselection_score = float(row.get("heuristic_score") or 0.0)
         if reranker_enabled:
-            preselection_score = float(row.get("reranker_score") or 0.0)
+            weighted_reranker_score = reranker_score_weight * float(row.get("reranker_score") or 0.0)
+            row["weighted_reranker_score"] = round(weighted_reranker_score, 6)
+            preselection_score = weighted_reranker_score
             if hybrid_enabled:
                 preselection_score += _reference_hybrid_reranker_blend() * float(row.get("hybrid_score") or 0.0)
         elif hybrid_enabled:
@@ -2307,7 +2385,7 @@ def _rerank_reference_chunks(
             for idx, row in row_cache.items():
                 if idx in ranked_indices:
                     continue
-                reranker_score = float(row.get("reranker_score") or 0.0)
+                reranker_score = float(row.get("weighted_reranker_score") or 0.0)
                 counterpart_signal = float(row.get("counterpart_signal") or 0.0)
                 metadata_counterpart = bool(row.get("metadata_counterpart"))
                 ui_api_counterpart = bool(row.get("ui_api_counterpart"))
@@ -2352,8 +2430,11 @@ def _rerank_reference_chunks(
         debug_stats["reranker_enabled"] = reranker_enabled
         debug_stats["reranker_model_version"] = reranker_model_version
         debug_stats["reranker_model_path"] = reranker_model_path
+        debug_stats["reranker_score_weight"] = reranker_score_weight
         debug_stats["adjudicator_enabled"] = adjudicator_enabled
         debug_stats["reranker_rescue_enabled"] = reranker_rescue_enabled
+        debug_stats["path_diversity_penalty"] = path_diversity_penalty_weight
+        debug_stats["max_per_path"] = max_per_path
         debug_stats["row_debug_by_chunk_id"] = {
             str(getattr(trimmed[idx], "chunk_id", "") or ""): {
                 key: value
@@ -2362,6 +2443,7 @@ def _rerank_reference_chunks(
                 in {
                     "hybrid_score",
                     "reranker_score",
+                    "weighted_reranker_score",
                     "heuristic_score",
                     "fts_rank",
                     "counterpart_signal",
@@ -2382,6 +2464,7 @@ def _rerank_reference_chunks(
         best_index = -1
         best_score = float("-inf")
         best_tokens: set[str] | None = None
+        best_path_key = ""
         for idx, candidate in enumerate(trimmed):
             if idx in used_indices:
                 continue
@@ -2398,6 +2481,10 @@ def _rerank_reference_chunks(
             feature_row = row_cache.get(idx)
             if feature_row is None:
                 continue
+            candidate_path = str(feature_row.get("candidate_path") or "")
+            path_key = _reference_path_key(source_key, candidate_path)
+            if max_per_path > 0 and path_key and path_counts.get(path_key, 0) >= max_per_path:
+                continue
             diversity_penalty = 0.0
             if selected_tokens:
                 diversity_penalty = max(_token_overlap_ratio(candidate_tokens, prev) for prev in selected_tokens)
@@ -2405,7 +2492,7 @@ def _rerank_reference_chunks(
             preselection_score = float(feature_row.get("preselection_score") or 0.0)
             adjudicator_score = float(feature_row.get("adjudicator_score") or 0.0)
             adjudicator_kind = str(feature_row.get("adjudicator_kind") or "")
-            candidate_is_doc_like = _is_doc_like_path(str(feature_row.get("candidate_path") or ""))
+            candidate_is_doc_like = _is_doc_like_path(candidate_path)
             diversity_multiplier = (
                 _reference_reranker_diversity_penalty()
                 if reranker_enabled
@@ -2423,11 +2510,13 @@ def _rerank_reference_chunks(
                 )
             else:
                 score = preselection_score + (_reference_adjudicator_default_score_weight() * adjudicator_score)
-            score -= (diversity_penalty * diversity_multiplier) + source_penalty
+            path_penalty = path_diversity_penalty_weight * float(path_counts.get(path_key, 0)) if path_key else 0.0
+            score -= (diversity_penalty * diversity_multiplier) + source_penalty + path_penalty
             if score > best_score:
                 best_score = score
                 best_index = idx
                 best_tokens = candidate_tokens
+                best_path_key = path_key
 
         if best_index < 0:
             break
@@ -2436,6 +2525,8 @@ def _rerank_reference_chunks(
         used_indices.add(best_index)
         source_key = _reference_source_key(chosen)
         source_counts[source_key] = source_counts.get(source_key, 0) + 1
+        if best_path_key:
+            path_counts[best_path_key] = path_counts.get(best_path_key, 0) + 1
         selected.append(chosen)
         selected_tokens.append(best_tokens or set())
 
@@ -2745,6 +2836,14 @@ def _reference_adjudication_payload(
         (_is_ui_surface_path(target_path) and _is_api_surface_path(candidate_path))
         or (_is_ui_surface_path(candidate_path) and _is_api_surface_path(target_path))
     )
+    candidate_is_license_metadata = _is_license_metadata_path(candidate_path)
+    target_is_license_context = _is_license_metadata_path(target_path) or (
+        _is_high_signal_metadata_path(target_path)
+        and (
+            "license" in _reference_anchor_profile(target_text).key_names
+            or bool(_reference_anchor_profile(target_text).license_terms)
+        )
+    )
     looks_implementation = (not candidate_is_doc_like) and (
         "```" in candidate_text
         or re.search(r"\b(?:def|class|return|await|fetch|router|mapped_column|function)\b", candidate_text)
@@ -2759,6 +2858,9 @@ def _reference_adjudication_payload(
     elif ui_api_counterpart and kind in {None, "generic divergence", "rename", "presence/absence"} and (shared_structured >= 2 or counterpart_signal >= 1.2):
         kind = "route/path mismatch"
         confidence = max(confidence, 3)
+    if kind == "docs-vs-impl mismatch" and candidate_is_license_metadata and not metadata_counterpart and not target_is_license_context:
+        kind = "generic divergence"
+        confidence = min(confidence, 1)
     if kind == "generic divergence":
         adjudicator_score = 0.0 if target_is_doc_like and candidate_is_doc_like else min(0.45, 0.02 * float(match_score))
     else:
@@ -2803,8 +2905,8 @@ def _reference_candidate_feature_row(
     artifact_score = min(_artifact_overlap_score(query_text, content), 4.0)
     anchor_overlap = _reference_anchor_overlap_score(query_text, content)
     anchor_conflict = _reference_anchor_conflict_score(query_text, content)
-    source_embedding = getattr(source_chunk, "embedding", None) or []
-    candidate_embedding = getattr(candidate, "embedding", None) or []
+    source_embedding = _embedding_list(getattr(source_chunk, "embedding", None))
+    candidate_embedding = _embedding_list(getattr(candidate, "embedding", None))
     counterpart_signal = _reference_counterpart_signal(source_content, content)
     metadata_counterpart = (
         _is_high_signal_metadata_path(target_path)
