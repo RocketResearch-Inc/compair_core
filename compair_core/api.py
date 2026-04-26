@@ -473,27 +473,44 @@ def _render_email(template: str, **context: str) -> str:
 def _dispatch_process_document_task(
     user_id: str,
     doc_id: str,
-    doc_text: str,
+    doc_text: str | None,
     generate_feedback: bool,
     chunk_mode: Optional[str] = None,
     reanalyze_existing: bool = False,
+    snapshot_payload_key: str | None = None,
 ):
     task_callable = getattr(process_document_celery, "delay", None)
     if callable(task_callable):
         try:
-            return task_callable(user_id, doc_id, doc_text, generate_feedback, chunk_mode, reanalyze_existing)
+            return task_callable(
+                user_id,
+                doc_id,
+                doc_text or "",
+                generate_feedback,
+                chunk_mode,
+                reanalyze_existing,
+                snapshot_payload_key=snapshot_payload_key,
+            )
         except TypeError:
             try:
-                return task_callable(user_id, doc_id, doc_text, generate_feedback, chunk_mode)
+                return task_callable(user_id, doc_id, doc_text or "", generate_feedback, chunk_mode)
             except TypeError:
-                return task_callable(user_id, doc_id, doc_text, generate_feedback)
+                return task_callable(user_id, doc_id, doc_text or "", generate_feedback)
     try:
-        return process_document_celery(user_id, doc_id, doc_text, generate_feedback, chunk_mode, reanalyze_existing)
+        return process_document_celery(
+            user_id,
+            doc_id,
+            doc_text or "",
+            generate_feedback,
+            chunk_mode,
+            reanalyze_existing,
+            snapshot_payload_key=snapshot_payload_key,
+        )
     except TypeError:
         try:
-            return process_document_celery(user_id, doc_id, doc_text, generate_feedback, chunk_mode)
+            return process_document_celery(user_id, doc_id, doc_text or "", generate_feedback, chunk_mode)
         except TypeError:
-            return process_document_celery(user_id, doc_id, doc_text, generate_feedback)
+            return process_document_celery(user_id, doc_id, doc_text or "", generate_feedback)
 
 
 def _json_safe_task_meta(value: Any) -> Any:
@@ -640,6 +657,7 @@ HAS_REFERRALS = hasattr(models.User, "referral_code")
 HAS_BILLING = hasattr(models.User, "stripe_customer_id")
 HAS_TRIALS = hasattr(models.User, "trial_expiration_date")
 HAS_REDIS = redis_client is not None
+_PROCESS_DOC_PAYLOAD_TTL_SEC = 3600
 
 
 def require_feature(flag: bool, feature: str) -> None:
@@ -655,6 +673,29 @@ def _decode_optional_base64(value: str | None, field_name: str) -> str | None:
         return decoded.decode("utf-8")
     except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
         raise HTTPException(status_code=400, detail=f"Invalid base64 payload for {field_name}") from exc
+
+
+def _estimate_b64_decoded_bytes(value: str) -> int:
+    stripped = (value or "").strip()
+    if not stripped:
+        return 0
+    padding = stripped.count("=")
+    return max(0, (len(stripped) * 3 // 4) - padding)
+
+
+def _stage_process_doc_payload(*, doc_text: str | None, doc_text_b64: str | None) -> str | None:
+    if not HAS_REDIS or redis_client is None:
+        return None
+    payload: dict[str, str] = {}
+    if doc_text_b64 is not None:
+        payload["doc_text_b64"] = doc_text_b64
+    elif doc_text is not None:
+        payload["doc_text"] = doc_text
+    else:
+        return None
+    key = f"process_doc_payload:{secrets.token_urlsafe(24)}"
+    redis_client.setex(key, _PROCESS_DOC_PAYLOAD_TTL_SEC, json.dumps(payload, ensure_ascii=False))
+    return key
 
 def get_current_user(auth_token: str | None = Header(None)):
     settings = get_settings_dependency()
@@ -2314,11 +2355,36 @@ async def process_doc(
     current_user: models.User = Depends(get_current_user),
     analytics: Analytics = Depends(get_analytics),
 ) -> Mapping[str, str | None]:
-    decoded_doc_text = _decode_optional_base64(doc_text_b64, "doc_text_b64")
-    if decoded_doc_text is not None:
-        doc_text = decoded_doc_text
-    if doc_text is None:
+    if doc_text is None and doc_text_b64 is None:
         raise HTTPException(status_code=422, detail="doc_text or doc_text_b64 is required")
+
+    staged_payload_key: str | None = None
+    if HAS_REDIS:
+        try:
+            staged_payload_key = _stage_process_doc_payload(doc_text=doc_text, doc_text_b64=doc_text_b64)
+        except Exception as exc:
+            logger.warning("process_doc payload staging failed: %s", exc)
+
+    if staged_payload_key is None:
+        decoded_doc_text = _decode_optional_base64(doc_text_b64, "doc_text_b64")
+        if decoded_doc_text is not None:
+            doc_text = decoded_doc_text
+        if doc_text is None:
+            raise HTTPException(status_code=422, detail="doc_text or doc_text_b64 is required")
+
+    payload_bytes = (
+        _estimate_b64_decoded_bytes(doc_text_b64)
+        if doc_text_b64 is not None
+        else len((doc_text or "").encode("utf-8"))
+    )
+    log_event(
+        "process_doc_request_received",
+        user_id=current_user.user_id,
+        doc_id=doc_id,
+        payload_transport="doc_text_b64" if doc_text_b64 is not None else "doc_text",
+        payload_bytes=payload_bytes,
+        staged_via_redis=bool(staged_payload_key),
+    )
 
     with compair.Session() as session:
         doc = session.query(models.Document).filter(models.Document.document_id == doc_id).first()
@@ -2338,6 +2404,7 @@ async def process_doc(
         generate_feedback=generate_feedback,
         chunk_mode=chunk_mode,
         reanalyze_existing=reanalyze_existing,
+        snapshot_payload_key=staged_payload_key,
     )
     task_id = getattr(task_result, "id", None)
 

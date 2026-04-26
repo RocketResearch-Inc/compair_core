@@ -46,6 +46,7 @@ except (ImportError, ModuleNotFoundError) as exc:
         generate_feedback: bool = True,
         chunk_mode: Optional[str] = None,
         reanalyze_existing: bool = False,
+        snapshot_payload_key: Optional[str] = None,
     ) -> Mapping[str, list[str]]:
         SessionMaker, Embedder, Reviewer, log_event, process_document, Document, User, extract_topic_tags = _lazy_components()
         with SessionMaker() as session:
