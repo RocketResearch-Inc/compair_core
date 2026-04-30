@@ -13,6 +13,7 @@ import re
 
 from sqlalchemy.orm import Session
 
+from ..logger import log_event
 from ..local_summary import assess_relation, best_grounded_excerpt, excerpt_tokens
 from ..models import Chunk, Document, NotificationEvent
 from .delivery_logic import (
@@ -101,6 +102,10 @@ def is_scoring_enabled() -> bool:
     if os.getenv("COMPAIR_NOTIFICATION_SCORING_ENABLED") is not None:
         return _bool_env("COMPAIR_NOTIFICATION_SCORING_ENABLED", default)
     return _bool_env("NOTIFICATION_SCORING_ENABLED", default)
+
+
+def _notification_score_trace_enabled() -> bool:
+    return _bool_env("COMPAIR_NOTIFICATION_SCORING_TRACE", False) or _bool_env("NOTIFICATION_SCORING_TRACE", False)
 
 
 @dataclass(frozen=True)
@@ -393,6 +398,22 @@ def _build_payload(candidate: NotificationCandidate) -> Dict[str, Any]:
     }
 
 
+def _assessment_trace_dict(assessment: ParsedLLMNotificationAssessment) -> Dict[str, Any]:
+    return {
+        "intent": assessment.intent,
+        "relevance": assessment.relevance,
+        "novelty": assessment.novelty,
+        "severity": assessment.severity,
+        "certainty": assessment.certainty,
+        "delivery": assessment.delivery,
+        "parse_mode": assessment.parse_mode,
+        "errors": list(assessment.errors or []),
+        "rationale": list(assessment.rationale or []),
+        "evidence_target": assessment.evidence_target,
+        "evidence_peer": assessment.evidence_peer,
+    }
+
+
 def _count_pushes_last_24h(session: Session, user_id: str) -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
     try:
@@ -550,10 +571,28 @@ def score_and_route_candidate(
     scorer = scorer or NotificationScorer(NotificationScorerConfig())
 
     payload = _build_payload(candidate)
+    if _notification_score_trace_enabled():
+        log_event(
+            "notification_score_trace",
+            stage="input",
+            run_id=candidate.run_id,
+            target_doc_id=candidate.target_doc_id,
+            target_chunk_id=candidate.target_chunk_id,
+            payload=payload,
+        )
     assessment = scorer.score(payload)
     assessment = _ground_notification_assessment(candidate, assessment)
     assessment = _calibrate_assessment_from_feedback(candidate, assessment)
     assessment = _enforce_assessment_consistency(candidate, assessment)
+    if _notification_score_trace_enabled():
+        log_event(
+            "notification_score_trace",
+            stage="result",
+            run_id=candidate.run_id,
+            target_doc_id=candidate.target_doc_id,
+            target_chunk_id=candidate.target_chunk_id,
+            assessment=_assessment_trace_dict(assessment),
+        )
 
     ctx = CandidateContext(
         user_id=candidate.user_id,

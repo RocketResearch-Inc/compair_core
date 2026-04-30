@@ -2368,15 +2368,24 @@ def _rerank_reference_chunks(
         row["preselection_score"] = round(preselection_score, 6)
         row_cache[idx] = row
 
+    ranked_preselection = sorted(
+        row_cache.items(),
+        key=lambda item: float(item[1].get("preselection_score") or 0.0),
+        reverse=True,
+    )
+    for rank, (idx, row) in enumerate(ranked_preselection, start=1):
+        row["preselection_rank"] = rank
+
+    initial_adjudication_cutoff: float | None = None
+
     if adjudicator_enabled and row_cache:
         top_k = _reference_adjudicator_top_k()
-        ranked_for_adjudication = sorted(
-            row_cache.items(),
-            key=lambda item: float(item[1].get("preselection_score") or 0.0),
-            reverse=True,
-        )[:top_k]
+        ranked_for_adjudication = ranked_preselection[:top_k]
+        if ranked_for_adjudication:
+            initial_adjudication_cutoff = float(ranked_for_adjudication[-1][1].get("preselection_score") or 0.0)
         ranked_indices = {idx for idx, _ in ranked_for_adjudication}
         rescued_indices: set[int] = set()
+        adjudication_reason_by_idx: dict[int, str] = {idx: "top_k" for idx in ranked_indices}
         if reranker_rescue_enabled:
             rescue_count = _reference_reranker_rescue_count()
             rescue_min_score = _reference_reranker_rescue_min_score()
@@ -2404,7 +2413,13 @@ def _rerank_reference_chunks(
                 row["rescued_for_adjudication"] = True
                 ranked_for_adjudication.append((idx, row))
                 rescued_indices.add(idx)
+                adjudication_reason_by_idx[idx] = "rescued"
         positive_count = 0
+        for idx, row in row_cache.items():
+            row["adjudicated"] = idx in ranked_indices or idx in rescued_indices
+            row["adjudication_reason"] = adjudication_reason_by_idx.get(idx, "below_preselection_cutoff")
+        for adjudication_rank, (idx, row) in enumerate(ranked_for_adjudication, start=1):
+            row["adjudication_rank"] = adjudication_rank
         for idx, row in ranked_for_adjudication:
             candidate = trimmed[idx]
             content = getattr(candidate, "content", "") or ""
@@ -2424,6 +2439,12 @@ def _rerank_reference_chunks(
             debug_stats["adjudicated_candidate_count"] = len(ranked_for_adjudication)
             debug_stats["positive_adjudication_count"] = positive_count
             debug_stats["rescued_adjudication_count"] = len(rescued_indices)
+            debug_stats["adjudicator_top_k"] = top_k
+            debug_stats["adjudicator_preselection_cutoff"] = initial_adjudication_cutoff
+    else:
+        for idx, row in row_cache.items():
+            row["adjudicated"] = False
+            row["adjudication_reason"] = "adjudicator_disabled"
 
     if debug_stats is not None:
         debug_stats["hybrid_enabled"] = hybrid_enabled
@@ -2433,8 +2454,37 @@ def _rerank_reference_chunks(
         debug_stats["reranker_score_weight"] = reranker_score_weight
         debug_stats["adjudicator_enabled"] = adjudicator_enabled
         debug_stats["reranker_rescue_enabled"] = reranker_rescue_enabled
+        debug_stats["trim_limit"] = trim_limit
+        debug_stats["trimmed_candidate_count"] = len(trimmed)
         debug_stats["path_diversity_penalty"] = path_diversity_penalty_weight
         debug_stats["max_per_path"] = max_per_path
+    round1_scores: list[tuple[float, int]] = []
+    for idx, row in row_cache.items():
+        candidate = trimmed[idx]
+        candidate_path = str(row.get("candidate_path") or "")
+        preselection_score = float(row.get("preselection_score") or 0.0)
+        adjudicator_score = float(row.get("adjudicator_score") or 0.0)
+        adjudicator_kind = str(row.get("adjudicator_kind") or "")
+        candidate_is_doc_like = _is_doc_like_path(candidate_path)
+        if adjudicator_kind in {"docs-vs-impl mismatch", "route/path mismatch", "value mismatch", "rename", "presence/absence"}:
+            round1_score = (
+                _reference_adjudicator_mismatch_preselection_weight() * preselection_score
+                + _reference_adjudicator_mismatch_score_weight() * adjudicator_score
+            )
+        elif target_is_doc_like and candidate_is_doc_like:
+            round1_score = (
+                _reference_adjudicator_docdoc_preselection_weight() * preselection_score
+                + _reference_adjudicator_docdoc_score_weight() * adjudicator_score
+            )
+        else:
+            round1_score = preselection_score + (_reference_adjudicator_default_score_weight() * adjudicator_score)
+        row["selector_round1_score"] = round(round1_score, 6)
+        round1_scores.append((round1_score, idx))
+    round1_scores.sort(key=lambda item: item[0], reverse=True)
+    for rank, (_score, idx) in enumerate(round1_scores, start=1):
+        row_cache[idx]["selector_round1_rank"] = rank
+
+    if debug_stats is not None:
         debug_stats["row_debug_by_chunk_id"] = {
             str(getattr(trimmed[idx], "chunk_id", "") or ""): {
                 key: value
@@ -2449,11 +2499,17 @@ def _rerank_reference_chunks(
                     "counterpart_signal",
                     "counterpart_rank",
                     "preselection_score",
+                    "preselection_rank",
+                    "adjudicated",
+                    "adjudication_reason",
+                    "adjudication_rank",
                     "adjudicator_score",
                     "adjudicator_kind",
                     "adjudicator_confidence",
                     "adjudicator_match_score",
                     "rescued_for_adjudication",
+                    "selector_round1_score",
+                    "selector_round1_rank",
                 }
             }
             for idx, row in row_cache.items()

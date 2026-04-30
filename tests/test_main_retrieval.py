@@ -903,6 +903,7 @@ class MainRetrievalTests(unittest.TestCase):
         )
         candidates = [
             DummyChunk(
+                chunk_id="docs-peer",
                 document_id="docs-peer",
                 content=(
                     "### File: docs/quickstart.md\n"
@@ -911,6 +912,7 @@ class MainRetrievalTests(unittest.TestCase):
                 ),
             ),
             DummyChunk(
+                chunk_id="impl-peer",
                 document_id="impl-peer",
                 content=(
                     "### File: compair_core/server/providers/console_mailer.py\n"
@@ -920,12 +922,13 @@ class MainRetrievalTests(unittest.TestCase):
                 ),
             ),
         ]
+        debug_stats: dict[str, object] = {}
         original_hybrid = os.environ.get("COMPAIR_REFERENCE_HYBRID_ENABLED")
         original_adjudicator = os.environ.get("COMPAIR_REFERENCE_ADJUDICATOR_ENABLED")
         try:
             os.environ["COMPAIR_REFERENCE_HYBRID_ENABLED"] = "1"
             os.environ["COMPAIR_REFERENCE_ADJUDICATOR_ENABLED"] = "1"
-            ranked = main._rerank_reference_chunks(target, candidates, code_focus=True)
+            ranked = main._rerank_reference_chunks(target, candidates, code_focus=True, debug_stats=debug_stats)
         finally:
             if original_hybrid is None:
                 os.environ.pop("COMPAIR_REFERENCE_HYBRID_ENABLED", None)
@@ -938,6 +941,25 @@ class MainRetrievalTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(ranked), 2)
         self.assertEqual(ranked[0].document_id, "impl-peer")
+        self.assertEqual(debug_stats.get("trimmed_candidate_count"), 2)
+        self.assertIn("adjudicator_top_k", debug_stats)
+        row_debug = debug_stats.get("row_debug_by_chunk_id")
+        self.assertIsInstance(row_debug, dict)
+        assert isinstance(row_debug, dict)
+        docs_debug = row_debug.get("docs-peer")
+        impl_debug = row_debug.get("impl-peer")
+        self.assertIsInstance(docs_debug, dict)
+        self.assertIsInstance(impl_debug, dict)
+        assert isinstance(docs_debug, dict)
+        assert isinstance(impl_debug, dict)
+        for entry in (docs_debug, impl_debug):
+            self.assertIn("preselection_score", entry)
+            self.assertIn("preselection_rank", entry)
+            self.assertIn("adjudicated", entry)
+            self.assertIn("adjudication_reason", entry)
+            self.assertIn("selector_round1_score", entry)
+            self.assertIn("selector_round1_rank", entry)
+        self.assertTrue(bool(impl_debug.get("adjudicated")))
 
     def test_rerank_reference_chunks_rescue_high_reranker_docs_to_impl_candidate(self) -> None:
         target = (
@@ -976,6 +998,7 @@ class MainRetrievalTests(unittest.TestCase):
             ),
         ]
 
+        debug_stats: dict[str, object] = {}
         original_hybrid = os.environ.get("COMPAIR_REFERENCE_HYBRID_ENABLED")
         original_adjudicator = os.environ.get("COMPAIR_REFERENCE_ADJUDICATOR_ENABLED")
         original_top_k = os.environ.get("COMPAIR_REFERENCE_ADJUDICATOR_TOP_K")
@@ -991,11 +1014,11 @@ class MainRetrievalTests(unittest.TestCase):
             os.environ["COMPAIR_REFERENCE_RERANKER_RESCUE_MIN_SCORE"] = "0.5"
             main._reference_reranker_metadata = lambda: (True, "test-model", "/tmp/test-model.json")
             main._reference_reranker_score = lambda row: (
-                1.25
+                0.6
                 if str(row.get("candidate_path") or "").endswith("console_mailer.py")
                 else 0.25
             )
-            ranked = main._rerank_reference_chunks(target, candidates, code_focus=True)
+            ranked = main._rerank_reference_chunks(target, candidates, code_focus=True, debug_stats=debug_stats)
         finally:
             main._reference_reranker_metadata = original_metadata
             main._reference_reranker_score = original_score
@@ -1022,6 +1045,16 @@ class MainRetrievalTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(ranked), 3)
         self.assertEqual(ranked[0].document_id, "impl-peer")
+        row_debug = debug_stats.get("row_debug_by_chunk_id")
+        self.assertIsInstance(row_debug, dict)
+        assert isinstance(row_debug, dict)
+        impl_debug = row_debug.get("impl-peer")
+        self.assertIsInstance(impl_debug, dict)
+        assert isinstance(impl_debug, dict)
+        self.assertEqual(impl_debug.get("adjudication_reason"), "rescued")
+        self.assertTrue(bool(impl_debug.get("rescued_for_adjudication")))
+        self.assertEqual(impl_debug.get("adjudication_rank"), 2)
+        self.assertEqual(debug_stats.get("rescued_adjudication_count"), 1)
 
     def test_chunk_relevance_score_boosts_structured_doc_chunks(self) -> None:
         generic_doc = (

@@ -142,6 +142,73 @@ class NotificationScorerTests(unittest.TestCase):
         self.assertTrue(request["text"]["format"]["strict"])
         self.assertEqual(request["text"]["format"]["name"], "notification_score")
 
+    def test_score_rubric_uses_structured_path_only(self) -> None:
+        client = _FakeClient(
+            [
+                _FakeResponse(
+                    json.dumps(
+                        {
+                            "same_surface_area": "yes",
+                            "direct_contradiction": "yes",
+                            "docs_vs_impl_drift": "yes",
+                            "user_or_runtime_impact": "yes",
+                            "policy_or_release_risk": "no",
+                            "duplication_or_overlap": "no",
+                            "alignment_or_confirmation": "no",
+                            "novel_for_user": "yes",
+                            "rationale": ["Target and peer disagree on the route path."],
+                            "evidence_target": "| `activity` | `GET /activity_feed` |",
+                            "evidence_peer": "| `activity` | `GET /get_activity_feed` |",
+                        }
+                    )
+                )
+            ]
+        )
+        scorer = scorer_module.NotificationScorer(
+            config=scorer_module.NotificationScorerConfig(max_retries=1),
+            client=client,
+        )
+
+        result = scorer.score_rubric(_payload())
+
+        self.assertEqual(result.parse_mode, "json_schema_rubric")
+        self.assertEqual(len(client.responses.requests), 1)
+        request = client.responses.requests[0]
+        self.assertIn("text", request)
+        self.assertEqual(request["text"]["format"]["type"], "json_schema")
+
+    def test_score_direct_uses_non_structured_path(self) -> None:
+        client = _FakeClient(
+            [
+                _FakeResponse(
+                    json.dumps(
+                        {
+                            "intent": "potential_conflict",
+                            "relevance": "HIGH",
+                            "novelty": "HIGH",
+                            "severity": "HIGH",
+                            "certainty": "HIGH",
+                            "delivery": "push",
+                            "rationale": ["Target and peer disagree on the route path."],
+                            "evidence_target": "| `activity` | `GET /activity_feed` |",
+                            "evidence_peer": "| `activity` | `GET /get_activity_feed` |",
+                        }
+                    )
+                )
+            ]
+        )
+        scorer = scorer_module.NotificationScorer(
+            config=scorer_module.NotificationScorerConfig(max_retries=1),
+            client=client,
+        )
+
+        result = scorer.score_direct(_payload())
+
+        self.assertEqual(result.intent, "potential_conflict")
+        self.assertEqual(len(client.responses.requests), 1)
+        request = client.responses.requests[0]
+        self.assertNotIn("text", request)
+
     def test_structured_request_uses_configured_timeout(self) -> None:
         client = _FakeClient(
             [

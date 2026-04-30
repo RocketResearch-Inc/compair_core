@@ -562,6 +562,27 @@ class NotificationScorer:
                 self.client = None
 
     def score(self, payload: Dict[str, Any]) -> ParsedLLMNotificationAssessment:
+        return self._score_auto(payload)
+
+    def score_rubric(self, payload: Dict[str, Any]) -> ParsedLLMNotificationAssessment:
+        provider = (self.config.provider or "auto").lower()
+        if provider == "heuristic" or self.client is None:
+            return conservative_default(
+                "failed_default",
+                errors=["OpenAI scorer unavailable for rubric replay mode."],
+            )
+        return self._score_rubric(payload)
+
+    def score_direct(self, payload: Dict[str, Any]) -> ParsedLLMNotificationAssessment:
+        provider = (self.config.provider or "auto").lower()
+        if provider == "heuristic" or self.client is None:
+            return conservative_default(
+                "failed_default",
+                errors=["OpenAI scorer unavailable for direct replay mode."],
+            )
+        return self._score_direct(payload)
+
+    def _score_auto(self, payload: Dict[str, Any]) -> ParsedLLMNotificationAssessment:
         provider = (self.config.provider or "auto").lower()
         if provider == "heuristic":
             return _heuristic_assessment(payload)
@@ -569,10 +590,7 @@ class NotificationScorer:
         if self.client is None:
             return _heuristic_assessment(payload)
 
-        rubric_system = RUBRIC_SYSTEM_INSTRUCTIONS
-        rubric_user = build_rubric_user_prompt(payload)
-
-        structured = self._score_once_structured(rubric_system, rubric_user)
+        structured = self._score_rubric(payload)
         if structured.parse_mode != "failed_default":
             return structured
         if _has_transport_error(structured.errors):
@@ -584,19 +602,36 @@ class NotificationScorer:
                 }
             )
 
+        direct = self._score_direct(payload)
+        if direct.parse_mode != "failed_default":
+            return direct
+        if _has_transport_error(direct.errors):
+            heuristic = _heuristic_assessment(payload)
+            return ParsedLLMNotificationAssessment(
+                **{
+                    **heuristic.__dict__,
+                    "errors": ["OpenAI scorer transport failure; heuristic fallback used.", *(direct.errors or [])],
+                }
+            )
+
+        heuristic = _heuristic_assessment(payload)
+        return ParsedLLMNotificationAssessment(
+            **{**heuristic.__dict__, "errors": ["OpenAI scorer failed; heuristic fallback used."]}
+        )
+
+    def _score_rubric(self, payload: Dict[str, Any]) -> ParsedLLMNotificationAssessment:
+        rubric_system = RUBRIC_SYSTEM_INSTRUCTIONS
+        rubric_user = build_rubric_user_prompt(payload)
+        return self._score_once_structured(rubric_system, rubric_user)
+
+    def _score_direct(self, payload: Dict[str, Any]) -> ParsedLLMNotificationAssessment:
         system = SYSTEM_INSTRUCTIONS
         user = build_user_prompt(payload)
         first = self._score_once(system, user)
         if first.parse_mode != "failed_default":
             return first
         if _has_transport_error(first.errors):
-            heuristic = _heuristic_assessment(payload)
-            return ParsedLLMNotificationAssessment(
-                **{
-                    **heuristic.__dict__,
-                    "errors": ["OpenAI scorer transport failure; heuristic fallback used.", *(first.errors or [])],
-                }
-            )
+            return conservative_default("failed_default", errors=list(first.errors or []))
 
         repaired_prompt = build_repair_prompt(first.raw_extracted or user)
         repaired = self._score_once(
@@ -605,19 +640,7 @@ class NotificationScorer:
         )
         if repaired.parse_mode != "failed_default":
             return repaired
-        if _has_transport_error(repaired.errors):
-            heuristic = _heuristic_assessment(payload)
-            return ParsedLLMNotificationAssessment(
-                **{
-                    **heuristic.__dict__,
-                    "errors": ["OpenAI scorer transport failure; heuristic fallback used.", *(repaired.errors or [])],
-                }
-            )
-
-        heuristic = _heuristic_assessment(payload)
-        return ParsedLLMNotificationAssessment(
-            **{**heuristic.__dict__, "errors": ["OpenAI scorer failed; heuristic fallback used."]}
-        )
+        return conservative_default("failed_default", errors=list(repaired.errors or ["All direct attempts failed"]))
 
     def _score_once_structured(self, system_prompt: str, user_prompt: str) -> ParsedLLMNotificationAssessment:
         raw, last_err = self._responses_create_text(
