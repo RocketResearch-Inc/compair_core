@@ -156,6 +156,12 @@ _VALIDATION_TERMS = {"aligns", "aligned", "reinforces", "confirms", "validated",
 _HIGH_SEVERITY_TERMS = {"break", "broken", "silently", "mislead", "misleading", "error", "hang", "contract", "api"}
 _HIGH_RELEVANCE_TERMS = {"api", "contract", "schema", "field", "endpoint", "env", "sync", "install", "publish"}
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]{3,}")
+_WEAK_HEURISTIC_PREFIXES = (
+    "possible cross-repo drift detected",
+    "the changed content says ",
+    "the changed text says ",
+    "this may rename ",
+)
 
 
 def _getenv(*names: str, default: Optional[str] = None) -> Optional[str]:
@@ -390,12 +396,43 @@ def _feedback_summary(payload: Dict[str, Any]) -> str:
     return ""
 
 
+def _is_weak_heuristic_summary(summary: str) -> bool:
+    lowered = (summary or "").strip().lower()
+    if not lowered:
+        return False
+    if lowered.startswith("possible route/path drift:"):
+        return False
+    if lowered.startswith("possible value drift:"):
+        return False
+    if lowered.startswith("possible docs-vs-implementation drift"):
+        return False
+    if lowered.startswith("possible cross-repo drift:"):
+        return False
+    return any(lowered.startswith(prefix) for prefix in _WEAK_HEURISTIC_PREFIXES)
+
+
 def _heuristic_assessment(payload: Dict[str, Any]) -> ParsedLLMNotificationAssessment:
     target = payload.get("target") or {}
     peer = _first_peer(payload)
     summary = _feedback_summary(payload)
     target_excerpt = (target.get("chunk_excerpt") or target.get("chunk_text") or "").strip()
     peer_excerpt = (peer.get("peer_excerpt") or peer.get("peer_chunk_text") or "").strip()
+
+    if _is_weak_heuristic_summary(summary):
+        return ParsedLLMNotificationAssessment(
+            intent="quiet_validation",
+            relevance="LOW",
+            novelty="LOW",
+            severity="LOW",
+            certainty="LOW",
+            delivery="digest",
+            rationale=["Heuristic local summary was too weak or generic to surface as a notification."],
+            evidence_target=target_excerpt[:280] if target_excerpt else "",
+            evidence_peer=peer_excerpt[:280] if peer_excerpt else "",
+            parse_mode="heuristic",
+            raw_extracted=None,
+            errors=[],
+        )
 
     text = " ".join([summary, target_excerpt, peer_excerpt]).lower()
     intent = "relevant_update"

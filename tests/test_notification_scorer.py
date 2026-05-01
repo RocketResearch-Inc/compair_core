@@ -353,6 +353,20 @@ class NotificationScorerTests(unittest.TestCase):
         self.assertEqual(result.intent, "potential_conflict")
         self.assertEqual(calls, ["structured"])
 
+    def test_heuristic_assessment_drops_generic_local_summary(self) -> None:
+        payload = _payload()
+        payload["generated_feedback"]["summary"] = (
+            "The changed text says \"Compair Core Quickstart\", while the reference implementation says \"provider=openai\"."
+        )
+
+        result = scorer_module._heuristic_assessment(payload)
+
+        self.assertEqual(result.intent, "quiet_validation")
+        self.assertEqual(result.relevance, "LOW")
+        self.assertEqual(result.novelty, "LOW")
+        self.assertEqual(result.severity, "LOW")
+        self.assertEqual(result.rationale[0], "Heuristic local summary was too weak or generic to surface as a notification.")
+
 
 if __name__ == "__main__":
     unittest.main()

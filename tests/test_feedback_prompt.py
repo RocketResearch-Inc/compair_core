@@ -160,8 +160,7 @@ class FeedbackPromptTests(unittest.TestCase):
 
         summary = feedback._render_local_reference_match(match)
 
-        self.assertIn("Possible cross-repo drift detected", summary)
-        self.assertIn("bundled local review path", summary)
+        self.assertIsNone(summary)
 
     def test_render_local_reference_match_avoids_specific_path_when_excerpt_has_many_paths(self) -> None:
         relation = SimpleNamespace(
@@ -183,8 +182,25 @@ class FeedbackPromptTests(unittest.TestCase):
 
         summary = feedback._render_local_reference_match(match)
 
-        self.assertIn("Possible cross-repo drift detected", summary)
-        self.assertNotIn('/notification_events', summary)
+        self.assertIsNone(summary)
+
+    def test_render_local_reference_match_suppresses_punctuation_only_rename(self) -> None:
+        relation = SimpleNamespace(
+            kind="rename",
+            confidence=6,
+            target_artifact="new.user",
+            peer_artifact="new.user:",
+        )
+        match = SimpleNamespace(
+            relation=relation,
+            reference_label="RocketResearch-Inc/compair_ui",
+            target_excerpt='username = "new.user"',
+            peer_excerpt='username = "new.user:"',
+        )
+
+        summary = feedback._render_local_reference_match(match)
+
+        self.assertIsNone(summary)
 
     def test_local_references_prefer_file_path_in_label(self) -> None:
         ref = SimpleNamespace(

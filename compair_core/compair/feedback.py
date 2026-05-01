@@ -350,13 +350,84 @@ def _generic_local_quality_note(reference_label: str) -> str:
     )
 
 
+def _normalized_local_artifact(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+
+def _looks_like_local_import_or_header(text: str) -> bool:
+    candidate = (text or "").strip().lower()
+    if not candidate:
+        return True
+    return candidate.startswith("#") or candidate.startswith("import ") or candidate.startswith("from ")
+
+
+def _local_structured_overlap(target_excerpt: str, peer_excerpt: str) -> tuple[set[str], set[str], set[str], set[str]]:
+    target_profile = extract_artifacts(target_excerpt)
+    peer_profile = extract_artifacts(peer_excerpt)
+    shared_keys = set(target_profile.key_names & peer_profile.key_names)
+    shared_quotes = set(target_profile.quoted_norm & peer_profile.quoted_norm)
+    shared_paths = set(target_profile.path_tokens & peer_profile.path_tokens)
+    shared_tokens = set(target_profile.tokens & peer_profile.tokens)
+    return shared_keys, shared_quotes, shared_paths, shared_tokens
+
+
+def _local_docs_impl_focus(target_excerpt: str, peer_excerpt: str) -> str:
+    shared_keys, shared_quotes, shared_paths, shared_tokens = _local_structured_overlap(target_excerpt, peer_excerpt)
+    if shared_keys:
+        return sorted(shared_keys)[0]
+    if shared_quotes:
+        return sorted(shared_quotes)[0]
+    if shared_paths:
+        return sorted(shared_paths)[0]
+    if shared_tokens:
+        return sorted(shared_tokens)[0]
+    return ""
+
+
+def _should_surface_local_reference_match(match: Any) -> bool:
+    relation = getattr(match, "relation", None)
+    if relation is None:
+        return False
+
+    kind = getattr(relation, "kind", None)
+    confidence = int(getattr(relation, "confidence", 0) or 0)
+    target_artifact = (getattr(relation, "target_artifact", "") or "").strip()
+    peer_artifact = (getattr(relation, "peer_artifact", "") or "").strip()
+    target_excerpt = getattr(match, "target_excerpt", "") or ""
+    peer_excerpt = getattr(match, "peer_excerpt", "") or ""
+
+    if kind is None or kind == "generic divergence" or confidence <= 1:
+        return False
+    if not target_excerpt or not peer_excerpt:
+        return False
+
+    if kind == "rename":
+        if _normalized_local_artifact(target_artifact) == _normalized_local_artifact(peer_artifact):
+            return False
+        return False
+
+    if kind == "docs-vs-impl mismatch":
+        if _looks_like_local_import_or_header(target_excerpt) or _looks_like_local_import_or_header(peer_excerpt):
+            return False
+        shared_keys, shared_quotes, shared_paths, shared_tokens = _local_structured_overlap(target_excerpt, peer_excerpt)
+        return bool(shared_keys or shared_quotes or shared_paths or len(shared_tokens) >= 5)
+
+    if kind == "presence/absence":
+        if not target_artifact:
+            return False
+        if _normalized_local_artifact(target_artifact) in {"settings", "config", "summary", "title", "readme"}:
+            return False
+
+    return True
+
+
 def _render_local_reference_match(match: Any) -> str | None:
     relation = getattr(match, "relation", None)
     reference_label = getattr(match, "reference_label", "a related reference")
     target_excerpt = getattr(match, "target_excerpt", "") or ""
     peer_excerpt = getattr(match, "peer_excerpt", "") or ""
-    if relation is None:
-        return _generic_local_quality_note(reference_label)
+    if relation is None or not _should_surface_local_reference_match(match):
+        return None
 
     kind = getattr(relation, "kind", None)
     confidence = int(getattr(relation, "confidence", 0) or 0)
@@ -364,11 +435,13 @@ def _render_local_reference_match(match: Any) -> str | None:
     peer_artifact = (getattr(relation, "peer_artifact", "") or "").strip()
 
     if kind is None or kind == "generic divergence" or confidence <= 1:
-        return _generic_local_quality_note(reference_label)
+        return None
 
     if kind == "docs-vs-impl mismatch":
+        focus = _local_docs_impl_focus(target_excerpt, peer_excerpt)
+        focus_prefix = f' around "{focus}"' if focus else ""
         return (
-            f'Possible docs-vs-implementation drift: the changed excerpt says '
+            f'Possible docs-vs-implementation drift{focus_prefix}: the changed excerpt says '
             f'"{_compact_local_excerpt(target_excerpt)}", while related implementation or '
             f'config in {reference_label} indicates otherwise.'
         )
@@ -394,7 +467,7 @@ def _render_local_reference_match(match: Any) -> str | None:
     if kind == "presence/absence" and target_artifact:
         target_profile = extract_artifacts(target_excerpt)
         if target_artifact.startswith("/") and len(target_profile.paths) > 1:
-            return _generic_local_quality_note(reference_label)
+            return None
         return (
             f'Possible cross-repo drift: the changed excerpt includes "{target_artifact}", '
             f'but {reference_label} does not show a corresponding item.'
@@ -405,9 +478,9 @@ def _render_local_reference_match(match: Any) -> str | None:
         [ReferenceText(label=reference_label, text=peer_excerpt)],
     )
     if not rendered:
-        return _generic_local_quality_note(reference_label)
+        return None
     if len(rendered) > 360:
-        return _generic_local_quality_note(reference_label)
+        return None
     return rendered
 
 
@@ -438,6 +511,7 @@ def _fallback_feedback(
 ) -> str:
     summary = _local_reference_feedback_text(
         text,
+        references,
         focus_text=focus_text,
         change_context=change_context,
     )
@@ -647,6 +721,7 @@ def _local_reference_feedback(
 ) -> str | None:
     return _local_reference_feedback_text(
         text,
+        references,
         focus_text=focus_text,
         change_context=change_context,
     )
