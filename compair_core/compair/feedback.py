@@ -261,7 +261,7 @@ class Reviewer:
 
         self._cloud_impl = None
         self._openai_client = None
-        self.openai_model = os.getenv("COMPAIR_OPENAI_MODEL", "gpt-5-nano")
+        self.openai_model = os.getenv("COMPAIR_OPENAI_MODEL", "gpt-5.4-mini")
         self.code_openai_model = os.getenv("COMPAIR_OPENAI_CODE_MODEL", self.openai_model)
         self.openai_reasoning_effort = os.getenv("COMPAIR_OPENAI_REASONING_EFFORT", "minimal")
         self.uses_reasoning_model = _is_reasoning_model_name(self.openai_model)

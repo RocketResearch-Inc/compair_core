@@ -50,7 +50,7 @@ docker run -d --name compair-core-openai \
   -e COMPAIR_GENERATION_PROVIDER=openai \
   -e COMPAIR_EMBEDDING_PROVIDER=openai \
   -e COMPAIR_OPENAI_API_KEY="$COMPAIR_OPENAI_API_KEY" \
-  -e COMPAIR_OPENAI_MODEL=gpt-5-nano \
+  -e COMPAIR_OPENAI_MODEL=gpt-5.4-mini \
   -e COMPAIR_OPENAI_EMBED_MODEL=text-embedding-3-small \
   compairsteven/compair-core
 ```
