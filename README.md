@@ -67,21 +67,28 @@ docker run -d --name compair-core \
   compairsteven/compair-core
 ```
 
-To use your own OpenAI credentials instead of the bundled local model runtime:
+To use your own OpenAI credentials instead of the bundled local model runtime, the recommended starting point is OpenAI generation with local embeddings:
 
 ```bash
-compair core config set --provider openai --openai-api-key "$OPENAI_API_KEY"
+compair core config set --generation-provider openai --embedding-provider local --openai-api-key "$OPENAI_API_KEY"
 compair core up
 ```
 
-Or manually:
+If you want the strongest current self-hosted quality path, move both generation and embeddings to OpenAI:
+
+```bash
+compair core config set --provider openai --openai-model gpt-5.4 --openai-api-key "$OPENAI_API_KEY"
+compair core up
+```
+
+Manual equivalent for the lower-outsourced-cost path:
 
 ```bash
 docker run -d --name compair-core-openai \
   -p 8000:8000 \
   -e COMPAIR_REQUIRE_AUTHENTICATION=false \
   -e COMPAIR_GENERATION_PROVIDER=openai \
-  -e COMPAIR_EMBEDDING_PROVIDER=openai \
+  -e COMPAIR_EMBEDDING_PROVIDER=local \
   -e COMPAIR_OPENAI_API_KEY="$COMPAIR_OPENAI_API_KEY" \
   -e COMPAIR_OPENAI_MODEL=gpt-5.4-mini \
   -e COMPAIR_OPENAI_EMBED_MODEL=text-embedding-3-small \
@@ -89,6 +96,7 @@ docker run -d --name compair-core-openai \
 ```
 
 This path requires only your own OpenAI API key from the Compair side. OpenAI usage is billed by OpenAI.
+Keeping embeddings local is the better cost-aware default; using OpenAI for both generation and embeddings is the quality-first option when you want the closest local behavior to Cloud.
 
 For a fuller self-hosted walkthrough, see `docs/quickstart.md` and `docs/user-guide.md`.
 

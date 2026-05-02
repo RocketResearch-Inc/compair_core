@@ -34,28 +34,35 @@ You can override the OCR endpoint by setting `COMPAIR_OCR_ENDPOINT` when startin
 
 ### Use your own OpenAI key instead of the local model
 
-If you want Core to use your OpenAI account for both feedback generation and embeddings, the simplest CLI-managed path is:
+The recommended self-hosted starting point is OpenAI generation with local embeddings:
 
 ```bash
-compair core config set --provider openai --openai-api-key "$OPENAI_API_KEY"
+compair core config set --generation-provider openai --embedding-provider local --openai-api-key "$OPENAI_API_KEY"
 compair core up
 ```
 
-Manual equivalent:
+If you want the strongest current self-hosted quality path, move both generation and embeddings to OpenAI:
+
+```bash
+compair core config set --provider openai --openai-model gpt-5.4 --openai-api-key "$OPENAI_API_KEY"
+compair core up
+```
+
+Manual equivalent for the lower-outsourced-cost path:
 
 ```bash
 docker run -d --name compair-core-openai \
   -p 8000:8000 \
   -e COMPAIR_REQUIRE_AUTHENTICATION=false \
   -e COMPAIR_GENERATION_PROVIDER=openai \
-  -e COMPAIR_EMBEDDING_PROVIDER=openai \
+  -e COMPAIR_EMBEDDING_PROVIDER=local \
   -e COMPAIR_OPENAI_API_KEY="$COMPAIR_OPENAI_API_KEY" \
   -e COMPAIR_OPENAI_MODEL=gpt-5.4-mini \
   -e COMPAIR_OPENAI_EMBED_MODEL=text-embedding-3-small \
   compairsteven/compair-core
 ```
 
-If you only want OpenAI for feedback, omit `COMPAIR_EMBEDDING_PROVIDER=openai` and keep the default local/hash embedding path.
+Keeping embeddings local is the better cost-aware default. Use OpenAI for both generation and embeddings when you want the quality-first self-hosted path instead.
 
 ## 1. Start the API locally
 
