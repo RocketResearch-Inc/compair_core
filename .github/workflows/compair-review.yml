@@ -1,0 +1,58 @@
+name: compair-review
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    if: ${{ secrets.COMPAIR_AUTH_TOKEN != '' && secrets.COMPAIR_PROJECT_CONFIG_YAML_B64 != '' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/checkout@v4
+        with:
+          repository: RocketResearch-Inc/compair-cli
+          ref: main
+          path: compair-cli-src
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+
+      - name: Build Compair CLI
+        working-directory: compair-cli-src
+        run: go build -o "$RUNNER_TEMP/compair" .
+
+      - name: Restore Compair repo binding
+        run: |
+          mkdir -p "$RUNNER_TEMP/compair-state"
+          echo "${{ secrets.COMPAIR_PROJECT_CONFIG_YAML_B64 }}" | base64 --decode > "$RUNNER_TEMP/compair-state/project-config.yaml"
+
+      - name: Login to Compair Cloud
+        run: |
+          "$RUNNER_TEMP/compair" --api-base https://app.compair.sh/api \
+            login --token "${{ secrets.COMPAIR_AUTH_TOKEN }}"
+
+      - name: Run advisory Compair review
+        env:
+          COMPAIR_PROJECT_CONFIG_PATH: ${{ runner.temp }}/compair-state/project-config.yaml
+        run: |
+          "$RUNNER_TEMP/compair" --api-base https://app.compair.sh/api \
+            sync --json --write-md .compair/compair-ci.md || true
+
+      - name: Upload Compair report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compair-feedback
+          path: .compair/compair-ci.md
+          if-no-files-found: ignore
