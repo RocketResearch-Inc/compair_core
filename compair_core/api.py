@@ -817,7 +817,7 @@ def load_user(
 ) -> schema.User | None:
     with compair.Session() as session:
         q = select(models.User).filter(
-            models.User.username.match(username)
+            models.User.username == username
         )
         user = session.execute(q).fetchone()
         if user is None:
