@@ -2,7 +2,7 @@
 
 Compair Core is the open-source foundation of the Compair platform. It bundles the shared data models, FastAPI application, email utilities, and local-only helpers so that you can run Compair in a self-hosted or evaluation environment without premium cloud integrations.
 
-The premium cloud offering (available at [https://www.compair.sh/](https://www.compair.sh/)) layers on premium services (premium models, OCR, storage,  etc.). Core gracefully falls back to local behaviour when those packages are not present.
+The premium cloud offering (available at [https://www.compair.sh/](https://www.compair.sh/)) layers on premium services such as higher-end models, OCR, and hosted storage. Core gracefully falls back to local behavior when those packages are not present.
 
 If you want the strongest out-of-the-box review quality with the least setup, start with Compair Cloud. Core is the self-hosted path: it works well for evaluation and local/private deployments, and it gets closer to Cloud quality when you connect your own OpenAI key instead of relying on the bundled local fallback.
 
@@ -12,7 +12,7 @@ If you want the strongest out-of-the-box review quality with the least setup, st
 pip install compair-core
 ```
 
-This installs the package as a dependency so you can embed Compair into your own FastAPI instance or reuse the models in scripts. The core library exposes hooks for the private cloud extension that Compair itself uses for hosted deployments.
+This installs the package as a dependency so you can embed Compair into your own FastAPI instance or reuse the models in scripts. The core library also exposes the extension points that the hosted Compair Cloud offering builds on.
 
 ### Installing from source
 
@@ -41,14 +41,11 @@ pip install -e ".[dev]"
 | `compair/` | Core runtime (ORM models, tasks, embeddings, feedback). |
 | `server/` | FastAPI app factory and dependency providers used by both editions. |
 | `compair_email/` | Console mailer + minimal templates for account verification and password reset. |
-| `docs/` | Additional documentation (see `docs/editions.md` for an overview of the two editions). |
+| `docs/` | Additional documentation for running and evaluating Core. |
 
 ## Containers
 
-Container definitions and build pipelines live outside this public package:
-
-- The **core** container lives alongside the private CI workflow in the `compair_cloud` repository (`Dockerfile.core`). It installs this package from PyPI and runs the FastAPI factory with SQLite defaults.
-- A **cloud** container (`Dockerfile.cloud`) is built from a private cloud extension that enables premium features. For more information, please visit [https://www.compair.sh/](https://www.compair.sh/).
+The published Core image and the hosted Compair Cloud deployment are both built on top of this package. For public evaluation, the simplest containerized path is still `compair core up` from the CLI, or the published Core image shown below.
 
 If you are evaluating Core locally with the CLI, the simplest path is:
 
@@ -148,9 +145,9 @@ The API will be available at http://127.0.0.1:8000 and supports the Swagger UI a
 Core and Cloud share the same document, group, feedback, and authentication foundations, but they do not expose the same product surface.
 
 - `compair_core` is the self-hosted/open-core runtime.
-- `compair_cloud` adds the hosted-only layers: Google OAuth, billing, richer analytics, and hosted notification delivery.
+- The hosted Cloud offering adds the hosted-only layers: Google OAuth, billing, richer analytics, and hosted notification delivery.
 
-Core now includes ranked notification-event generation, `/notification_events`, and `/get_activity_feed` so the CLI, desktop app, and self-hosted evaluations can use the same review semantics as Cloud. Hosted-only delivery layers such as Google OAuth, billing, and transactional notification delivery still belong to `compair_cloud`.
+Core now includes ranked notification-event generation, `/notification_events`, and `/get_activity_feed` so the CLI, desktop app, and self-hosted evaluations can use the same review semantics as Cloud. Hosted-only delivery layers such as Google OAuth, billing, and transactional notification delivery still belong to the hosted Cloud offering.
 
 Practical guidance:
 
@@ -162,7 +159,7 @@ Practical guidance:
 
 Core currently ships with a syntax sanity check (`python -m compileall ...`). You can add pytest or other tooling as needed.
 
-Release and packaging steps are documented in `docs/maintainers.md`.
+End-user release and packaging automation live in the `compair-cli` repository, since that repo owns the published binaries and package-manager integrations.
 
 ## Reporting Issues
 

@@ -1068,7 +1068,8 @@ def create_user(
     password: str,
     session: Session,
     groups: list[str] | None = None,
-    referral_code: str = None
+    referral_code: str = None,
+    analytics: Analytics | None = None,
 ):
     token, expiration = generate_verification_token()
     existing_user = session.query(models.User).filter(models.User.username == username).first()
@@ -1139,10 +1140,11 @@ def create_user(
     
     session.add(user)
     session.commit()
-    try:
-        analytics.track("user_signup", user.user_id)
-    except Exception as exc:
-        logger.warning("analytics track failed: %s", exc)
+    if analytics is not None:
+        try:
+            analytics.track("user_signup", user.user_id)
+        except Exception as exc:
+            logger.warning("analytics track failed: %s", exc)
     return user
 
 
@@ -2887,6 +2889,7 @@ def sign_up(
             groups=request.groups,
             session=session,
             referral_code=request.referral_code,
+            analytics=analytics,
         )
         if settings.require_email_verification:
             web_base = _public_web_base_url()
