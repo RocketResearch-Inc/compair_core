@@ -36,7 +36,9 @@ def _load_service_module():
 
     local_summary = types.ModuleType(f"{compair_package_name}.local_summary")
     local_summary.assess_relation = lambda target, peer: types.SimpleNamespace(kind="route/path mismatch")
-    local_summary.best_grounded_excerpt = lambda text, signal_texts, preferred_text="": preferred_text or text
+    local_summary.best_grounded_excerpt = (
+        lambda text, signal_texts, preferred_text="", **kwargs: preferred_text or text
+    )
     local_summary.excerpt_tokens = lambda *values: set()
     sys.modules[local_summary.__name__] = local_summary
 

@@ -3935,6 +3935,7 @@ def get_notification_events(
     page_size: int = 20,
     include_acknowledged: bool = False,
     include_dismissed: bool = False,
+    include_drop: bool = False,
     current_user: models.User = Depends(get_current_user),
 ):
     with compair.Session() as session:
@@ -3952,6 +3953,8 @@ def get_notification_events(
             q = q.filter(models.NotificationEvent.acknowledged_at.is_(None))
         if not include_dismissed:
             q = q.filter(models.NotificationEvent.dismissed_at.is_(None))
+        if not include_drop:
+            q = q.filter(models.NotificationEvent.delivery_action != "drop")
 
         total_count = q.count()
         offset = (page - 1) * page_size

@@ -29,6 +29,7 @@ from .llm_notification_scorer import NotificationScorer, NotificationScorerConfi
 from .parse_llm_structured_output import ParsedLLMNotificationAssessment
 
 logger = logging.getLogger(__name__)
+_NOTIFICATION_EVIDENCE_CHARS = 600
 _CONFLICT_SUMMARY_TERMS = (
     "conflict",
     "drift",
@@ -203,12 +204,18 @@ def _ground_notification_assessment(
         candidate.target_text,
         signal_texts,
         assessment.evidence_target,
+        limit=_NOTIFICATION_EVIDENCE_CHARS,
     )
 
     grounded_peer = ""
     best_peer_score = 0
     for peer in candidate.peer_candidates:
-        excerpt = best_grounded_excerpt(peer.chunk_text, signal_texts, assessment.evidence_peer)
+        excerpt = best_grounded_excerpt(
+            peer.chunk_text,
+            signal_texts,
+            assessment.evidence_peer,
+            limit=_NOTIFICATION_EVIDENCE_CHARS,
+        )
         if not excerpt:
             continue
         score = _grounded_excerpt_score(excerpt, signal_texts, assessment.evidence_peer)
@@ -251,7 +258,12 @@ def _calibrate_assessment_from_feedback(
     if any(marker in rationale_text for marker in _RATIONALE_PROMOTION_BLOCKERS):
         return assessment
 
-    target_excerpt = assessment.evidence_target or best_grounded_excerpt(candidate.target_text, [summary], summary)
+    target_excerpt = assessment.evidence_target or best_grounded_excerpt(
+        candidate.target_text,
+        [summary],
+        summary,
+        limit=_NOTIFICATION_EVIDENCE_CHARS,
+    )
     peer_excerpt = assessment.evidence_peer
     relation = assess_relation(target_excerpt or "", peer_excerpt or "")
 

@@ -367,6 +367,19 @@ class NotificationScorerTests(unittest.TestCase):
         self.assertEqual(result.severity, "LOW")
         self.assertEqual(result.rationale[0], "Heuristic local summary was too weak or generic to surface as a notification.")
 
+    def test_heuristic_assessment_keeps_longer_evidence_excerpt(self) -> None:
+        payload = _payload()
+        payload["generated_feedback"]["summary"] = (
+            "There is a concrete route/path drift between the documented and implemented endpoint."
+        )
+        payload["target"]["chunk_excerpt"] = "T" * 700
+        payload["candidates"][0]["peer_excerpt"] = "P" * 700
+
+        result = scorer_module._heuristic_assessment(payload)
+
+        self.assertEqual(len(result.evidence_target), 600)
+        self.assertEqual(len(result.evidence_peer), 600)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -162,6 +162,7 @@ _WEAK_HEURISTIC_PREFIXES = (
     "the changed text says ",
     "this may rename ",
 )
+_NOTIFICATION_EVIDENCE_CHARS = 600
 
 
 def _getenv(*names: str, default: Optional[str] = None) -> Optional[str]:
@@ -427,8 +428,8 @@ def _heuristic_assessment(payload: Dict[str, Any]) -> ParsedLLMNotificationAsses
             certainty="LOW",
             delivery="digest",
             rationale=["Heuristic local summary was too weak or generic to surface as a notification."],
-            evidence_target=target_excerpt[:280] if target_excerpt else "",
-            evidence_peer=peer_excerpt[:280] if peer_excerpt else "",
+            evidence_target=target_excerpt[:_NOTIFICATION_EVIDENCE_CHARS] if target_excerpt else "",
+            evidence_peer=peer_excerpt[:_NOTIFICATION_EVIDENCE_CHARS] if peer_excerpt else "",
             parse_mode="heuristic",
             raw_extracted=None,
             errors=[],
@@ -488,8 +489,8 @@ def _heuristic_assessment(payload: Dict[str, Any]) -> ParsedLLMNotificationAsses
     if not rationale:
         rationale = ["Heuristic fallback used because structured notification scoring was unavailable."]
 
-    preferred_target = target_excerpt[:280] if target_excerpt else ""
-    preferred_peer = peer_excerpt[:280] if peer_excerpt else ""
+    preferred_target = target_excerpt[:_NOTIFICATION_EVIDENCE_CHARS] if target_excerpt else ""
+    preferred_peer = peer_excerpt[:_NOTIFICATION_EVIDENCE_CHARS] if peer_excerpt else ""
 
     return ParsedLLMNotificationAssessment(
         intent=intent,
