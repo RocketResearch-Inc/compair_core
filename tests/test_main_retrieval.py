@@ -112,6 +112,24 @@ class DummyChunk:
 
 
 class MainRetrievalTests(unittest.TestCase):
+    def test_reference_scope_allows_same_document_when_explicitly_requested(self) -> None:
+        self.assertTrue(
+            main._reference_scope_allows_same_document(
+                "doc-1",
+                allow_same_document=False,
+                reference_doc_ids=["doc-1", "doc-2"],
+            )
+        )
+
+    def test_reference_scope_disables_same_document_when_explicit_scope_excludes_it(self) -> None:
+        self.assertFalse(
+            main._reference_scope_allows_same_document(
+                "doc-1",
+                allow_same_document=True,
+                reference_doc_ids=["doc-2"],
+            )
+        )
+
     def test_reference_candidate_allowed_excludes_same_document_when_self_feedback_disabled(self) -> None:
         doc = types.SimpleNamespace(document_id="doc-1")
         source = DummyChunk(

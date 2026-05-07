@@ -1844,6 +1844,34 @@ def _allow_same_document_feedback(user: User | None) -> bool:
     return bool(getattr(user, "include_own_documents_in_feedback", False))
 
 
+def _clean_reference_document_ids(reference_doc_ids: list[str] | tuple[str, ...] | set[str] | None) -> list[str]:
+    if not reference_doc_ids:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for candidate in reference_doc_ids:
+        cleaned = str(candidate or "").strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        out.append(cleaned)
+    return out
+
+
+def _reference_scope_allows_same_document(
+    document_id: str | None,
+    *,
+    allow_same_document: bool,
+    reference_doc_ids: list[str] | tuple[str, ...] | set[str] | None,
+) -> bool:
+    cleaned_reference_doc_ids = _clean_reference_document_ids(reference_doc_ids)
+    if not cleaned_reference_doc_ids:
+        return allow_same_document
+    if not document_id:
+        return False
+    return document_id in set(cleaned_reference_doc_ids)
+
+
 def _same_file_self_reference_allowed(source_text: str, candidate_text: str, *, code_focus: bool) -> bool:
     source_path = _extract_snapshot_file_path(source_text).lower().replace("\\", "/")
     candidate_path = _extract_snapshot_file_path(candidate_text).lower().replace("\\", "/")
@@ -3138,6 +3166,7 @@ def process_document(
     generate_feedback: bool = True,
     chunk_mode: Optional[str] = None,
     reanalyze_existing: bool = False,
+    reference_doc_ids: list[str] | None = None,
 ) -> Mapping[str, int]:
     new = False
 
@@ -3360,6 +3389,7 @@ def process_document(
             query_embedding=feedback_query_embedding_by_new_index.get(i),
             focus_text=feedback_focus_by_new_index.get(i, ""),
             change_context=feedback_change_context_by_new_index.get(i, ""),
+            reference_doc_ids=reference_doc_ids,
         )
 
     for idx in existing_indices_to_generate_feedback:
@@ -3379,6 +3409,7 @@ def process_document(
             query_embedding=query_embedding,
             focus_text=focus_text,
             change_context=change_context,
+            reference_doc_ids=reference_doc_ids,
         )
 
     removed = [c for c in prev_chunks if c not in set(chunks)]
@@ -3700,6 +3731,7 @@ def process_text(
     query_embedding: list[float] | None = None,
     focus_text: str = "",
     change_context: str = "",
+    reference_doc_ids: list[str] | None = None,
 ) -> None:
     logger = logging.getLogger(__name__)
     chunk_hash = stable_chunk_hash(text)
@@ -3758,7 +3790,12 @@ def process_text(
         doc_group_ids = [g.group_id for g in doc.groups]
         target_embedding = existing_chunk.embedding
         code_focus = _is_code_review_chunk(doc, text)
-        allow_same_document = _allow_same_document_feedback(user)
+        scoped_reference_doc_ids = _clean_reference_document_ids(reference_doc_ids)
+        allow_same_document = _reference_scope_allows_same_document(
+            getattr(doc, "document_id", None),
+            allow_same_document=_allow_same_document_feedback(user),
+            reference_doc_ids=scoped_reference_doc_ids,
+        )
         query_variants = _reference_query_variants(text, focus_text, change_context, code_focus=code_focus)
         query_text = query_variants[0][1] if query_variants else text
         source_retrieval_text = getattr(existing_chunk, "content", "") or text or query_text
@@ -3816,6 +3853,8 @@ def process_text(
                     published_filter = or_(Document.is_published.is_(True), Document.document_id == doc.document_id)
                 else:
                     base_query = base_query.filter(Document.document_id != doc.document_id)
+                if scoped_reference_doc_ids:
+                    base_query = base_query.filter(Document.document_id.in_(scoped_reference_doc_ids))
                 base_query = base_query.filter(
                     published_filter,
                     Chunk.chunk_type == "document",

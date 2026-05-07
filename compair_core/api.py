@@ -478,6 +478,7 @@ def _dispatch_process_document_task(
     chunk_mode: Optional[str] = None,
     reanalyze_existing: bool = False,
     snapshot_payload_key: str | None = None,
+    reference_doc_ids: list[str] | None = None,
 ):
     task_callable = getattr(process_document_celery, "delay", None)
     if callable(task_callable):
@@ -490,6 +491,7 @@ def _dispatch_process_document_task(
                 chunk_mode,
                 reanalyze_existing,
                 snapshot_payload_key=snapshot_payload_key,
+                reference_doc_ids=reference_doc_ids,
             )
         except TypeError:
             try:
@@ -505,6 +507,7 @@ def _dispatch_process_document_task(
             chunk_mode,
             reanalyze_existing,
             snapshot_payload_key=snapshot_payload_key,
+            reference_doc_ids=reference_doc_ids,
         )
     except TypeError:
         try:
@@ -2354,6 +2357,7 @@ async def process_doc(
     generate_feedback: bool = Form(True),
     chunk_mode: Optional[str] = Form(None),
     reanalyze_existing: bool = Form(False),
+    reference_doc_ids: list[str] = Form([]),
     current_user: models.User = Depends(get_current_user),
     analytics: Analytics = Depends(get_analytics),
 ) -> Mapping[str, str | None]:
@@ -2399,6 +2403,15 @@ async def process_doc(
         if current_user.status == "suspended":
             generate_feedback=False
 
+    cleaned_reference_doc_ids: list[str] = []
+    seen_reference_doc_ids: set[str] = set()
+    for candidate in reference_doc_ids:
+        cleaned = (candidate or "").strip()
+        if not cleaned or cleaned in seen_reference_doc_ids:
+            continue
+        seen_reference_doc_ids.add(cleaned)
+        cleaned_reference_doc_ids.append(cleaned)
+
     task_result = _dispatch_process_document_task(
         user_id=current_user.user_id,
         doc_id=doc_id,
@@ -2407,6 +2420,7 @@ async def process_doc(
         chunk_mode=chunk_mode,
         reanalyze_existing=reanalyze_existing,
         snapshot_payload_key=staged_payload_key,
+        reference_doc_ids=cleaned_reference_doc_ids or None,
     )
     task_id = getattr(task_result, "id", None)
 
