@@ -32,6 +32,7 @@ from . import compair
 from .compair import models, schema
 from .compair.embeddings import create_embedding, Embedder
 from .compair.logger import log_event 
+from .compair.topic_tags import extract_topic_tags
 from .compair.utils import (
     chunk_text,
     generate_verification_token,
@@ -514,6 +515,38 @@ def _dispatch_process_document_task(
             return process_document_celery(user_id, doc_id, doc_text or "", generate_feedback, chunk_mode)
         except TypeError:
             return process_document_celery(user_id, doc_id, doc_text or "", generate_feedback)
+
+
+def _update_document_content_without_index(
+    *,
+    session: Session,
+    doc: models.Document,
+    doc_text: str,
+    user_id: str,
+) -> None:
+    doc.content = doc_text
+    doc.datetime_modified = datetime.now(timezone.utc)
+    try:
+        doc.topic_tags = extract_topic_tags(doc_text)
+    except Exception as exc:
+        logger.warning("topic tag extraction failed during skip-index update: %s", exc)
+    session.add(doc)
+    session.commit()
+    group_id = ""
+    if getattr(doc, "groups", None):
+        first_group = doc.groups[0]
+        group_id = str(getattr(first_group, "group_id", "") or "").strip()
+    if group_id:
+        log_activity(
+            session=session,
+            user_id=user_id,
+            group_id=group_id,
+            action="update",
+            object_id=doc.document_id,
+            object_name=doc.title,
+            object_type="document",
+        )
+        session.commit()
 
 
 def _json_safe_task_meta(value: Any) -> Any:
@@ -2355,23 +2388,30 @@ async def process_doc(
     doc_text: str | None = Form(None),
     doc_text_b64: str | None = Form(None),
     generate_feedback: bool = Form(True),
+    skip_index: bool = Form(False),
     chunk_mode: Optional[str] = Form(None),
     reanalyze_existing: bool = Form(False),
     reference_doc_ids: list[str] = Form([]),
     current_user: models.User = Depends(get_current_user),
     analytics: Analytics = Depends(get_analytics),
-) -> Mapping[str, str | None]:
+) -> Mapping[str, str | bool | None]:
     if doc_text is None and doc_text_b64 is None:
         raise HTTPException(status_code=422, detail="doc_text or doc_text_b64 is required")
 
     staged_payload_key: str | None = None
-    if HAS_REDIS:
+    if HAS_REDIS and not skip_index:
         try:
             staged_payload_key = _stage_process_doc_payload(doc_text=doc_text, doc_text_b64=doc_text_b64)
         except Exception as exc:
             logger.warning("process_doc payload staging failed: %s", exc)
 
     if staged_payload_key is None:
+        decoded_doc_text = _decode_optional_base64(doc_text_b64, "doc_text_b64")
+        if decoded_doc_text is not None:
+            doc_text = decoded_doc_text
+        if doc_text is None:
+            raise HTTPException(status_code=422, detail="doc_text or doc_text_b64 is required")
+    elif skip_index and doc_text is None:
         decoded_doc_text = _decode_optional_base64(doc_text_b64, "doc_text_b64")
         if decoded_doc_text is not None:
             doc_text = decoded_doc_text
@@ -2402,6 +2442,25 @@ async def process_doc(
         # If the user is suspended, allow user to edit, but not receive any new feedback for docs
         if current_user.status == "suspended":
             generate_feedback=False
+        if skip_index and generate_feedback:
+            raise HTTPException(status_code=422, detail="skip_index requires generate_feedback=false")
+        if skip_index:
+            if doc_text is None:
+                raise HTTPException(status_code=422, detail="doc_text or doc_text_b64 is required")
+            _update_document_content_without_index(
+                session=session,
+                doc=doc,
+                doc_text=doc_text,
+                user_id=current_user.user_id,
+            )
+            log_event(
+                "process_doc_skip_index",
+                user_id=current_user.user_id,
+                doc_id=doc_id,
+                payload_transport="doc_text_b64" if doc_text_b64 is not None else "doc_text",
+                payload_bytes=payload_bytes,
+            )
+            return {"task_id": None, "skipped_index": True}
 
     cleaned_reference_doc_ids: list[str] = []
     seen_reference_doc_ids: set[str] = set()
