@@ -1,61 +1,54 @@
 # Compair Core
 
-Compair Core is the open-source foundation of the Compair platform. It bundles the shared data models, FastAPI application, email utilities, and local-only helpers so that you can run Compair in a self-hosted or evaluation environment without premium cloud integrations.
+Compair Core is the self-hosted runtime for Compair’s cross-repo review workflow. It lets you evaluate Compair locally, run the API inside your own environment, and choose whether feedback comes from local providers, OpenAI, or an OpenAI-compatible endpoint.
 
-The premium cloud offering (available at [https://www.compair.sh/](https://www.compair.sh/)) layers on premium services such as higher-end models, OCR, and hosted storage. Core gracefully falls back to local behavior when those packages are not present.
+Compair is built for teams that maintain related codebases: backend plus frontend, API plus SDK, CLI plus cloud service, docs plus implementation, or internal tools split across several repos. Core gives those repos a shared review context so Compair can surface drift, hidden overlap, and missing downstream updates before they become user-facing problems.
 
-If you want the strongest out-of-the-box review quality with the least setup, start with Compair Cloud. Core is the self-hosted path: it works well for evaluation and local/private deployments, and it gets closer to Cloud quality when you connect your own OpenAI key instead of relying on the bundled local fallback.
-
-## Installing
+If you want the fastest first look, start with the [CLI’s](https://github.com/RocketResearch-Inc/compair-cli) offline demo:
 
 ```bash
-pip install compair-core
+compair demo --offline
 ```
 
-This installs the package as a dependency so you can embed Compair into your own FastAPI instance or reuse the models in scripts. The core library also exposes the extension points that the hosted Compair Cloud offering builds on.
-
-### Installing from source
-
-You can also install directly from GitHub (handy for pinning to a specific commit or branch):
-
-```bash
-pip install "git+https://github.com/RocketResearch-Inc/compair_core.git@main"
-```
-
-For local development:
-
-```bash
-git clone https://github.com/RocketResearch-Inc/compair_core.git
-cd compair_core
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-```
-
-> 🔧 The optional OCR stack relies on the Tesseract CLI. When running outside the container image, install Tesseract separately (for example, `brew install tesseract` on macOS or `apt-get install tesseract-ocr` on Debian/Ubuntu) so pytesseract can invoke it.
-
-## Repository Layout
-
-| Path | Purpose |
-| --- | --- |
-| `compair/` | Core runtime (ORM models, tasks, embeddings, feedback). |
-| `server/` | FastAPI app factory and dependency providers used by both editions. |
-| `compair_email/` | Console mailer + minimal templates for account verification and password reset. |
-| `docs/` | Additional documentation for running and evaluating Core. |
-
-## Containers
-
-The published Core image and the hosted Compair Cloud deployment are both built on top of this package. For public evaluation, the simplest containerized path is still `compair core up` from the CLI, or the published Core image shown below.
-
-If you are evaluating Core locally with the CLI, the simplest path is:
+If you want a real local review against self-hosted Core:
 
 ```bash
 compair core up
 compair profile use local
 compair login
+compair demo --mode local
 ```
 
-If you want to run the published container image manually instead, use:
+Use Compair Cloud when you want the strongest out-of-the-box review quality, hosted collaboration, and the least setup. Use Core when you want self-hosting, private evaluation, local development, or a bring-your-own-key path.
+
+## What Core Does
+
+- Runs the Compair API locally with FastAPI.
+- Tracks repo snapshots and changed chunks for cross-repo review.
+- Generates feedback with local, OpenAI, OpenAI-compatible HTTP, or fallback providers.
+- Scores feedback into notification-style events so reports and gates can prioritize likely conflicts.
+- Supports a default single-user mode for quick local use, plus account-style auth when you need it.
+- Provides the base package used by the published Core container and the hosted Cloud deployment.
+
+## Choose a Review Quality Path
+
+Core is functional in fully local mode, but review quality depends on the provider path you choose.
+
+- Use `compair demo --offline` to understand the workflow with no setup.
+- Use local Core with bundled providers for private/offline smoke tests.
+- Use local Core with your own OpenAI key for stronger review quality.
+- Use Cloud for the strongest hosted/team-ready experience.
+
+| Path | Best for | Notes |
+| --- | --- | --- |
+| Core + local providers | Offline/private smoke tests | Functional and zero external API cost, but lower-fidelity feedback. |
+| Core + local embeddings + OpenAI generation | Cost-aware self-hosted review | Recommended bring-your-own-key starting point. |
+| Core + OpenAI embeddings + OpenAI generation | Highest current self-hosted quality | Closest Core lane to the hosted review experience. |
+| Compair Cloud | Fastest team-ready experience | Hosted auth, shared accounts, delivery, and the strongest default review quality. |
+
+## Run Core Manually
+
+Most users should start with the CLI-managed Core runtime above. If you want to run the published container image yourself, use:
 
 ```bash
 docker run -d --name compair-core \
@@ -96,6 +89,36 @@ This path requires only your own OpenAI API key from the Compair side. OpenAI us
 Keeping embeddings local is the better cost-aware default; using OpenAI for both generation and embeddings is the quality-first option when you want the closest local behavior to Cloud.
 
 For a fuller self-hosted walkthrough, see `docs/quickstart.md` and `docs/user-guide.md`.
+
+## Install as a Python Package
+
+Most people evaluating Compair should start with the CLI-managed Core runtime above. Use the Python package when you want to embed Core in another FastAPI app, develop against the internals, or reuse the shared models and utilities.
+
+```bash
+pip install compair-core
+```
+
+This installs the package as a dependency so you can embed Compair into your own FastAPI instance or reuse the models in scripts.
+
+### Installing from source
+
+You can also install directly from GitHub (handy for pinning to a specific commit or branch):
+
+```bash
+pip install "git+https://github.com/RocketResearch-Inc/compair_core.git@main"
+```
+
+For local development:
+
+```bash
+git clone https://github.com/RocketResearch-Inc/compair_core.git
+cd compair_core
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+The optional OCR stack relies on the Tesseract CLI. When running outside the container image, install Tesseract separately, for example `brew install tesseract` on macOS or `apt-get install tesseract-ocr` on Debian/Ubuntu.
 
 ## Configuration
 
@@ -140,11 +163,20 @@ uvicorn compair_core.server.app:create_app --factory --reload
 
 The API will be available at http://127.0.0.1:8000 and supports the Swagger UI at `/docs`.
 
+## Repository Layout
+
+| Path | Purpose |
+| --- | --- |
+| `compair/` | Core runtime (ORM models, tasks, embeddings, feedback). |
+| `server/` | FastAPI app factory and dependency providers used by both editions. |
+| `compair_email/` | Console mailer + minimal templates for account verification and password reset. |
+| `docs/` | Additional documentation for running and evaluating Core. |
+
 ## Core vs. Cloud
 
 Core and Cloud share the same document, group, feedback, and authentication foundations, but they do not expose the same product surface.
 
-- `compair_core` is the self-hosted/open-core runtime.
+- `compair_core` is the self-hosted MIT-licensed runtime.
 - The hosted Cloud offering adds the hosted-only layers: Google OAuth, billing, richer analytics, and hosted notification delivery.
 
 Core now includes ranked notification-event generation, `/notification_events`, and `/get_activity_feed` so the CLI, desktop app, and self-hosted evaluations can use the same review semantics as Cloud. Hosted-only delivery layers such as Google OAuth, billing, and transactional notification delivery still belong to the hosted Cloud offering.
@@ -163,4 +195,8 @@ End-user release and packaging automation live in the `compair-cli` repository, 
 
 ## Reporting Issues
 
-Please open GitHub issues or PRs against this repository. If you are a Compair Cloud customer, reach out through your support channel for issues related to premium features.
+If you try Core, the most helpful feedback is what you ran, what worked, what broke, and whether the review output made sense for your repo shape.
+
+Please open GitHub issues or PRs against this repository with what you tried, what worked, what broke, and where the output was confusing. If you are testing multiple related repos, include the repo shapes involved, for example backend/frontend, API/SDK, CLI/cloud service, or docs/implementation.
+
+Core is MIT licensed. Cloud-specific hosted services remain part of the hosted Compair product.

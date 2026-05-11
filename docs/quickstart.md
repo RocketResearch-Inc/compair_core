@@ -1,8 +1,20 @@
 # Compair Core Quickstart
 
-This quickstart shows how to experience Compair's core feedback loop in a minute or less. You'll run the API locally in single-user mode, create a few documents, and generate feedback that reuses your published work as a reference.
+This quickstart shows the fastest ways to try Compair Core, the self-hosted runtime for Compair's cross-repo review workflow.
 
-Compair Core now includes local notification-event ranking so self-hosted reviews can use the same report/gating semantics as Cloud. Hosted delivery layers such as Google OAuth and transactional email remain Cloud-only.
+Start with the CLI-managed path if you want to test real repo review behavior. Use the manual API walkthrough when you want to embed Core, inspect endpoints, or build against the backend directly.
+
+Compair Core includes local notification-event ranking so self-hosted reviews can use the same report and gating semantics as Cloud. Hosted delivery layers such as Google OAuth, billing, and transactional email remain Cloud-only.
+
+## Zero-setup sample
+
+If you only want to see the output shape before starting Docker or configuring a model key:
+
+```bash
+compair demo --offline
+```
+
+That command creates the demo repos and renders a prebaked report. It is not a live review, but it is the quickest way to see the problem Compair is built to catch.
 
 ## Managed container quick start
 
@@ -12,7 +24,10 @@ If you are trying Compair from the CLI, let the CLI manage the local Core contai
 compair core up
 compair profile use local
 compair login
+compair demo --mode local
 ```
+
+This is the recommended first live Core run.
 
 ## Manual container quick start
 
