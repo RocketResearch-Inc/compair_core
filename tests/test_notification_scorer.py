@@ -241,13 +241,13 @@ class NotificationScorerTests(unittest.TestCase):
         self.assertEqual(client.responses.requests[0]["timeout"], 75.0)
 
     def test_scorer_model_inherits_primary_openai_model_when_notif_model_unset(self) -> None:
-        with mock.patch.dict(os.environ, {"COMPAIR_OPENAI_MODEL": "gpt-5-nano"}, clear=False):
+        with mock.patch.dict(os.environ, {"COMPAIR_OPENAI_MODEL": "gpt-5.4-mini"}, clear=False):
             scorer = scorer_module.NotificationScorer(
                 config=scorer_module.NotificationScorerConfig(),
                 client=object(),
             )
 
-        self.assertEqual(scorer.config.model, "gpt-5-nano")
+        self.assertEqual(scorer.config.model, "gpt-5.4-mini")
 
     def test_rubric_mapping_yields_low_overlap_digest(self) -> None:
         parsed, errors = scorer_module._rubric_assessment(

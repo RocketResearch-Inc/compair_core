@@ -18,6 +18,9 @@ Before hitting the API, configure the deployment with environment variables. The
 | `COMPAIR_VECTOR_BACKEND` | Chooses how embeddings are stored (`json` for SQLite, `pgvector` for PostgreSQL). | `json` |
 | `COMPAIR_GENERATION_PROVIDER` | Selects the feedback generator: `local`, `openai`, `http`, or `fallback`. | `local` |
 | `COMPAIR_LOCAL_MODEL_URL` | Base URL of the bundled/local text generation + embedding service used when `COMPAIR_GENERATION_PROVIDER=local`. | `http://127.0.0.1:9000` |
+| `COMPAIR_OPENAI_API_KEY` | OpenAI API key used when generation, embeddings, or notification scoring call OpenAI. | Set from your shell or secret manager |
+| `COMPAIR_OPENAI_MODEL` | OpenAI feedback generation model when `COMPAIR_GENERATION_PROVIDER=openai`. | `gpt-5.4-mini` |
+| `COMPAIR_OPENAI_EMBED_MODEL` | OpenAI embedding model when `COMPAIR_EMBEDDING_PROVIDER=openai`. | `text-embedding-3-small` |
 | `COMPAIR_NOTIFICATION_SCORING_ENABLED` | Enables ranked notification-event scoring for feedback generated in Core. | `true` |
 | `COMPAIR_NOTIFICATION_SCORING_PROVIDER` | Chooses the notification scorer: `auto`, `heuristic`, or `openai`. | `auto` |
 | `COMPAIR_NOTIFICATION_SCORING_TIMEOUT_S` | Timeout in seconds for OpenAI-backed notification scoring requests. Increase for large survey-style runs. | `30` |
@@ -58,6 +61,16 @@ Compair Core ships with helper services that let you run everything offline:
 5. **Notification-event scoring** – Core can rank feedback into notification events locally. With `COMPAIR_NOTIFICATION_SCORING_PROVIDER=auto`, Core uses OpenAI when an API key is present and otherwise falls back to a deterministic heuristic scorer so the CLI and desktop still have ranked events in pure self-hosted deployments.
 
 If you do not run any model service, set `COMPAIR_GENERATION_PROVIDER=fallback` to skip generation while still storing document embeddings (useful for similarity-only scenarios).
+
+The recommended bring-your-own-key starting point is OpenAI generation with local embeddings:
+
+```bash
+export OPENAI_API_KEY="sk-..."
+export COMPAIR_GENERATION_PROVIDER=openai
+export COMPAIR_EMBEDDING_PROVIDER=local
+export COMPAIR_OPENAI_API_KEY="$OPENAI_API_KEY"
+export COMPAIR_OPENAI_MODEL=gpt-5.4-mini
+```
 
 ## Deploying with Docker
 

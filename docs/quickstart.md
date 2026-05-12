@@ -29,6 +29,17 @@ compair demo --mode local
 
 This is the recommended first live Core run.
 
+If you want hosted review quality and shared team workflows instead of self-hosting, use Cloud:
+
+```bash
+compair profile use cloud
+compair signup --email you@example.com --name "Your Name"
+compair login
+compair demo --mode cloud
+```
+
+Skip `compair signup` if you already have an account.
+
 ## Manual container quick start
 
 Prefer to run the prebuilt image yourself? The published container already bundles the API, local model, and OCR sidecar:
@@ -52,9 +63,12 @@ You can override the OCR endpoint by setting `COMPAIR_OCR_ENDPOINT` when startin
 The recommended self-hosted starting point is OpenAI generation with local embeddings:
 
 ```bash
-compair core config set --generation-provider openai --embedding-provider local --openai-api-key "$OPENAI_API_KEY"
+export OPENAI_API_KEY="sk-..."
+compair core config set --generation-provider openai --embedding-provider local --openai-model gpt-5.4-mini --openai-api-key "$OPENAI_API_KEY"
 compair core up
 ```
+
+If you do not want the key saved in `~/.compair/core_runtime.yaml`, set `COMPAIR_OPENAI_API_KEY` or `OPENAI_API_KEY` in your shell and omit `--openai-api-key`.
 
 If you want the strongest current self-hosted quality path, move both generation and embeddings to OpenAI:
 

@@ -4,6 +4,15 @@ Compair Core is the self-hosted runtime for Compair’s cross-repo review workfl
 
 Compair is built for teams that maintain related codebases: backend plus frontend, API plus SDK, CLI plus cloud service, docs plus implementation, or internal tools split across several repos. Core gives those repos a shared review context so Compair can surface drift, hidden overlap, and missing downstream updates before they become user-facing problems.
 
+If you are starting from a terminal, install the [Compair CLI](https://github.com/RocketResearch-Inc/compair-cli) first:
+
+| Platform | Fast install path |
+| --- | --- |
+| macOS | `brew tap RocketResearch-Inc/tap` then `brew install --cask compair` |
+| Debian / Ubuntu | `curl -fsSL https://rocketresearch-inc.github.io/compair-packages/install/debian.sh \| bash` |
+| Fedora / RHEL | `curl -fsSL https://rocketresearch-inc.github.io/compair-packages/install/compair.repo \| sudo tee /etc/yum.repos.d/compair.repo >/dev/null` then `sudo dnf install -y compair` |
+| Windows | Download the latest CLI zip from [GitHub Releases](https://github.com/RocketResearch-Inc/compair-cli/releases). |
+
 If you want the fastest first look, start with the [CLI’s](https://github.com/RocketResearch-Inc/compair-cli) offline demo:
 
 ```bash
@@ -18,6 +27,27 @@ compair profile use local
 compair login
 compair demo --mode local
 ```
+
+For stronger local review quality, keep embeddings local and bring your own OpenAI key for generation:
+
+```bash
+export OPENAI_API_KEY="sk-..."
+compair core config set --generation-provider openai --embedding-provider local --openai-model gpt-5.4-mini --openai-api-key "$OPENAI_API_KEY"
+compair core restart
+```
+
+If you do not want the key saved in `~/.compair/core_runtime.yaml`, set `COMPAIR_OPENAI_API_KEY` or `OPENAI_API_KEY` in your shell and omit `--openai-api-key`.
+
+If you want Compair Cloud instead of self-hosted Core:
+
+```bash
+compair profile use cloud
+compair signup --email you@example.com --name "Your Name"
+compair login
+compair demo --mode cloud
+```
+
+Skip `compair signup` if you already have an account.
 
 Use Compair Cloud when you want the strongest out-of-the-box review quality, hosted collaboration, and the least setup. Use Core when you want self-hosting, private evaluation, local development, or a bring-your-own-key path.
 
@@ -60,7 +90,8 @@ docker run -d --name compair-core \
 To use your own OpenAI credentials instead of the bundled local model runtime, the recommended starting point is OpenAI generation with local embeddings:
 
 ```bash
-compair core config set --generation-provider openai --embedding-provider local --openai-api-key "$OPENAI_API_KEY"
+export OPENAI_API_KEY="sk-..."
+compair core config set --generation-provider openai --embedding-provider local --openai-model gpt-5.4-mini --openai-api-key "$OPENAI_API_KEY"
 compair core up
 ```
 
