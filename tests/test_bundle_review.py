@@ -109,6 +109,41 @@ class BundleReviewTests(unittest.TestCase):
         self.assertAlmostEqual(estimate["output_cost_usd"], 0.003)
         self.assertAlmostEqual(estimate["total_cost_usd"], 0.008)
 
+    def test_quote_now_review_includes_prompt_budget_and_cost(self) -> None:
+        old_input = os.environ.get("COMPAIR_NOW_REVIEW_INPUT_COST_PER_1M_USD")
+        old_output = os.environ.get("COMPAIR_NOW_REVIEW_OUTPUT_COST_PER_1M_USD")
+        old_budget = os.environ.get("COMPAIR_NOW_REVIEW_MAX_OUTPUT_TOKENS")
+        try:
+            os.environ["COMPAIR_NOW_REVIEW_INPUT_COST_PER_1M_USD"] = "1"
+            os.environ["COMPAIR_NOW_REVIEW_OUTPUT_COST_PER_1M_USD"] = "5"
+            os.environ["COMPAIR_NOW_REVIEW_MAX_OUTPUT_TOKENS"] = "512"
+            quote = bundle_review.quote_now_review(
+                [SimpleNamespace(document_id="doc_a", title="Core", doc_type="code-repo", content="hello world")],
+                group_name="demo",
+                model="gpt-5.4-mini",
+                max_findings=4,
+            )
+        finally:
+            if old_input is None:
+                os.environ.pop("COMPAIR_NOW_REVIEW_INPUT_COST_PER_1M_USD", None)
+            else:
+                os.environ["COMPAIR_NOW_REVIEW_INPUT_COST_PER_1M_USD"] = old_input
+            if old_output is None:
+                os.environ.pop("COMPAIR_NOW_REVIEW_OUTPUT_COST_PER_1M_USD", None)
+            else:
+                os.environ["COMPAIR_NOW_REVIEW_OUTPUT_COST_PER_1M_USD"] = old_output
+            if old_budget is None:
+                os.environ.pop("COMPAIR_NOW_REVIEW_MAX_OUTPUT_TOKENS", None)
+            else:
+                os.environ["COMPAIR_NOW_REVIEW_MAX_OUTPUT_TOKENS"] = old_budget
+
+        self.assertEqual(quote["document_count"], 1)
+        self.assertEqual(quote["max_output_tokens"], 512)
+        self.assertGreater(quote["prompt_estimated_tokens"], 0)
+        self.assertIn(quote["prompt_token_count_method"], {"tiktoken", "chars_per_token"})
+        self.assertIsNotNone(quote["cost_estimate_usd"])
+        self.assertGreater(quote["cost_estimate_usd"]["total_cost_usd"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

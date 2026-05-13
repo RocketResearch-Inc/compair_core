@@ -165,6 +165,7 @@ class NowReviewRequest(BaseModel):
     document_ids: list[str] | None = None
     max_findings: int = 12
     model: str | None = None
+    quote_id: str | None = None
 
 
 class NowReviewResponse(BaseModel):
@@ -173,4 +174,11 @@ class NowReviewResponse(BaseModel):
     document_ids: list[str]
     markdown: str
     findings: list[dict[str, Any]]
+    meta: dict[str, Any]
+
+
+class NowReviewQuoteResponse(BaseModel):
+    group_id: str
+    group_name: str
+    document_ids: list[str]
     meta: dict[str, Any]

@@ -101,6 +101,45 @@ def estimate_tokens(text: str) -> int:
     return int(math.ceil(len(text or "") / 4.0))
 
 
+def count_model_tokens(text: str, *, model: str | None = None) -> dict[str, Any]:
+    """Count tokens with the model tokenizer when available.
+
+    Falls back to the existing chars-per-token estimate only when tiktoken is
+    unavailable or cannot resolve the requested model/encoding.
+    """
+    try:
+        import tiktoken  # type: ignore
+
+        try:
+            encoding = tiktoken.encoding_for_model(model or "")
+            encoding_name = getattr(encoding, "name", None) or "model"
+        except Exception:
+            encoding_name = os.getenv("COMPAIR_NOW_REVIEW_TOKEN_ENCODING") or os.getenv("COMPAIR_CHUNK_TOKEN_ENCODING", "cl100k_base")
+            encoding = tiktoken.get_encoding(encoding_name)
+        return {
+            "tokens": len(encoding.encode(text or "")),
+            "method": "tiktoken",
+            "encoding": encoding_name,
+            "estimated": False,
+        }
+    except Exception:
+        return {
+            "tokens": estimate_tokens(text),
+            "method": "chars_per_token",
+            "encoding": None,
+            "estimated": True,
+        }
+
+
+def now_review_max_output_tokens() -> int:
+    raw = os.getenv("COMPAIR_NOW_REVIEW_MAX_OUTPUT_TOKENS") or os.getenv("NOW_REVIEW_MAX_OUTPUT_TOKENS")
+    try:
+        value = int(raw) if raw else 2200
+    except ValueError:
+        value = 2200
+    return max(256, min(value, 32000))
+
+
 def _float_env(*names: str) -> float | None:
     for name in names:
         raw = os.getenv(name)
@@ -183,6 +222,63 @@ def build_document_bundle(documents: Sequence[Any]) -> tuple[list[dict[str, Any]
         parts.append(content)
         parts.append("<<<END DOC>>>")
     return stats, "\n".join(parts)
+
+
+def build_now_review_prompt(
+    documents: Sequence[Any],
+    *,
+    max_findings: int,
+) -> dict[str, Any]:
+    document_stats, bundle_text = build_document_bundle(documents)
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(max_findings=max(1, min(max_findings, 12)))
+    user_prompt = USER_PROMPT_TEMPLATE.format(bundle=bundle_text)
+    prompt_text = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}"
+    return {
+        "document_stats": document_stats,
+        "bundle_text": bundle_text,
+        "system_prompt": system_prompt,
+        "user_prompt": user_prompt,
+        "prompt_text": prompt_text,
+    }
+
+
+def quote_now_review(
+    documents: Sequence[Any],
+    *,
+    group_name: str,
+    model: str | None,
+    max_findings: int,
+) -> dict[str, Any]:
+    prompt = build_now_review_prompt(documents, max_findings=max_findings)
+    prompt_tokens = count_model_tokens(str(prompt["prompt_text"]), model=model)
+    bundle_tokens = count_model_tokens(str(prompt["bundle_text"]), model=model)
+    output_budget = now_review_max_output_tokens()
+    cost_estimate = estimate_usage_cost(
+        model=model,
+        input_tokens=int(prompt_tokens["tokens"]),
+        output_tokens=output_budget,
+        prompt_estimated_tokens=int(prompt_tokens["tokens"]),
+    )
+    if cost_estimate is not None:
+        cost_estimate["estimated_input_tokens"] = bool(prompt_tokens["estimated"])
+        cost_estimate["estimated_output_tokens"] = True
+        cost_estimate["output_tokens_are_budget"] = True
+    return {
+        "model": model,
+        "group_name": group_name,
+        "document_count": len(prompt["document_stats"]),
+        "documents": prompt["document_stats"],
+        "bundle_estimated_tokens": int(bundle_tokens["tokens"]),
+        "bundle_token_count_method": bundle_tokens["method"],
+        "bundle_tokens_estimated": bool(bundle_tokens["estimated"]),
+        "prompt_estimated_tokens": int(prompt_tokens["tokens"]),
+        "prompt_token_count_method": prompt_tokens["method"],
+        "prompt_token_encoding": prompt_tokens.get("encoding"),
+        "prompt_tokens_estimated": bool(prompt_tokens["estimated"]),
+        "max_output_tokens": output_budget,
+        "cost_estimate_usd": cost_estimate,
+        "created_at": utc_now(),
+    }
 
 
 def _coerce_str_list(value: Any, *, limit: int) -> list[str]:

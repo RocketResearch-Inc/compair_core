@@ -11,13 +11,12 @@ import requests
 
 from .bundle_review import (
     FINDINGS_JSON_SCHEMA,
-    SYSTEM_PROMPT_TEMPLATE,
-    USER_PROMPT_TEMPLATE,
-    build_document_bundle,
-    estimate_tokens,
+    build_now_review_prompt,
     estimate_usage_cost,
     extract_json_object,
+    now_review_max_output_tokens,
     normalize_findings_payload,
+    quote_now_review,
     render_now_review_markdown,
 )
 from .logger import log_event
@@ -574,7 +573,9 @@ def review_documents_now(
     group_name: str,
     max_findings: int = 12,
     model_override: str | None = None,
+    quote_id: str | None = None,
 ) -> dict[str, Any]:
+    del quote_id  # Cloud validates durable quotes before calling this shared generator.
     if not documents:
         raise ValueError("At least one document is required for now review")
     client = _bundle_review_openai_client(reviewer)
@@ -584,17 +585,27 @@ def review_documents_now(
             "Set COMPAIR_OPENAI_MODEL and optionally COMPAIR_OPENAI_BASE_URL."
         )
 
-    doc_stats, bundle_text = build_document_bundle(documents)
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(max_findings=max(1, min(max_findings, 12)))
-    user_prompt = USER_PROMPT_TEMPLATE.format(bundle=bundle_text)
-    prompt_text = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}"
     model_name = _bundle_review_model_name(reviewer, override=model_override)
+    quote = quote_now_review(
+        documents,
+        group_name=group_name,
+        model=model_name,
+        max_findings=max_findings,
+    )
+    prompt = build_now_review_prompt(documents, max_findings=max_findings)
+    doc_stats = prompt["document_stats"]
+    bundle_text = str(prompt["bundle_text"])
+    system_prompt = str(prompt["system_prompt"])
+    user_prompt = str(prompt["user_prompt"])
+    prompt_text = str(prompt["prompt_text"])
     uses_reasoning = _is_reasoning_model_name(model_name)
+    max_output_tokens = now_review_max_output_tokens()
 
     started_at = time.time()
     response: Any = None
     raw_text: str | None = None
     response_mode = "responses"
+    max_output_tokens_applied = True
     request_kwargs: dict[str, Any] = {"model": model_name}
     if uses_reasoning:
         request_kwargs["input"] = [
@@ -614,6 +625,7 @@ def review_documents_now(
             "strict": True,
         }
     }
+    request_kwargs["max_output_tokens"] = max_output_tokens
 
     last_exc: Exception | None = None
     try:
@@ -624,6 +636,11 @@ def review_documents_now(
                 if "reasoning" in request_kwargs and _should_retry_without_reasoning(exc):
                     reduced = dict(request_kwargs)
                     reduced.pop("reasoning", None)
+                    response = client.responses.create(**reduced)
+                elif "max_output_tokens" in str(exc or "").lower():
+                    reduced = dict(request_kwargs)
+                    reduced.pop("max_output_tokens", None)
+                    max_output_tokens_applied = False
                     response = client.responses.create(**reduced)
                 else:
                     raise
@@ -643,7 +660,7 @@ def review_documents_now(
                 {"role": "user", "content": user_prompt + "\n\nReturn JSON only."},
             ],
             "temperature": 0.2,
-            "max_tokens": 2200,
+            "max_tokens": max_output_tokens,
         }
         try:
             response = client.chat.completions.create(  # type: ignore[call-arg]
@@ -665,8 +682,15 @@ def review_documents_now(
         "response_mode": response_mode,
         "duration_sec": duration_sec,
         "response_id": _get_field(response, "id"),
-        "bundle_estimated_tokens": estimate_tokens(bundle_text),
-        "prompt_estimated_tokens": estimate_tokens(prompt_text),
+        "bundle_estimated_tokens": quote["bundle_estimated_tokens"],
+        "bundle_token_count_method": quote.get("bundle_token_count_method"),
+        "bundle_tokens_estimated": quote.get("bundle_tokens_estimated"),
+        "prompt_estimated_tokens": quote["prompt_estimated_tokens"],
+        "prompt_token_count_method": quote.get("prompt_token_count_method"),
+        "prompt_token_encoding": quote.get("prompt_token_encoding"),
+        "prompt_tokens_estimated": quote.get("prompt_tokens_estimated"),
+        "max_output_tokens": max_output_tokens,
+        "max_output_tokens_applied": max_output_tokens_applied,
         "usage": {
             "input_tokens": _usage_int(usage, "input_tokens"),
             "output_tokens": _usage_int(usage, "output_tokens"),
@@ -676,8 +700,9 @@ def review_documents_now(
             model=model_name,
             input_tokens=_usage_int(usage, "input_tokens"),
             output_tokens=_usage_int(usage, "output_tokens"),
-            prompt_estimated_tokens=estimate_tokens(prompt_text),
+            prompt_estimated_tokens=int(quote["prompt_estimated_tokens"]),
         ),
+        "pre_run_quote": quote,
         "created_at": _utc_now(),
     }
     markdown = render_now_review_markdown(
@@ -707,6 +732,27 @@ def review_documents_now(
         "markdown": markdown,
         "bundle_text": bundle_text,
     }
+
+
+def quote_documents_now(
+    reviewer: Reviewer,
+    documents: list[Document],
+    user: User,
+    *,
+    group_name: str,
+    max_findings: int = 12,
+    model_override: str | None = None,
+) -> dict[str, Any]:
+    del user  # Reserved for Cloud policy/billing checks.
+    if not documents:
+        raise ValueError("At least one document is required for now review")
+    model_name = _bundle_review_model_name(reviewer, override=model_override)
+    return quote_now_review(
+        documents,
+        group_name=group_name,
+        model=model_name,
+        max_findings=max_findings,
+    )
 
 
 

@@ -33,6 +33,7 @@ class BillingProvider(Protocol):
         success_url: str,
         cancel_url: str,
         metadata: Mapping[str, str] | None = None,
+        mode: str = "subscription",
     ) -> BillingSession: ...
 
     def retrieve_session(self, session_id: str) -> BillingSession: ...

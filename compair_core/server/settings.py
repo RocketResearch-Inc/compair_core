@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     stripe_endpoint_secret: str | None = None
     stripe_success_url: str = "https://compair.sh/home"
     stripe_cancel_url: str = "https://compair.sh/home"
+    review_now_credit_price_id: str | None = None
+    review_now_credit_pack_cents: int = 1000
+    review_now_max_quote_cents: int = 200
+    review_now_min_charge_cents: int = 1
+    review_now_quote_ttl_sec: int = 1800
     ga4_measurement_id: str | None = None
     ga4_api_secret: str | None = None
     telemetry_enabled: bool = False

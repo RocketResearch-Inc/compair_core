@@ -19,9 +19,10 @@ from fastapi import APIRouter, Body, Depends, File, Form, Header, HTTPException,
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.routing import APIRoute
 from sqlalchemy import distinct, func, select, or_, cast
+from sqlalchemy import inspect as sqlalchemy_inspect
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import joinedload, Session
+from sqlalchemy.orm import joinedload, load_only, Session
 
 from .server.deps import get_analytics, get_billing, get_ocr, get_settings_dependency, get_storage
 from .server.feature_flags import review_now_backend_enabled, review_now_disabled_detail
@@ -117,7 +118,11 @@ def _reference_content(ref: models.Reference) -> Optional[str]:
     chunk = getattr(ref, "reference_chunk", None)
     if chunk is not None and getattr(chunk, "content", None):
         return chunk.content
-    if ref.document is not None and getattr(ref.document, "content", None):
+    if (
+        ref.document is not None
+        and "content" not in sqlalchemy_inspect(ref.document).unloaded
+        and getattr(ref.document, "content", None)
+    ):
         return ref.document.content
     if ref.note is not None and getattr(ref.note, "content", None):
         return ref.note.content
@@ -2131,6 +2136,49 @@ def load_doc(
         return doc
 
 
+@router.get("/documents/{document_id}/metadata")
+def load_document_metadata(
+    document_id: str,
+    current_user: models.User = Depends(get_current_user),
+) -> Mapping[str, Any]:
+    with compair.Session() as session:
+        doc = session.query(
+            models.Document.document_id,
+            models.Document.user_id,
+            models.Document.author_id,
+            models.Document.title,
+            models.Document.doc_type,
+            models.Document.datetime_created,
+            models.Document.datetime_modified,
+            models.Document.is_published,
+        ).filter(
+            models.Document.document_id == document_id
+        ).first()
+        if doc is None:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        doc_group_ids = {
+            row[0]
+            for row in session.query(models.document_to_group_table.c.group_id)
+            .filter(models.document_to_group_table.c.document_id == document_id)
+            .all()
+        }
+        user_group_ids = {g.group_id for g in current_user.groups}
+        if not doc_group_ids & user_group_ids and current_user.user_id != doc.author_id:
+            raise HTTPException(status_code=403, detail="Not authorized to view this document")
+
+        return {
+            "document_id": doc.document_id,
+            "user_id": doc.user_id,
+            "author_id": doc.author_id,
+            "title": doc.title,
+            "doc_type": doc.doc_type,
+            "datetime_created": doc.datetime_created,
+            "datetime_modified": doc.datetime_modified,
+            "is_published": doc.is_published,
+        }
+
+
 @router.post("/update_doc")
 def update_doc(
     doc_id: str = Form(...),
@@ -2491,6 +2539,101 @@ async def process_doc(
     return {"task_id": task_id}
 
 
+def _load_now_review_scope(
+    session,
+    payload: schema.NowReviewRequest,
+    current_user: models.User,
+) -> tuple[models.User, models.Group, list[models.Document]]:
+    group_id = (payload.group_id or "").strip()
+    if not group_id:
+        raise HTTPException(status_code=422, detail="group_id is required")
+
+    current_user_db = (
+        session.query(models.User)
+        .options(joinedload(models.User.groups))
+        .filter(models.User.user_id == current_user.user_id)
+        .first()
+    )
+    if current_user_db is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    group = (
+        session.query(models.Group)
+        .options(joinedload(models.Group.users))
+        .filter(models.Group.group_id == group_id)
+        .first()
+    )
+    if group is None:
+        raise HTTPException(status_code=404, detail="Group not found")
+
+    is_member = any(member.user_id == current_user_db.user_id for member in (group.users or []))
+    if not is_member and group.visibility != "public":
+        raise HTTPException(status_code=403, detail="User does not belong to the group")
+
+    requested_doc_ids = [doc_id.strip() for doc_id in (payload.document_ids or []) if doc_id and doc_id.strip()]
+    q = (
+        session.query(models.Document)
+        .join(models.Document.groups)
+        .options(joinedload(models.Document.groups), joinedload(models.Document.user))
+        .filter(models.Group.group_id == group_id)
+        .filter(
+            or_(
+                models.Document.is_published == True,
+                models.Document.user_id == current_user_db.user_id,
+            )
+        )
+        .order_by(models.Document.datetime_modified.desc(), models.Document.title.asc())
+    )
+    if requested_doc_ids:
+        q = q.filter(models.Document.document_id.in_(requested_doc_ids))
+    documents = q.distinct().all()
+    if requested_doc_ids:
+        by_id = {doc.document_id: doc for doc in documents}
+        documents = [by_id[doc_id] for doc_id in requested_doc_ids if doc_id in by_id]
+    elif any((getattr(doc, "doc_type", "") or "").strip().lower() == "code-repo" for doc in documents):
+        documents = [
+            doc for doc in documents if (getattr(doc, "doc_type", "") or "").strip().lower() == "code-repo"
+        ]
+    if not documents:
+        raise HTTPException(status_code=404, detail="No accessible documents found for now review")
+
+    return current_user_db, group, documents
+
+
+@router.post("/review_now/quote")
+def review_now_quote(
+    payload: schema.NowReviewRequest,
+    current_user: models.User = Depends(get_current_user),
+) -> schema.NowReviewQuoteResponse:
+    if not review_now_backend_enabled():
+        raise HTTPException(status_code=403, detail=review_now_disabled_detail() or "Now review is disabled.")
+
+    with compair.Session() as session:
+        current_user_db, group, documents = _load_now_review_scope(session, payload, current_user)
+
+        reviewer = compair.feedback.Reviewer()
+        try:
+            meta = compair.main.quote_documents_now(
+                current_user_db,
+                session,
+                reviewer,
+                documents,
+                group=group,
+                max_findings=max(1, min(int(payload.max_findings or 12), 12)),
+                model_override=(payload.model or "").strip() or None,
+            )
+        except Exception as exc:
+            logger.warning("review_now_quote failed: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        return schema.NowReviewQuoteResponse(
+            group_id=group.group_id,
+            group_name=group.name,
+            document_ids=[doc.document_id for doc in documents],
+            meta=dict(meta or {}),
+        )
+
+
 @router.post("/review_now")
 def review_now(
     payload: schema.NowReviewRequest,
@@ -2499,59 +2642,8 @@ def review_now(
     if not review_now_backend_enabled():
         raise HTTPException(status_code=403, detail=review_now_disabled_detail() or "Now review is disabled.")
 
-    group_id = (payload.group_id or "").strip()
-    if not group_id:
-        raise HTTPException(status_code=422, detail="group_id is required")
-
     with compair.Session() as session:
-        current_user_db = (
-            session.query(models.User)
-            .options(joinedload(models.User.groups))
-            .filter(models.User.user_id == current_user.user_id)
-            .first()
-        )
-        if current_user_db is None:
-            raise HTTPException(status_code=404, detail="User not found")
-
-        group = (
-            session.query(models.Group)
-            .options(joinedload(models.Group.users))
-            .filter(models.Group.group_id == group_id)
-            .first()
-        )
-        if group is None:
-            raise HTTPException(status_code=404, detail="Group not found")
-
-        is_member = any(member.user_id == current_user_db.user_id for member in (group.users or []))
-        if not is_member and group.visibility != "public":
-            raise HTTPException(status_code=403, detail="User does not belong to the group")
-
-        requested_doc_ids = [doc_id.strip() for doc_id in (payload.document_ids or []) if doc_id and doc_id.strip()]
-        q = (
-            session.query(models.Document)
-            .join(models.Document.groups)
-            .options(joinedload(models.Document.groups), joinedload(models.Document.user))
-            .filter(models.Group.group_id == group_id)
-            .filter(
-                or_(
-                    models.Document.is_published == True,
-                    models.Document.user_id == current_user_db.user_id,
-                )
-            )
-            .order_by(models.Document.datetime_modified.desc(), models.Document.title.asc())
-        )
-        if requested_doc_ids:
-            q = q.filter(models.Document.document_id.in_(requested_doc_ids))
-        documents = q.distinct().all()
-        if requested_doc_ids:
-            by_id = {doc.document_id: doc for doc in documents}
-            documents = [by_id[doc_id] for doc_id in requested_doc_ids if doc_id in by_id]
-        elif any((getattr(doc, "doc_type", "") or "").strip().lower() == "code-repo" for doc in documents):
-            documents = [
-                doc for doc in documents if (getattr(doc, "doc_type", "") or "").strip().lower() == "code-repo"
-            ]
-        if not documents:
-            raise HTTPException(status_code=404, detail="No accessible documents found for now review")
+        current_user_db, group, documents = _load_now_review_scope(session, payload, current_user)
 
         reviewer = compair.feedback.Reviewer()
         try:
@@ -2563,6 +2655,7 @@ def review_now(
                 group=group,
                 max_findings=max(1, min(int(payload.max_findings or 12), 12)),
                 model_override=(payload.model or "").strip() or None,
+                quote_id=(payload.quote_id or "").strip() or None,
             )
         except Exception as exc:
             logger.warning("review_now failed: %s", exc)
@@ -2784,12 +2877,21 @@ def list_document_feedback(
 ):
     """Return feedback entries for a document the current user can access."""
     with compair.Session() as session:
-        doc = session.query(models.Document).filter(models.Document.document_id == document_id).first()
+        doc = session.query(
+            models.Document.user_id,
+            models.Document.author_id,
+            models.Document.is_published,
+        ).filter(models.Document.document_id == document_id).first()
         if not doc:
             raise HTTPException(status_code=404, detail="Document not found")
         # Access control: owner, member of a group with access, or published
         user_group_ids = {g.group_id for g in current_user.groups}
-        doc_group_ids = {g.group_id for g in doc.groups}
+        doc_group_ids = {
+            row[0]
+            for row in session.query(models.document_to_group_table.c.group_id)
+            .filter(models.document_to_group_table.c.document_id == document_id)
+            .all()
+        }
         if not (doc.user_id == current_user.user_id or doc_group_ids & user_group_ids or doc.is_published):
             raise HTTPException(status_code=403, detail="Not authorized to access this document")
         # Join through chunks
@@ -2800,7 +2902,19 @@ def list_document_feedback(
                 joinedload(models.Feedback.chunk)
                 .joinedload(models.Chunk.references)
                 .joinedload(models.Reference.document)
-                .joinedload(models.Document.user),
+                .load_only(
+                    models.Document.document_id,
+                    models.Document.user_id,
+                    models.Document.author_id,
+                    models.Document.title,
+                    models.Document.doc_type,
+                    models.Document.is_published,
+                ),
+                joinedload(models.Feedback.chunk)
+                .joinedload(models.Chunk.references)
+                .joinedload(models.Reference.document)
+                .joinedload(models.Document.user)
+                .load_only(models.User.user_id, models.User.name, models.User.username),
                 joinedload(models.Feedback.chunk)
                 .joinedload(models.Chunk.references)
                 .joinedload(models.Reference.note)
@@ -4626,6 +4740,12 @@ async def stripe_webhook(
             intent = event["data"]["object"]
             handle_successful_payment_intent(intent)
 
+        elif event["type"] == "checkout.session.completed":
+            checkout_session = event["data"]["object"]
+            handler = getattr(compair.main, "handle_checkout_session_completed", None)
+            if callable(handler):
+                handler(checkout_session, billing=billing, analytics=analytics)
+
         elif event["type"] == "invoice.payment_succeeded":
             invoice = event["data"]["object"]
             handle_successful_invoice_payment(invoice, billing, analytics)
@@ -5838,6 +5958,7 @@ CORE_PATHS: set[str] = {
     "/load_documents",
     "/load_document",
     "/load_document_by_id",
+    "/documents/{document_id}/metadata",
     "/load_user_files",
     "/create_doc",
     "/update_doc",

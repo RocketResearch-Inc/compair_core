@@ -4244,12 +4244,39 @@ def review_documents_now(
     group: Group | None = None,
     max_findings: int = 12,
     model_override: str | None = None,
+    quote_id: str | None = None,
 ) -> dict[str, Any]:
     del session  # Included for parity with other main helpers.
     if generate_now_review is None:
         raise RuntimeError("Now review is unavailable in this runtime")
     group_name = str(getattr(group, "name", "") or getattr(group, "group_id", "") or "Active group")
     return generate_now_review(
+        reviewer,
+        documents,
+        user,
+        group_name=group_name,
+        max_findings=max_findings,
+        model_override=model_override,
+        quote_id=quote_id,
+    )
+
+
+def quote_documents_now(
+    user: User,
+    session: SASession,
+    reviewer: Reviewer,
+    documents: list[Document],
+    *,
+    group: Group | None = None,
+    max_findings: int = 12,
+    model_override: str | None = None,
+) -> dict[str, Any]:
+    del session  # Included for parity with other main helpers.
+    quote_now = getattr(feedback_module, "quote_documents_now", None)
+    if quote_now is None:
+        raise RuntimeError("Now review quote is unavailable in this runtime")
+    group_name = str(getattr(group, "name", "") or getattr(group, "group_id", "") or "Active group")
+    return quote_now(
         reviewer,
         documents,
         user,
