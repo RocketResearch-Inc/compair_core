@@ -522,6 +522,16 @@ def _dispatch_process_document_task(
             return process_document_celery(user_id, doc_id, doc_text or "", generate_feedback)
 
 
+def _process_document_async_result(task_id: str):
+    task_async_result = getattr(process_document_celery, "AsyncResult", None)
+    if callable(task_async_result):
+        try:
+            return task_async_result(task_id)
+        except Exception as exc:
+            logger.warning("process_document task-bound status lookup failed: %s", exc)
+    return AsyncResult(task_id)
+
+
 def _update_document_content_without_index(
     *,
     session: Session,
@@ -2727,7 +2737,7 @@ def get_ocr_file_result(
 async def get_process_status(
     task_id: str
 ):
-    task_result = AsyncResult(task_id)
+    task_result = _process_document_async_result(task_id)
     status = task_result.status
     info = task_result.info
     if status == "SUCCESS":
