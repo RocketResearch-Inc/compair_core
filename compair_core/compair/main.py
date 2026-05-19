@@ -13,7 +13,7 @@ from typing import Any, Mapping, Optional
 import Levenshtein
 from sqlalchemy import or_, select
 from sqlalchemy.orm.attributes import get_history
-from sqlalchemy.orm import Session as SASession
+from sqlalchemy.orm import Session as SASession, load_only
 
 from . import feedback as feedback_module
 from .embeddings import create_embedding, create_embeddings, Embedder
@@ -3739,15 +3739,31 @@ def process_text(
     chunk_type = "note" if note else "document"
     note_id = note.note_id if note else None
 
-    existing_chunks = session.query(Chunk).filter(
+    # Check by stable hash first. Comparing full chunk text and loading full rows
+    # is expensive on large code snapshots.
+    existing_chunks = session.query(Chunk).options(
+        load_only(Chunk.chunk_id, Chunk.hash, Chunk.embedding)
+    ).filter(
         Chunk.document_id == doc.document_id,
         Chunk.chunk_type == chunk_type,
         Chunk.note_id == note_id,
-        Chunk.content == text,
+        Chunk.hash == chunk_hash,
     )
 
     user = session.query(User).filter(User.user_id == doc.author_id).first()
     existing_rows = existing_chunks.all()
+    # Legacy fallback is opt-in because text equality against large chunks is the
+    # pressure point that can destabilize small Postgres instances.
+    if not existing_rows and os.getenv("COMPAIR_ENABLE_LEGACY_CONTENT_CHUNK_LOOKUP", "").lower() in {"1", "true", "yes"}:
+        legacy_chunks = session.query(Chunk).options(
+            load_only(Chunk.chunk_id, Chunk.hash, Chunk.embedding)
+        ).filter(
+            Chunk.document_id == doc.document_id,
+            Chunk.chunk_type == chunk_type,
+            Chunk.note_id == note_id,
+            Chunk.content == text,
+        )
+        existing_rows = legacy_chunks.all()
     existing_chunk = existing_rows[0] if existing_rows else None
 
     embedding = precomputed_embedding
@@ -3782,7 +3798,7 @@ def process_text(
             Chunk.document_id == doc.document_id,
             Chunk.chunk_type == chunk_type,
             Chunk.note_id == note_id,
-            Chunk.content == text,
+            Chunk.hash == chunk_hash,
         ).first()
 
     references: list[Chunk] = []

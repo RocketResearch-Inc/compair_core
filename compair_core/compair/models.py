@@ -20,6 +20,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Identity,
+    Index,
     Integer,
     JSON,
     String,
@@ -363,7 +364,9 @@ class Note(Base):
 
 class Chunk(Base):
     __tablename__ = "chunk"
-    
+    __table_args__ = (
+        Index("ix_chunk_document_type_note_hash", "document_id", "chunk_type", "note_id", "hash"),
+    )
 
     chunk_id: Mapped[str] = mapped_column(String(36), primary_key=True, init=False, default=lambda: str(uuid4()))
     hash: Mapped[str] = mapped_column(String(64))
