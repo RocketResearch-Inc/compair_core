@@ -708,7 +708,20 @@ HAS_REFERRALS = hasattr(models.User, "referral_code")
 HAS_BILLING = hasattr(models.User, "stripe_customer_id")
 HAS_TRIALS = hasattr(models.User, "trial_expiration_date")
 HAS_REDIS = redis_client is not None
-_PROCESS_DOC_PAYLOAD_TTL_SEC = 3600
+
+
+def _process_doc_payload_ttl_sec() -> int:
+    raw = os.getenv("COMPAIR_PROCESS_DOC_PAYLOAD_TTL_SEC", "").strip()
+    if not raw:
+        return 86_400
+    try:
+        value = int(raw)
+    except ValueError:
+        return 86_400
+    return max(3_600, value)
+
+
+_PROCESS_DOC_PAYLOAD_TTL_SEC = _process_doc_payload_ttl_sec()
 
 
 def require_feature(flag: bool, feature: str) -> None:
