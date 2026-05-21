@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import logging
 import os
@@ -724,6 +725,13 @@ def _process_doc_payload_ttl_sec() -> int:
 _PROCESS_DOC_PAYLOAD_TTL_SEC = _process_doc_payload_ttl_sec()
 
 
+def _process_doc_payload_stage_backend() -> str:
+    raw = os.getenv("COMPAIR_PROCESS_DOC_PAYLOAD_STAGE_BACKEND", "").strip().lower()
+    if raw in {"auto", "redis", "storage"}:
+        return raw
+    return "storage" if IS_CLOUD else "redis"
+
+
 def require_feature(flag: bool, feature: str) -> None:
     if not flag and not IS_CLOUD:
         raise HTTPException(status_code=501, detail=f"{feature} is only available in the Compair Cloud edition.")
@@ -747,9 +755,7 @@ def _estimate_b64_decoded_bytes(value: str) -> int:
     return max(0, (len(stripped) * 3 // 4) - padding)
 
 
-def _stage_process_doc_payload(*, doc_text: str | None, doc_text_b64: str | None) -> str | None:
-    if not HAS_REDIS or redis_client is None:
-        return None
+def _build_process_doc_payload(*, doc_text: str | None, doc_text_b64: str | None) -> dict[str, str] | None:
     payload: dict[str, str] = {}
     if doc_text_b64 is not None:
         payload["doc_text_b64"] = doc_text_b64
@@ -757,9 +763,56 @@ def _stage_process_doc_payload(*, doc_text: str | None, doc_text_b64: str | None
         payload["doc_text"] = doc_text
     else:
         return None
+    return payload
+
+
+def _stage_process_doc_payload_storage(storage: StorageProvider, payload: dict[str, str]) -> str:
+    key = f"process_doc_payloads/{secrets.token_urlsafe(24)}.json"
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    storage.put_file(key, io.BytesIO(body), "application/json")
+    return f"storage://{key}"
+
+
+def _stage_process_doc_payload_redis(payload: dict[str, str]) -> str | None:
+    if not HAS_REDIS or redis_client is None:
+        return None
     key = f"process_doc_payload:{secrets.token_urlsafe(24)}"
     redis_client.setex(key, _PROCESS_DOC_PAYLOAD_TTL_SEC, json.dumps(payload, ensure_ascii=False))
     return key
+
+
+def _stage_process_doc_payload(
+    *,
+    doc_text: str | None,
+    doc_text_b64: str | None,
+    storage: StorageProvider | None = None,
+) -> str | None:
+    payload = _build_process_doc_payload(doc_text=doc_text, doc_text_b64=doc_text_b64)
+    if payload is None:
+        return None
+
+    backend = _process_doc_payload_stage_backend()
+    if backend in {"storage", "auto"} and storage is not None:
+        try:
+            return _stage_process_doc_payload_storage(storage, payload)
+        except Exception as exc:
+            logger.warning("process_doc payload storage staging failed: %s", exc)
+            if backend == "storage":
+                raise
+
+    if backend in {"redis", "auto"}:
+        return _stage_process_doc_payload_redis(payload)
+    return None
+
+
+def _process_doc_payload_stage_backend_for_key(key: str | None) -> str | None:
+    if not key:
+        return None
+    if key.startswith("storage://"):
+        return "storage"
+    if key.startswith("process_doc_payload:"):
+        return "redis"
+    return "unknown"
 
 def get_current_user(auth_token: str | None = Header(None)):
     settings = get_settings_dependency()
@@ -2465,16 +2518,22 @@ async def process_doc(
     reference_doc_ids: list[str] = Form([]),
     current_user: models.User = Depends(get_current_user),
     analytics: Analytics = Depends(get_analytics),
+    storage: StorageProvider = Depends(get_storage),
 ) -> Mapping[str, str | bool | None]:
     if doc_text is None and doc_text_b64 is None:
         raise HTTPException(status_code=422, detail="doc_text or doc_text_b64 is required")
 
     staged_payload_key: str | None = None
-    if HAS_REDIS and not skip_index:
+    if not skip_index:
         try:
-            staged_payload_key = _stage_process_doc_payload(doc_text=doc_text, doc_text_b64=doc_text_b64)
+            staged_payload_key = _stage_process_doc_payload(
+                doc_text=doc_text,
+                doc_text_b64=doc_text_b64,
+                storage=storage,
+            )
         except Exception as exc:
             logger.warning("process_doc payload staging failed: %s", exc)
+            raise HTTPException(status_code=503, detail="Unable to stage document payload for background processing") from exc
 
     if staged_payload_key is None:
         decoded_doc_text = _decode_optional_base64(doc_text_b64, "doc_text_b64")
@@ -2500,7 +2559,8 @@ async def process_doc(
         doc_id=doc_id,
         payload_transport="doc_text_b64" if doc_text_b64 is not None else "doc_text",
         payload_bytes=payload_bytes,
-        staged_via_redis=bool(staged_payload_key),
+        payload_stage_backend=_process_doc_payload_stage_backend_for_key(staged_payload_key),
+        staged_via_redis=_process_doc_payload_stage_backend_for_key(staged_payload_key) == "redis",
     )
 
     with compair.Session() as session:
