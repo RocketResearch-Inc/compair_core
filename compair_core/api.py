@@ -725,11 +725,11 @@ def _process_doc_payload_ttl_sec() -> int:
 _PROCESS_DOC_PAYLOAD_TTL_SEC = _process_doc_payload_ttl_sec()
 
 
-def _process_doc_payload_stage_backend() -> str:
+def _process_doc_payload_stage_backend(*, prefer_storage: bool = False) -> str:
     raw = os.getenv("COMPAIR_PROCESS_DOC_PAYLOAD_STAGE_BACKEND", "").strip().lower()
     if raw in {"auto", "redis", "storage"}:
         return raw
-    return "storage" if IS_CLOUD else "redis"
+    return "storage" if (prefer_storage or IS_CLOUD) else "redis"
 
 
 def require_feature(flag: bool, feature: str) -> None:
@@ -786,12 +786,13 @@ def _stage_process_doc_payload(
     doc_text: str | None,
     doc_text_b64: str | None,
     storage: StorageProvider | None = None,
+    prefer_storage: bool = False,
 ) -> str | None:
     payload = _build_process_doc_payload(doc_text=doc_text, doc_text_b64=doc_text_b64)
     if payload is None:
         return None
 
-    backend = _process_doc_payload_stage_backend()
+    backend = _process_doc_payload_stage_backend(prefer_storage=prefer_storage)
     if backend in {"storage", "auto"} and storage is not None:
         try:
             return _stage_process_doc_payload_storage(storage, payload)
@@ -2519,6 +2520,7 @@ async def process_doc(
     current_user: models.User = Depends(get_current_user),
     analytics: Analytics = Depends(get_analytics),
     storage: StorageProvider = Depends(get_storage),
+    settings: Settings = Depends(get_settings_dependency),
 ) -> Mapping[str, str | bool | None]:
     if doc_text is None and doc_text_b64 is None:
         raise HTTPException(status_code=422, detail="doc_text or doc_text_b64 is required")
@@ -2530,6 +2532,7 @@ async def process_doc(
                 doc_text=doc_text,
                 doc_text_b64=doc_text_b64,
                 storage=storage,
+                prefer_storage=settings.edition.lower() == "cloud",
             )
         except Exception as exc:
             logger.warning("process_doc payload staging failed: %s", exc)

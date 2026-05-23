@@ -29,6 +29,13 @@ def _parse_cors_origins(value: str | None) -> list[str]:
     return [origin for origin in origins if origin]
 
 
+def _constant_dependency(value):
+    def dependency():
+        return value
+
+    return dependency
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Instantiate the FastAPI application with edition-specific wiring."""
 
@@ -116,30 +123,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 api_secret=resolved_settings.ga4_api_secret,
             )
 
-        app.dependency_overrides[get_storage] = lambda sp=storage_provider: sp
+        app.dependency_overrides[get_storage] = _constant_dependency(storage_provider)
         if ocr_provider is not None:
-            app.dependency_overrides[get_ocr] = lambda op=ocr_provider: op
+            app.dependency_overrides[get_ocr] = _constant_dependency(ocr_provider)
             object.__setattr__(resolved_settings, "ocr_enabled", True)
         else:
             object.__setattr__(resolved_settings, "ocr_enabled", False)
         if analytics_provider is not None:
-            app.dependency_overrides[get_analytics] = lambda ap=analytics_provider: ap
+            app.dependency_overrides[get_analytics] = _constant_dependency(analytics_provider)
         if resolved_settings.billing_enabled and resolved_settings.stripe_key:
             billing_provider = StripeBilling(
                 stripe_key=resolved_settings.stripe_key,
                 endpoint_secret=resolved_settings.stripe_endpoint_secret,
             )
-            app.dependency_overrides[get_billing] = lambda bp=billing_provider: bp
+            app.dependency_overrides[get_billing] = _constant_dependency(billing_provider)
         else:
             print("Warning: Stripe billing not configured or disabled. Using no-op billing provider.")
-        app.dependency_overrides[get_mailer] = lambda mp=mailer_provider: mp
+        app.dependency_overrides[get_mailer] = _constant_dependency(mailer_provider)
 
     else:
         storage_provider = LocalStorage(
             base_dir=resolved_settings.local_upload_dir,
             base_url=resolved_settings.local_upload_base_url,
         )
-        app.dependency_overrides[get_storage] = lambda sp=storage_provider: sp
+        app.dependency_overrides[get_storage] = _constant_dependency(storage_provider)
         start_usage_telemetry(resolved_settings)
 
     return app
