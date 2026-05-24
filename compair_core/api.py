@@ -39,6 +39,7 @@ from .compair.utils import (
     chunk_text,
     generate_verification_token,
     log_activity,
+    sanitize_text_for_database,
     sign_compact_payload,
     verify_compact_payload,
 )
@@ -540,6 +541,7 @@ def _update_document_content_without_index(
     doc_text: str,
     user_id: str,
 ) -> None:
+    doc_text = sanitize_text_for_database(doc_text)
     doc.content = doc_text
     doc.datetime_modified = datetime.now(timezone.utc)
     try:
@@ -745,10 +747,10 @@ def _decode_optional_base64(value: str | None, field_name: str) -> str | None:
     except (binascii.Error, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"Invalid base64 payload for {field_name}") from exc
     try:
-        return decoded.decode("utf-8")
+        return sanitize_text_for_database(decoded.decode("utf-8"))
     except UnicodeDecodeError:
         logger.warning("%s contained invalid UTF-8; replacing invalid bytes", field_name)
-        return decoded.decode("utf-8", errors="replace")
+        return sanitize_text_for_database(decoded.decode("utf-8", errors="replace"))
 
 
 def _estimate_b64_decoded_bytes(value: str) -> int:
@@ -2351,6 +2353,8 @@ def create_doc(
         decoded_content = _decode_optional_base64(document_content_b64, "document_content_b64")
         if decoded_content is not None:
             document_content = decoded_content
+        if document_content is not None:
+            document_content = sanitize_text_for_database(document_content)
 
         document = models.Document(
             user_id=current_user.user_id,
@@ -2528,6 +2532,8 @@ async def process_doc(
 ) -> Mapping[str, str | bool | None]:
     if doc_text is None and doc_text_b64 is None:
         raise HTTPException(status_code=422, detail="doc_text or doc_text_b64 is required")
+    if doc_text is not None:
+        doc_text = sanitize_text_for_database(doc_text)
 
     staged_payload_key: str | None = None
     if not skip_index:

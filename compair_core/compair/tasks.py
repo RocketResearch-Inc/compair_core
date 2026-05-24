@@ -34,8 +34,9 @@ except (ImportError, ModuleNotFoundError) as exc:
         from .main import process_document
         from .models import Document, User
         from .topic_tags import extract_topic_tags
+        from .utils import sanitize_text_for_database
 
-        return SessionMaker, Embedder, Reviewer, log_event, process_document, Document, User, extract_topic_tags
+        return SessionMaker, Embedder, Reviewer, log_event, process_document, Document, User, extract_topic_tags, sanitize_text_for_database
 
     logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ except (ImportError, ModuleNotFoundError) as exc:
         snapshot_payload_key: Optional[str] = None,
         reference_doc_ids: Optional[list[str]] = None,
     ) -> Mapping[str, list[str]]:
-        SessionMaker, Embedder, Reviewer, log_event, process_document, Document, User, extract_topic_tags = _lazy_components()
+        SessionMaker, Embedder, Reviewer, log_event, process_document, Document, User, extract_topic_tags, sanitize_text_for_database = _lazy_components()
         with SessionMaker() as session:
             user = session.query(User).filter(User.user_id == user_id).first()
             if not user:
@@ -66,6 +67,7 @@ except (ImportError, ModuleNotFoundError) as exc:
                 logger.warning("Document not found for processing", extra={"document_id": doc_id})
                 return {"chunk_task_ids": []}
 
+            doc_text = sanitize_text_for_database(doc_text)
             doc.content = doc_text
             doc.topic_tags = extract_topic_tags(doc_text)
             session.add(doc)

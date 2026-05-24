@@ -36,6 +36,7 @@ from .utils import (
     chunk_text_with_mode,
     count_tokens,
     log_activity,
+    sanitize_text_for_database,
     stable_chunk_hash,
 )
 
@@ -3169,6 +3170,7 @@ def process_document(
     reference_doc_ids: list[str] | None = None,
 ) -> Mapping[str, int]:
     new = False
+    doc.content = sanitize_text_for_database(doc.content)
 
     prev_content = get_history(doc, "content").deleted
     prev_chunks: list[str] = []
@@ -3734,6 +3736,7 @@ def process_text(
     reference_doc_ids: list[str] | None = None,
 ) -> None:
     logger = logging.getLogger(__name__)
+    text = sanitize_text_for_database(text)
     chunk_hash = stable_chunk_hash(text)
 
     chunk_type = "note" if note else "document"

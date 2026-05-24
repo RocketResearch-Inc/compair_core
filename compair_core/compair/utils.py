@@ -16,15 +16,25 @@ from .models import Activity
 
 
 CLIENT_CHUNK_DELIMITER = "<<<COMPAIR_CHUNK>>>"
+TEXT_REPLACEMENT_CHARACTER = "\uFFFD"
+
+
+def sanitize_text_for_database(text: str | None) -> str:
+    """PostgreSQL text columns reject NUL bytes; keep payloads DB-safe."""
+    if text is None:
+        return ""
+    return str(text).replace("\x00", TEXT_REPLACEMENT_CHARACTER)
 
 
 def chunk_text(text: str) -> list[str]:
+    text = sanitize_text_for_database(text)
     chunks = text.split("\n\n")
     chunks = [c.strip() for c in chunks]
     return [c for c in chunks if c]
 
 
 def split_client_chunks(text: str, delimiter: str = CLIENT_CHUNK_DELIMITER) -> list[str]:
+    text = sanitize_text_for_database(text)
     if not text or delimiter not in text:
         return []
     parts = [p.strip() for p in text.split(delimiter)]
@@ -32,6 +42,7 @@ def split_client_chunks(text: str, delimiter: str = CLIENT_CHUNK_DELIMITER) -> l
 
 
 def stable_chunk_hash(text: str) -> str:
+    text = sanitize_text_for_database(text)
     return hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()
 
 
@@ -234,6 +245,7 @@ def chunk_text_smart(
 
 
 def chunk_text_with_mode(text: str, chunk_mode: Optional[str] = None) -> list[str]:
+    text = sanitize_text_for_database(text)
     if not text:
         return []
     mode = (chunk_mode or "").strip().lower()
