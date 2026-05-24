@@ -742,9 +742,13 @@ def _decode_optional_base64(value: str | None, field_name: str) -> str | None:
         return None
     try:
         decoded = base64.b64decode(value.encode("utf-8"), validate=True)
-        return decoded.decode("utf-8")
-    except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
+    except (binascii.Error, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"Invalid base64 payload for {field_name}") from exc
+    try:
+        return decoded.decode("utf-8")
+    except UnicodeDecodeError:
+        logger.warning("%s contained invalid UTF-8; replacing invalid bytes", field_name)
+        return decoded.decode("utf-8", errors="replace")
 
 
 def _estimate_b64_decoded_bytes(value: str) -> int:
