@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     r2_cdn_base: str | None = None
     r2_access_key: str | None = None
     r2_secret_key: str | None = None
+    r2_account_id: str | None = None
     r2_endpoint_url: str | None = None
 
     # Optional cloud secrets

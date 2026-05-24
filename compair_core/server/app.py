@@ -96,15 +96,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             print(f"Warning: OCR not available ({exc}). OCR features will be disabled.")
 
         # Storage: Use R2 if configured, otherwise fall back to LocalStorage
+        r2_endpoint_url = resolved_settings.r2_endpoint_url
+        if not r2_endpoint_url and resolved_settings.r2_account_id:
+            r2_endpoint_url = f"https://{resolved_settings.r2_account_id}.r2.cloudflarestorage.com"
         if (resolved_settings.r2_bucket and
             resolved_settings.r2_access_key and
-            resolved_settings.r2_secret_key):
+            resolved_settings.r2_secret_key and
+            r2_endpoint_url):
             storage_provider = R2Storage(
                 bucket=resolved_settings.r2_bucket,
                 cdn_base=resolved_settings.r2_cdn_base,
                 access_key=resolved_settings.r2_access_key,
                 secret_key=resolved_settings.r2_secret_key,
-                endpoint_url=resolved_settings.r2_endpoint_url,
+                endpoint_url=r2_endpoint_url,
             )
             print("Using R2 storage for cloud mode")
         else:
