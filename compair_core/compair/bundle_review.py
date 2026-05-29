@@ -117,7 +117,7 @@ def count_model_tokens(text: str, *, model: str | None = None) -> dict[str, Any]
             encoding_name = os.getenv("COMPAIR_NOW_REVIEW_TOKEN_ENCODING") or os.getenv("COMPAIR_CHUNK_TOKEN_ENCODING", "cl100k_base")
             encoding = tiktoken.get_encoding(encoding_name)
         return {
-            "tokens": len(encoding.encode(text or "")),
+            "tokens": len(encoding.encode(text or "", disallowed_special=())),
             "method": "tiktoken",
             "encoding": encoding_name,
             "estimated": False,

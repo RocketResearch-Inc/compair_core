@@ -54,7 +54,7 @@ def _get_token_counter() -> Callable[[str], int]:
         encoding = tiktoken.get_encoding(encoding_name)
 
         def _count(text: str) -> int:
-            return len(encoding.encode(text or ""))
+            return len(encoding.encode(text or "", disallowed_special=()))
 
         return _count
     except Exception:
@@ -119,7 +119,7 @@ def _split_by_tokens(text: str, target: int, overlap: int, token_counter: Callab
 
         encoding_name = os.getenv("COMPAIR_CHUNK_TOKEN_ENCODING", "cl100k_base")
         encoding = tiktoken.get_encoding(encoding_name)
-        tokens = encoding.encode(text)
+        tokens = encoding.encode(text, disallowed_special=())
         step = max(1, target - overlap)
         out: list[str] = []
         for start in range(0, len(tokens), step):
@@ -149,7 +149,7 @@ def _tail_by_tokens(text: str, overlap: int) -> str:
 
         encoding_name = os.getenv("COMPAIR_CHUNK_TOKEN_ENCODING", "cl100k_base")
         encoding = tiktoken.get_encoding(encoding_name)
-        tokens = encoding.encode(text)
+        tokens = encoding.encode(text, disallowed_special=())
         if not tokens:
             return ""
         tail = tokens[-overlap:]

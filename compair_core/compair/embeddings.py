@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import hashlib
 import math
 import os
@@ -139,12 +141,12 @@ def _embed_encoding(model_name: str):
 
 
 def _token_count(text: str, model_name: str) -> int:
-    return len(_embed_encoding(model_name).encode(text or " "))
+    return len(_embed_encoding(model_name).encode(text or " ", disallowed_special=()))
 
 
 def _split_text_for_embedding(text: str, model_name: str, max_tokens: int) -> list[tuple[str, int]]:
     encoding = _embed_encoding(model_name)
-    tokens = encoding.encode(text or " ")
+    tokens = encoding.encode(text or " ", disallowed_special=())
     if len(tokens) <= max_tokens:
         return [(text or " ", len(tokens))]
     segments: list[tuple[str, int]] = []
