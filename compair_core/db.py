@@ -7,6 +7,55 @@ from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import sessionmaker
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _optional_int_env(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+def _pooled_engine_kwargs(*, default_pool_size: int | None = None, default_max_overflow: int | None = None) -> dict[str, object]:
+    """Return conservative SQLAlchemy pool settings for hosted Postgres.
+
+    Celery workers can run for hours between DB checkouts while Render/Postgres
+    may close idle SSL sockets. `pool_pre_ping` makes checkout discard dead
+    sockets instead of failing the first query in the next task.
+    """
+    kwargs: dict[str, object] = {}
+    if _bool_env("COMPAIR_DB_POOL_PRE_PING", True):
+        kwargs["pool_pre_ping"] = True
+    recycle_sec = _optional_int_env("COMPAIR_DB_POOL_RECYCLE_SEC")
+    if recycle_sec is None:
+        recycle_sec = 1800
+    if recycle_sec > 0:
+        kwargs["pool_recycle"] = recycle_sec
+    pool_size = _optional_int_env("COMPAIR_DB_POOL_SIZE")
+    if pool_size is None:
+        pool_size = default_pool_size
+    if pool_size is not None:
+        kwargs["pool_size"] = pool_size
+    max_overflow = _optional_int_env("COMPAIR_DB_MAX_OVERFLOW")
+    if max_overflow is None:
+        max_overflow = default_max_overflow
+    if max_overflow is not None:
+        kwargs["max_overflow"] = max_overflow
+    pool_timeout = _optional_int_env("COMPAIR_DB_POOL_TIMEOUT_SEC")
+    if pool_timeout is not None and pool_timeout > 0:
+        kwargs["pool_timeout"] = pool_timeout
+    return kwargs
+
+
 def _build_engine() -> Engine:
     """Create the SQLAlchemy engine using the same precedence as the core package."""
     explicit_url = (
@@ -17,7 +66,7 @@ def _build_engine() -> Engine:
     if explicit_url:
         if explicit_url.startswith("sqlite:"):
             return create_engine(explicit_url, connect_args={"check_same_thread": False})
-        return create_engine(explicit_url)
+        return create_engine(explicit_url, **_pooled_engine_kwargs())
 
     # Backwards compatibility with legacy Postgres env variables
     db = os.getenv("DB")
@@ -28,8 +77,7 @@ def _build_engine() -> Engine:
     if all([db, db_user, db_passw, db_host]):
         return create_engine(
             f"postgresql+psycopg2://{db_user}:{db_passw}@{db_host}/{db}",
-            pool_size=10,
-            max_overflow=0,
+            **_pooled_engine_kwargs(default_pool_size=10, default_max_overflow=0),
         )
 
     # Local default: place an SQLite database inside COMPAIR_DB_DIR
@@ -61,4 +109,17 @@ engine = _build_engine()
 SessionLocal = sessionmaker(engine)
 Session = SessionLocal
 
-__all__ = ["engine", "SessionLocal", "Session"]
+
+def dispose_engine(*, close: bool = True) -> None:
+    """Dispose pooled DB connections.
+
+    Celery prefork children call this with `close=False` immediately after fork
+    so they do not reuse sockets opened by the parent process.
+    """
+    try:
+        engine.dispose(close=close)
+    except TypeError:  # SQLAlchemy <1.4.33 compatibility.
+        engine.dispose()
+
+
+__all__ = ["engine", "SessionLocal", "Session", "dispose_engine"]
