@@ -469,6 +469,15 @@ IS_CLOUD = os.getenv("COMPAIR_EDITION", "core").lower() == "cloud"
 SINGLE_USER_SESSION_TTL = timedelta(days=365)
 
 
+def _authenticated_session_ttl() -> timedelta:
+    raw = os.getenv("COMPAIR_SESSION_TTL_DAYS", "1").strip()
+    try:
+        days = int(raw)
+    except ValueError:
+        days = 1
+    return timedelta(days=max(1, days))
+
+
 def _render_email(template: str, **context: str) -> str:
     """Lightweight template renderer for {{placeholders}} found in email HTML."""
     rendered = template
@@ -914,7 +923,7 @@ def login(request: schema.LoginRequest) -> dict:
             id=secrets.token_urlsafe(),
             user_id=user.user_id,
             datetime_created=now,
-            datetime_valid_until=now + timedelta(days=1),
+            datetime_valid_until=now + _authenticated_session_ttl(),
         )
         session.add(user_session)
         session.commit()
@@ -3132,7 +3141,7 @@ def verify_email(token: str):
             id=secrets.token_urlsafe(),
             user_id=user.user_id,
             datetime_created=now,
-            datetime_valid_until=now + timedelta(days=1),
+            datetime_valid_until=now + _authenticated_session_ttl(),
         )
         session.add(user_session)
         session.commit()
