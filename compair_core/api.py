@@ -830,6 +830,56 @@ def _process_doc_payload_stage_backend_for_key(key: str | None) -> str | None:
         return "redis"
     return "unknown"
 
+
+def _parse_process_doc_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    return text in {"1", "true", "yes", "y", "on"}
+
+
+def _parse_process_doc_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+def _parse_process_doc_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if isinstance(value, tuple):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+async def _read_process_doc_payload(request: Request) -> dict[str, Any]:
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type == "application/json":
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="JSON payload must be an object")
+        return dict(payload)
+
+    form = await request.form(
+        max_files=1000,
+        max_fields=1000,
+        max_part_size=int(os.getenv("COMPAIR_PROCESS_DOC_FORM_MAX_PART_SIZE", str(64 * 1024 * 1024))),
+    )
+    payload: dict[str, Any] = dict(form)
+    if hasattr(form, "getlist"):
+        payload["reference_doc_ids"] = list(form.getlist("reference_doc_ids"))
+    return payload
+
+
 def get_current_user(auth_token: str | None = Header(None)):
     settings = get_settings_dependency()
     if not settings.require_authentication:
@@ -2526,19 +2576,23 @@ def delete_doc(
 
 @router.post("/process_doc")
 async def process_doc(
-    doc_id: str = Form(...),
-    doc_text: str | None = Form(None),
-    doc_text_b64: str | None = Form(None),
-    generate_feedback: bool = Form(True),
-    skip_index: bool = Form(False),
-    chunk_mode: Optional[str] = Form(None),
-    reanalyze_existing: bool = Form(False),
-    reference_doc_ids: list[str] = Form([]),
+    request: Request,
     current_user: models.User = Depends(get_current_user),
     analytics: Analytics = Depends(get_analytics),
     storage: StorageProvider = Depends(get_storage),
     settings: Settings = Depends(get_settings_dependency),
 ) -> Mapping[str, str | bool | None]:
+    payload = await _read_process_doc_payload(request)
+    doc_id = str(payload.get("doc_id") or "").strip()
+    doc_text = _parse_process_doc_string(payload.get("doc_text"))
+    doc_text_b64 = _parse_process_doc_string(payload.get("doc_text_b64"))
+    generate_feedback = _parse_process_doc_bool(payload.get("generate_feedback"), True)
+    skip_index = _parse_process_doc_bool(payload.get("skip_index"), False)
+    chunk_mode = _parse_process_doc_string(payload.get("chunk_mode"))
+    reanalyze_existing = _parse_process_doc_bool(payload.get("reanalyze_existing"), False)
+    reference_doc_ids = _parse_process_doc_list(payload.get("reference_doc_ids"))
+    if not doc_id:
+        raise HTTPException(status_code=422, detail="doc_id is required")
     if doc_text is None and doc_text_b64 is None:
         raise HTTPException(status_code=422, detail="doc_text or doc_text_b64 is required")
     if doc_text is not None:
