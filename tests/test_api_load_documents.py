@@ -91,23 +91,31 @@ def _user(user_id: str = "user-1"):
     )
 
 
+class _FakeDocument:
+    document_id = "doc-1"
+    author_id = "user-1"
+    groups = []
+    title = "Large snapshot"
+    doc_type = "document"
+    datetime_created = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    datetime_modified = datetime(2024, 1, 2, tzinfo=timezone.utc)
+    is_published = True
+    file_key = None
+    image_key = None
+    topic_tags = None
+
+    def __init__(self, user):
+        self.user = user
+        self.user_id = user.user_id
+        self.author_id = user.user_id
+
+    @property
+    def content(self):
+        raise AssertionError("load_documents should not read full document content")
+
+
 def _document(user):
-    return SimpleNamespace(
-        document_id="doc-1",
-        user_id=user.user_id,
-        author_id=user.user_id,
-        groups=[],
-        user=user,
-        title="Large snapshot",
-        content="large content",
-        doc_type="document",
-        datetime_created=datetime(2024, 1, 1, tzinfo=timezone.utc),
-        datetime_modified=datetime(2024, 1, 2, tzinfo=timezone.utc),
-        is_published=True,
-        file_key=None,
-        image_key=None,
-        topic_tags=None,
-    )
+    return _FakeDocument(user)
 
 
 def test_load_documents_executes_only_paginated_query(monkeypatch):
@@ -120,5 +128,6 @@ def test_load_documents_executes_only_paginated_query(monkeypatch):
 
     assert result["total_count"] == 1
     assert len(result["documents"]) == 1
+    assert result["documents"][0]["content"] == ""
     assert fake_session.executed_query is not None
     assert fake_session.executed_query.limit_value == 50

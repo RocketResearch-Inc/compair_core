@@ -2093,6 +2093,55 @@ async def create_group(
         }
 
 
+def _document_group_list_item(group: models.Group) -> dict[str, Any]:
+    return {
+        "name": getattr(group, "name", ""),
+        "group_id": getattr(group, "group_id", None),
+        "datetime_created": getattr(group, "datetime_created", None),
+        "group_image": getattr(group, "group_image", None),
+        "category": getattr(group, "category", None),
+        "description": getattr(group, "description", None),
+        "visibility": getattr(group, "visibility", None),
+    }
+
+
+def _document_user_list_item(user: models.User | None) -> dict[str, Any] | None:
+    if user is None:
+        return None
+    return {
+        "user_id": getattr(user, "user_id", ""),
+        "username": getattr(user, "username", ""),
+        "name": getattr(user, "name", ""),
+        "datetime_registered": getattr(user, "datetime_registered", None),
+        "status": getattr(user, "status", ""),
+        "groups": [_document_group_list_item(group) for group in (getattr(user, "groups", None) or [])],
+        "profile_image": getattr(user, "profile_image", None),
+        "role": getattr(user, "role", None),
+        "include_own_documents_in_feedback": getattr(user, "include_own_documents_in_feedback", None),
+        "preferred_feedback_length": getattr(user, "preferred_feedback_length", None),
+    }
+
+
+def _document_list_item(document: models.Document) -> dict[str, Any]:
+    return {
+        "document_id": document.document_id,
+        "user_id": document.user_id,
+        "author_id": document.author_id,
+        "groups": [_document_group_list_item(group) for group in (getattr(document, "groups", None) or [])],
+        "user": _document_user_list_item(getattr(document, "user", None)),
+        "title": document.title,
+        # List views should never ship full repo snapshots; callers can fetch one document by id.
+        "content": "",
+        "doc_type": document.doc_type,
+        "datetime_created": document.datetime_created,
+        "datetime_modified": document.datetime_modified,
+        "is_published": document.is_published,
+        "file_key": document.file_key,
+        "image_key": document.image_key,
+        "topic_tags": document.topic_tags,
+    }
+
+
 @router.get("/load_documents")
 def load_doc(
     group_id: str | None = None,
@@ -2125,9 +2174,6 @@ def load_doc(
                 (
                     models.Group.group_id.in_(user_group_ids)
                 )
-            ).options(
-                joinedload(models.Document.groups),
-                joinedload(models.Document.user).joinedload(models.User.groups)
             )
 
         if group_id is not None and own_documents_only:
@@ -2179,7 +2225,6 @@ def load_doc(
                     models.Document.user_id,
                     models.Document.author_id,
                     models.Document.title,
-                    models.Document.content,
                     models.Document.doc_type,
                     models.Document.datetime_created,
                     models.Document.datetime_modified,
@@ -2188,8 +2233,35 @@ def load_doc(
                     models.Document.image_key,
                     models.Document.topic_tags,
                 ),
-                joinedload(models.Document.groups),
-                joinedload(models.Document.user).joinedload(models.User.groups),
+                joinedload(models.Document.groups).load_only(
+                    models.Group.group_id,
+                    models.Group.name,
+                    models.Group.datetime_created,
+                    models.Group.group_image,
+                    models.Group.category,
+                    models.Group.description,
+                    models.Group.visibility,
+                ),
+                joinedload(models.Document.user).load_only(
+                    models.User.user_id,
+                    models.User.username,
+                    models.User.name,
+                    models.User.datetime_registered,
+                    models.User.status,
+                    models.User.profile_image,
+                    models.User.role,
+                    models.User.include_own_documents_in_feedback,
+                    models.User.preferred_feedback_length,
+                ),
+                joinedload(models.Document.user).joinedload(models.User.groups).load_only(
+                    models.Group.group_id,
+                    models.Group.name,
+                    models.Group.datetime_created,
+                    models.Group.group_image,
+                    models.Group.category,
+                    models.Group.description,
+                    models.Group.visibility,
+                ),
             )
             .order_by(models.Document.datetime_created.desc())
             .offset(offset)
@@ -2202,7 +2274,7 @@ def load_doc(
             }
         return {
             "documents": [
-                schema.Document.model_validate(d[0]) for d in documents
+                _document_list_item(d[0]) for d in documents
             ],
             "total_count": total_count
         }
