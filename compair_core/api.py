@@ -2142,6 +2142,64 @@ def _document_list_item(document: models.Document) -> dict[str, Any]:
     }
 
 
+DEFAULT_DOCUMENT_DETAIL_CONTENT_CHARS = 200_000
+MAX_DOCUMENT_DETAIL_CONTENT_CHARS = 1_000_000
+
+
+def _clamp_content_max_chars(value: int) -> int:
+    return min(max(value, 0), MAX_DOCUMENT_DETAIL_CONTENT_CHARS)
+
+
+def _document_content_slice(
+    session: Session,
+    document_id: str,
+    *,
+    full_content: bool,
+    content_max_chars: int,
+) -> tuple[str, int | None, bool]:
+    length_expr = func.length(models.Document.content)
+    if full_content:
+        row = session.query(models.Document.content, length_expr).filter(
+            models.Document.document_id == document_id
+        ).first()
+    elif content_max_chars > 0:
+        row = session.query(func.substr(models.Document.content, 1, content_max_chars), length_expr).filter(
+            models.Document.document_id == document_id
+        ).first()
+    else:
+        row = session.query(length_expr).filter(
+            models.Document.document_id == document_id
+        ).first()
+        if row is not None:
+            return "", int(row[0] or 0), bool(row[0] or 0)
+
+    if row is None:
+        return "", None, False
+    content = str(row[0] or "")
+    content_length = int(row[1] or 0) if len(row) > 1 else len(content)
+    return content, content_length, content_length > len(content)
+
+
+def _document_detail_item(
+    session: Session,
+    document: models.Document,
+    *,
+    full_content: bool,
+    content_max_chars: int,
+) -> dict[str, Any]:
+    content, content_length, content_truncated = _document_content_slice(
+        session,
+        document.document_id,
+        full_content=full_content,
+        content_max_chars=content_max_chars,
+    )
+    payload = _document_list_item(document)
+    payload["content"] = content
+    payload["content_length"] = content_length
+    payload["content_truncated"] = content_truncated
+    return payload
+
+
 @router.get("/load_documents")
 def load_doc(
     group_id: str | None = None,
@@ -2333,34 +2391,125 @@ def load_group_users(
 @router.get("/load_document")
 def load_doc(
     title: str,
+    full_content: bool = False,
+    content_max_chars: int = DEFAULT_DOCUMENT_DETAIL_CONTENT_CHARS,
     current_user: models.User = Depends(get_current_user)
-) -> schema.Document | None:
+) -> Mapping[str, Any] | None:
+    content_max_chars = _clamp_content_max_chars(content_max_chars)
     with compair.Session() as session:
         q = select(models.Document).filter(
             models.Document.user_id==current_user.user_id
         ).filter(
             models.Document.title.match(title)
         ).options(
-            joinedload(models.Document.groups),
-            joinedload(models.Document.user).joinedload(models.User.groups)
+            load_only(
+                models.Document.document_id,
+                models.Document.user_id,
+                models.Document.author_id,
+                models.Document.title,
+                models.Document.doc_type,
+                models.Document.datetime_created,
+                models.Document.datetime_modified,
+                models.Document.is_published,
+                models.Document.file_key,
+                models.Document.image_key,
+                models.Document.topic_tags,
+            ),
+            joinedload(models.Document.groups).load_only(
+                models.Group.group_id,
+                models.Group.name,
+                models.Group.datetime_created,
+                models.Group.group_image,
+                models.Group.category,
+                models.Group.description,
+                models.Group.visibility,
+            ),
+            joinedload(models.Document.user).load_only(
+                models.User.user_id,
+                models.User.username,
+                models.User.name,
+                models.User.datetime_registered,
+                models.User.status,
+                models.User.profile_image,
+                models.User.role,
+                models.User.include_own_documents_in_feedback,
+                models.User.preferred_feedback_length,
+            ),
+            joinedload(models.Document.user).joinedload(models.User.groups).load_only(
+                models.Group.group_id,
+                models.Group.name,
+                models.Group.datetime_created,
+                models.Group.group_image,
+                models.Group.category,
+                models.Group.description,
+                models.Group.visibility,
+            ),
         )
         document = session.execute(q).unique().fetchone()
         if document is None:
             return None
-        return document[0]
+        return _document_detail_item(
+            session,
+            document[0],
+            full_content=full_content,
+            content_max_chars=content_max_chars,
+        )
 
 
 @router.get("/load_document_by_id")
 def load_doc(
     document_id: str,
+    full_content: bool = False,
+    content_max_chars: int = DEFAULT_DOCUMENT_DETAIL_CONTENT_CHARS,
     current_user: models.User = Depends(get_current_user)
-) -> schema.Document | None:
+) -> Mapping[str, Any] | None:
+    content_max_chars = _clamp_content_max_chars(content_max_chars)
     with compair.Session() as session:
         q = select(models.Document).filter(
             models.Document.document_id==document_id
         ).options(
-            joinedload(models.Document.groups),
-            joinedload(models.Document.user).joinedload(models.User.groups)
+            load_only(
+                models.Document.document_id,
+                models.Document.user_id,
+                models.Document.author_id,
+                models.Document.title,
+                models.Document.doc_type,
+                models.Document.datetime_created,
+                models.Document.datetime_modified,
+                models.Document.is_published,
+                models.Document.file_key,
+                models.Document.image_key,
+                models.Document.topic_tags,
+            ),
+            joinedload(models.Document.groups).load_only(
+                models.Group.group_id,
+                models.Group.name,
+                models.Group.datetime_created,
+                models.Group.group_image,
+                models.Group.category,
+                models.Group.description,
+                models.Group.visibility,
+            ),
+            joinedload(models.Document.user).load_only(
+                models.User.user_id,
+                models.User.username,
+                models.User.name,
+                models.User.datetime_registered,
+                models.User.status,
+                models.User.profile_image,
+                models.User.role,
+                models.User.include_own_documents_in_feedback,
+                models.User.preferred_feedback_length,
+            ),
+            joinedload(models.Document.user).joinedload(models.User.groups).load_only(
+                models.Group.group_id,
+                models.Group.name,
+                models.Group.datetime_created,
+                models.Group.group_image,
+                models.Group.category,
+                models.Group.description,
+                models.Group.visibility,
+            ),
         )
         document = session.execute(q).unique().fetchone()
         if document is None:
@@ -2370,7 +2519,12 @@ def load_doc(
         user_group_ids = {g.group_id for g in current_user.groups}
         if not doc_group_ids & user_group_ids and current_user.user_id != doc.author_id:
             raise HTTPException(status_code=403, detail="Not authorized to view this document")
-        return doc
+        return _document_detail_item(
+            session,
+            doc,
+            full_content=full_content,
+            content_max_chars=content_max_chars,
+        )
 
 
 @router.get("/documents/{document_id}/metadata")
@@ -3064,12 +3218,36 @@ def get_trial_status(
 @router.get("/load_chunks")
 def load_chunks(
     document_id: str,
-) -> list[schema.Chunk]:
+    page: int = 1,
+    page_size: int = 50,
+) -> list[Mapping[str, Any]]:
+    page = max(page, 1)
+    page_size = min(max(page_size, 1), 100)
     with compair.Session() as session:
-        chunks = session.query(models.Chunk).filter(
-            models.Chunk.document_id==document_id
+        chunks = (
+            session.query(models.Chunk)
+            .options(
+                load_only(
+                    models.Chunk.chunk_id,
+                    models.Chunk.hash,
+                    models.Chunk.document_id,
+                    models.Chunk.content,
+                )
+            )
+            .filter(models.Chunk.document_id == document_id)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
         )
-        return chunks
+        return [
+            {
+                "chunk_id": chunk.chunk_id,
+                "hash": chunk.hash,
+                "document_id": chunk.document_id,
+                "content": chunk.content,
+            }
+            for chunk in chunks
+        ]
 
 
 @router.get("/load_feedback")
@@ -3077,11 +3255,13 @@ def load_feedback(
     chunk_id: str,
 ) -> schema.Feedback | None:
     with compair.Session() as session:
-        feedback = session.query(models.Feedback).filter(
-            models.Feedback.source_chunk_id==chunk_id
+        feedback = (
+            session.query(models.Feedback)
+            .filter(models.Feedback.source_chunk_id == chunk_id)
+            .first()
         )
-        if len(feedback.all())>0:
-            f = feedback[0]
+        if feedback is not None:
+            f = feedback
             # Return user_feedback in the response
             return {
                 "feedback_id": f.feedback_id,
@@ -3222,9 +3402,30 @@ def load_references(
         references = (
             session.query(models.Reference)
             .options(
-                joinedload(models.Reference.document).joinedload(models.Document.user),
+                joinedload(models.Reference.document).load_only(
+                    models.Document.document_id,
+                    models.Document.user_id,
+                    models.Document.author_id,
+                    models.Document.title,
+                    models.Document.doc_type,
+                    models.Document.datetime_created,
+                    models.Document.datetime_modified,
+                    models.Document.is_published,
+                ),
+                joinedload(models.Reference.document).joinedload(models.Document.user).load_only(
+                    models.User.user_id,
+                    models.User.username,
+                    models.User.name,
+                    models.User.datetime_registered,
+                    models.User.status,
+                ),
                 joinedload(models.Reference.note).joinedload(models.Note.author),
-                joinedload(models.Reference.reference_chunk),
+                joinedload(models.Reference.reference_chunk).load_only(
+                    models.Chunk.chunk_id,
+                    models.Chunk.hash,
+                    models.Chunk.document_id,
+                    models.Chunk.content,
+                ),
             )
             .filter(models.Reference.source_chunk_id == chunk_id)
             .all()
@@ -3242,7 +3443,7 @@ def load_references(
                     user_id=r.document.user_id,
                     author_id=r.document.author_id,
                     title=r.document.title,
-                    content=r.document.content,
+                    content="",
                     doc_type=r.document.doc_type,
                     datetime_created=r.document.datetime_created,
                     datetime_modified=r.document.datetime_modified,

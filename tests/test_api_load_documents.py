@@ -80,6 +80,25 @@ class _FakeSession:
         return _FakeResult(self.rows)
 
 
+class _FakeContentQuery:
+    def __init__(self, row):
+        self.row = row
+
+    def filter(self, *args, **kwargs):
+        return self
+
+    def first(self):
+        return self.row
+
+
+class _FakeContentSession:
+    def __init__(self, row):
+        self.row = row
+
+    def query(self, *args, **kwargs):
+        return _FakeContentQuery(self.row)
+
+
 def _user(user_id: str = "user-1"):
     return SimpleNamespace(
         user_id=user_id,
@@ -131,3 +150,20 @@ def test_load_documents_executes_only_paginated_query(monkeypatch):
     assert result["documents"][0]["content"] == ""
     assert fake_session.executed_query is not None
     assert fake_session.executed_query.limit_value == 50
+
+
+def test_document_detail_uses_bounded_content_slice() -> None:
+    user = _user()
+    document = _document(user)
+    fake_session = _FakeContentSession(row=("preview", 50_000))
+
+    result = api._document_detail_item(
+        fake_session,
+        document,
+        full_content=False,
+        content_max_chars=100,
+    )
+
+    assert result["content"] == "preview"
+    assert result["content_length"] == 50_000
+    assert result["content_truncated"] is True
