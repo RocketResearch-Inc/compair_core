@@ -2102,6 +2102,9 @@ def load_doc(
     own_documents_only: bool = True,
     current_user: models.User = Depends(get_current_user)
 ) -> Mapping[str, Any] | None:
+    page = max(page, 1)
+    page_size = min(max(page_size, 1), 50)
+
     with compair.Session() as session:
         now = datetime.now(timezone.utc)
         week_ago = now - timedelta(days=7)
@@ -2160,18 +2163,38 @@ def load_doc(
         # Default: all, sorted by last update
         q = q.order_by(models.Document.datetime_modified.desc())
 
-        documents = session.execute(q).unique().fetchall()
-        if documents is None or len(documents)==0:
+        total_count = q.order_by(None).count()
+        if total_count == 0:
             return {
                 "documents": [],
                 "total_count": 0
             }
 
-        total_count = q.count()
-
         # Paging
         offset = (page - 1) * page_size
-        documents = session.execute(q.order_by(models.Document.datetime_created.desc()).offset(offset).limit(page_size)).unique().fetchall()
+        documents = session.execute(
+            q.options(
+                load_only(
+                    models.Document.document_id,
+                    models.Document.user_id,
+                    models.Document.author_id,
+                    models.Document.title,
+                    models.Document.content,
+                    models.Document.doc_type,
+                    models.Document.datetime_created,
+                    models.Document.datetime_modified,
+                    models.Document.is_published,
+                    models.Document.file_key,
+                    models.Document.image_key,
+                    models.Document.topic_tags,
+                ),
+                joinedload(models.Document.groups),
+                joinedload(models.Document.user).joinedload(models.User.groups),
+            )
+            .order_by(models.Document.datetime_created.desc())
+            .offset(offset)
+            .limit(page_size)
+        ).unique().fetchall()
         if documents is None or len(documents)==0:
             return {
                 "documents": [],
