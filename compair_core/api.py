@@ -592,6 +592,244 @@ def _json_safe_task_meta(value: Any) -> Any:
     return str(value)
 
 
+def _task_status_stale_after_sec() -> int:
+    raw = os.getenv("COMPAIR_STATUS_STALE_AFTER_SEC", "900").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 900
+    return max(0, value)
+
+
+def _task_status_value(task_result: Any) -> str:
+    try:
+        return str(getattr(task_result, "status", "") or "PENDING").upper()
+    except Exception as exc:
+        logger.warning("task status lookup failed: %s", exc)
+        return "UNKNOWN"
+
+
+def _task_info_value(task_result: Any) -> Any:
+    try:
+        return getattr(task_result, "info", None)
+    except Exception as exc:
+        logger.warning("task info lookup failed: %s", exc)
+        return {"message": f"Unable to load task info: {exc}"}
+
+
+def _task_result_value(task_result: Any, status: str, info: Any) -> Any:
+    if status == "SUCCESS":
+        try:
+            return getattr(task_result, "result", None)
+        except Exception as exc:
+            return {"message": f"Unable to load task result: {exc}"}
+    if status in {"FAILURE", "FAILED"}:
+        if isinstance(info, Mapping):
+            return info.get("message") or info.get("detail") or "Task failed."
+        if info is not None:
+            return str(info)
+        return "Task failed."
+    if status == "REVOKED":
+        return "Task was revoked."
+    if status == "RETRY":
+        return "Task is retrying."
+    if status == "PENDING":
+        return "Task is queued or still processing."
+    return "Task is running."
+
+
+def _task_meta_from_info(info: Any) -> dict[str, Any]:
+    if isinstance(info, Mapping):
+        return {str(key): value for key, value in info.items()}
+    return {}
+
+
+def _parse_task_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _task_time_payload(meta: Mapping[str, Any], key: str) -> tuple[Optional[str], Optional[float]]:
+    parsed = _parse_task_datetime(meta.get(key))
+    if parsed is None:
+        return None, None
+    age_sec = max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+    return parsed.isoformat(), age_sec
+
+
+def _extract_task_ids_from_payload(payload: Any) -> list[str]:
+    if not isinstance(payload, Mapping):
+        return []
+    raw = (
+        payload.get("chunk_task_ids")
+        or payload.get("child_task_ids")
+        or payload.get("task_ids")
+    )
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    ids: list[str] = []
+    for item in raw:
+        task_id = str(item or "").strip()
+        if task_id:
+            ids.append(task_id)
+    return ids
+
+
+def _task_lifecycle(status: str, meta: Mapping[str, Any], children: Optional[Mapping[str, Any]]) -> tuple[str, str, bool, bool, str]:
+    status = status.upper()
+    child_failed = int((children or {}).get("failed", 0) or 0)
+    child_revoked = int((children or {}).get("revoked", 0) or 0)
+    child_retrying = int((children or {}).get("retrying", 0) or 0)
+    child_running = int((children or {}).get("running", 0) or 0)
+    child_queued = int((children or {}).get("queued", 0) or 0)
+
+    if status == "SUCCESS":
+        return "succeeded", "healthy", False, True, "complete"
+    if status in {"FAILURE", "FAILED"}:
+        return "failed_terminal", "failed", False, True, "inspect_failure"
+    if status == "REVOKED":
+        return "revoked", "failed", False, True, "resubmit_if_needed"
+    if status == "RETRY":
+        return "retrying", "retrying", True, False, "wait_for_retry"
+    if child_failed or child_revoked:
+        return "failed_terminal", "failed", False, True, "inspect_failure"
+    if child_retrying:
+        return "running", "retrying", True, False, "wait_for_retry"
+
+    last_progress_at = _parse_task_datetime(meta.get("last_progress_at"))
+    stale_after_sec = _task_status_stale_after_sec()
+    if (
+        stale_after_sec > 0
+        and last_progress_at is not None
+        and (datetime.now(timezone.utc) - last_progress_at).total_seconds() >= stale_after_sec
+        and not child_running
+        and not child_queued
+    ):
+        return "running", "stale", False, False, "inspect_worker"
+
+    if status == "PENDING" and not meta:
+        return "queued", "unknown", False, False, "continue_waiting"
+    if status in {"STARTED", "PROGRESS", "PENDING"}:
+        return "running", "healthy", False, False, "continue_waiting"
+    return "unknown", "unknown", False, False, "continue_waiting"
+
+
+def _task_status_payload(task_id: str, *, include_children: bool = True) -> dict[str, Any]:
+    try:
+        task_result = _process_document_async_result(task_id)
+    except Exception as exc:
+        logger.warning("task status backend lookup failed for %s: %s", task_id, exc)
+        return {
+            "task_id": task_id,
+            "status": "UNKNOWN",
+            "result": str(exc),
+            "message": str(exc),
+            "lifecycle": "unknown",
+            "health": "unknown",
+            "retryable": False,
+            "terminal": False,
+            "recommended_action": "continue_waiting",
+        }
+
+    status = _task_status_value(task_result)
+    info = _task_info_value(task_result)
+    result = _task_result_value(task_result, status, info)
+    meta = _task_meta_from_info(info)
+    child_task_ids = _extract_task_ids_from_payload(result) or _extract_task_ids_from_payload(meta)
+    children = _summarize_child_task_statuses(child_task_ids) if include_children else None
+    lifecycle, health, retryable, terminal, recommended_action = _task_lifecycle(status, meta, children)
+    started_at, started_age_sec = _task_time_payload(meta, "started_at")
+    last_progress_at, last_progress_age_sec = _task_time_payload(meta, "last_progress_at")
+
+    payload: dict[str, Any] = {
+        "task_id": task_id,
+        "status": status,
+        "result": _json_safe_task_meta(result),
+        "lifecycle": lifecycle,
+        "health": health,
+        "retryable": retryable,
+        "terminal": terminal,
+        "recommended_action": recommended_action,
+        "child_task_ids": child_task_ids,
+    }
+    if meta:
+        payload["meta"] = _json_safe_task_meta(meta)
+        if "message" in meta and isinstance(meta["message"], str):
+            payload["message"] = meta["message"]
+    elif info not in (None, result):
+        payload["message"] = str(info)
+    if started_at is not None:
+        payload["started_at"] = started_at
+        payload["started_age_sec"] = started_age_sec
+    if last_progress_at is not None:
+        payload["last_progress_at"] = last_progress_at
+        payload["last_progress_age_sec"] = last_progress_age_sec
+    if children is not None:
+        payload["children"] = children
+    return payload
+
+
+def _summarize_child_task_statuses(task_ids: list[str]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "total": len(task_ids),
+        "succeeded": 0,
+        "running": 0,
+        "queued": 0,
+        "retrying": 0,
+        "failed": 0,
+        "revoked": 0,
+        "unknown": 0,
+        "terminal": 0,
+        "healthy": 0,
+        "failed_task_ids": [],
+        "retryable_failed_task_ids": [],
+        "task_ids": task_ids,
+    }
+    for child_id in task_ids:
+        child = _task_status_payload(child_id, include_children=False)
+        lifecycle = str(child.get("lifecycle") or "unknown")
+        status = str(child.get("status") or "UNKNOWN").upper()
+        health = str(child.get("health") or "unknown")
+        if lifecycle == "succeeded":
+            summary["succeeded"] += 1
+        elif lifecycle == "queued":
+            summary["queued"] += 1
+        elif lifecycle == "retrying":
+            summary["retrying"] += 1
+        elif lifecycle == "failed_terminal":
+            summary["failed"] += 1
+            summary["failed_task_ids"].append(child_id)
+        elif lifecycle == "revoked" or status == "REVOKED":
+            summary["revoked"] += 1
+            summary["failed_task_ids"].append(child_id)
+        elif lifecycle == "running":
+            summary["running"] += 1
+        else:
+            summary["unknown"] += 1
+        if bool(child.get("terminal")):
+            summary["terminal"] += 1
+        if bool(child.get("retryable")) and lifecycle in {"failed_terminal", "revoked"}:
+            summary["retryable_failed_task_ids"].append(child_id)
+        if health == "healthy":
+            summary["healthy"] += 1
+    return summary
+
+
 def _ensure_single_user(session: Session, settings: Settings) -> models.User:
     """Create or fetch the singleton user used when authentication is disabled."""
     changed = False
@@ -3135,26 +3373,7 @@ def get_ocr_file_result(
 async def get_process_status(
     task_id: str
 ):
-    task_result = _process_document_async_result(task_id)
-    status = task_result.status
-    info = task_result.info
-    if status == "SUCCESS":
-        result = task_result.result
-    elif status in {"FAILURE", "FAILED", "REVOKED"}:
-        result = "Task failed."
-    elif status == "PENDING":
-        result = "Task is still processing."
-    else:
-        result = "Task is running."
-
-    payload = {"task_id": task_id, "status": status, "result": result}
-    if isinstance(info, Mapping):
-        payload["meta"] = _json_safe_task_meta(info)
-        if "message" in info and isinstance(info["message"], str):
-            payload["message"] = info["message"]
-    elif info not in (None, result):
-        payload["message"] = str(info)
-    return payload
+    return _task_status_payload(task_id)
 
 
 @router.get("/trial_status")
