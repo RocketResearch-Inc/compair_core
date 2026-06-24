@@ -720,6 +720,9 @@ def _task_lifecycle(status: str, meta: Mapping[str, Any], children: Optional[Map
         and not child_running
         and not child_queued
     ):
+        stage = str(meta.get("stage") or "").strip().lower()
+        if stage in {"preparing", "chunking", "prioritizing"}:
+            return "running", "stale_prechunk", False, False, "resubmit_smaller_or_inspect_worker"
         return "running", "stale", False, False, "inspect_worker"
 
     if status == "PENDING" and not meta:
@@ -781,6 +784,11 @@ def _task_status_payload(task_id: str, *, include_children: bool = True) -> dict
         payload["last_progress_age_sec"] = last_progress_age_sec
     if children is not None:
         payload["children"] = children
+    if health == "stale_prechunk":
+        payload["failure_hint"] = (
+            "The parent processing task stopped making progress before child chunk tasks were queued. "
+            "This often means the worker was killed or the snapshot is too large for the current worker."
+        )
     return payload
 
 

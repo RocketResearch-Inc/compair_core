@@ -288,7 +288,7 @@ CANDIDATE_DOC_ID = candidate["document_id"]
 
 Send updated text to `POST /process_doc` to chunk the document, generate embeddings, and (optionally) request AI feedback. Only the author may process a document; suspended users can save edits but do not receive new feedback. Cloud deployments queue work asynchronously (returning a `task_id`), while core deployments process immediately and return `None`. Because the reference document is already published and processed, the draft below can pick it up as a candidate reference.
 
-Check asynchronous progress with `GET /status/{task_id}` when a task ID is provided.
+Check asynchronous progress with `GET /status/{task_id}` when a task ID is provided. The response includes the raw task status plus lifecycle fields such as `lifecycle`, `health`, `terminal`, `recommended_action`, and any downstream `child_task_ids`.
 
 ```python
 process_resp = requests.post(
