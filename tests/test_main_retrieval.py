@@ -8,6 +8,7 @@ import pathlib
 import sys
 import types
 import unittest
+from unittest import mock
 
 
 def _load_main_module():
@@ -31,6 +32,7 @@ def _load_main_module():
 
     sqlalchemy_orm = types.ModuleType("sqlalchemy.orm")
     sqlalchemy_orm.Session = object
+    sqlalchemy_orm.load_only = lambda *args, **kwargs: ("load_only", args)
     sys.modules["sqlalchemy.orm"] = sqlalchemy_orm
 
     sqlalchemy_orm_attributes = types.ModuleType("sqlalchemy.orm.attributes")
@@ -88,6 +90,7 @@ def _load_main_module():
     utils.chunk_text_with_mode = lambda text, chunk_mode=None: [text] if text else []
     utils.count_tokens = lambda text: max(1, len(text or "") // 4) if text else 0
     utils.log_activity = lambda *args, **kwargs: None
+    utils.sanitize_text_for_database = lambda text: text
     utils.stable_chunk_hash = lambda text: hashlib.sha256((text or "").encode("utf-8")).hexdigest()
     sys.modules[utils.__name__] = utils
 
@@ -1203,6 +1206,77 @@ class MainRetrievalTests(unittest.TestCase):
         selected = main.prioritize_chunks([0, 1, 2], chunks, limit=2, code_focus=True)
 
         self.assertEqual(selected[:2], [2, 1])
+
+    def test_prioritize_chunks_focus_manifest_boosts_matching_path(self) -> None:
+        chunks = [
+            (
+                "### File: pyproject.toml\n"
+                'name = "compair-core"\n'
+                'license = { text = "MIT" }\n'
+            ),
+            (
+                "### File: docs/overview.md\n"
+                "Compair keeps teams aligned across projects.\n"
+            ),
+            (
+                "### File: packages/admin/billing.ts\n"
+                "export function billingUrl() { return '/billing'; }\n"
+            ),
+        ]
+
+        def fake_relevance(chunk, idx, code_focus, novelty_score, *, chunks=None):
+            return 5.0 if idx == 0 else 1.0
+
+        with (
+            mock.patch.object(main, "_source_redundancy_penalty", return_value=0.0),
+            mock.patch.object(main, "_source_min_selection_score", return_value=-1.0),
+            mock.patch.object(main, "_chunk_relevance_score", side_effect=fake_relevance),
+        ):
+            selected = main.prioritize_chunks(
+                [0, 1, 2],
+                chunks,
+                limit=1,
+                code_focus=True,
+                focus_manifest={
+                    "limits": {"max_boost": 5.0, "min_unfocused_fraction": 0.0},
+                    "areas": [{"glob": "packages/admin/**", "weight": 5.0}],
+                },
+            )
+
+        self.assertEqual(selected, [2])
+
+    def test_prioritize_chunks_without_focus_manifest_keeps_existing_order(self) -> None:
+        chunks = [
+            "### File: docs/overview.md\nGeneral overview.\n",
+            "### File: docs/api_mapping.md\n| `notifications` | `GET /notification_events` |\n",
+            "### File: docs/architecture.md\nArchitecture notes.\n",
+        ]
+
+        selected_without_arg = main.prioritize_chunks([0, 1, 2], chunks, limit=2, code_focus=True)
+        selected_with_none = main.prioritize_chunks([0, 1, 2], chunks, limit=2, code_focus=True, focus_manifest=None)
+
+        self.assertEqual(selected_with_none, selected_without_arg)
+
+    def test_prioritize_chunks_focus_manifest_reserves_unfocused_slots(self) -> None:
+        chunks = [
+            "### File: focused/a.py\nprint('a')\n",
+            "### File: focused/b.py\nprint('b')\n",
+            "### File: unfocused/c.py\nprint('c')\n",
+        ]
+
+        selected = main.prioritize_chunks(
+            [0, 1, 2],
+            chunks,
+            limit=2,
+            code_focus=True,
+            focus_manifest={
+                "limits": {"min_unfocused_fraction": 0.5},
+                "areas": [{"glob": "focused/**", "weight": 5.0}],
+            },
+        )
+
+        self.assertEqual(len(selected), 2)
+        self.assertIn(2, selected)
 
     def test_source_trace_entries_capture_selected_and_filtered_reasons(self) -> None:
         chunks = [

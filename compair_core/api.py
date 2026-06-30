@@ -33,6 +33,7 @@ from .server.settings import Settings
 from . import compair
 from .compair import models, schema
 from .compair.embeddings import create_embedding, Embedder
+from .compair.focus_manifest import normalize_focus_manifest
 from .compair.logger import log_event 
 from .compair.topic_tags import extract_topic_tags
 from .compair.utils import (
@@ -496,6 +497,7 @@ def _dispatch_process_document_task(
     reanalyze_existing: bool = False,
     snapshot_payload_key: str | None = None,
     reference_doc_ids: list[str] | None = None,
+    focus_manifest: dict[str, Any] | None = None,
 ):
     task_callable = getattr(process_document_celery, "delay", None)
     if callable(task_callable):
@@ -509,6 +511,7 @@ def _dispatch_process_document_task(
                 reanalyze_existing,
                 snapshot_payload_key=snapshot_payload_key,
                 reference_doc_ids=reference_doc_ids,
+                focus_manifest=focus_manifest,
             )
         except TypeError:
             try:
@@ -525,6 +528,7 @@ def _dispatch_process_document_task(
             reanalyze_existing,
             snapshot_payload_key=snapshot_payload_key,
             reference_doc_ids=reference_doc_ids,
+            focus_manifest=focus_manifest,
         )
     except TypeError:
         try:
@@ -3086,6 +3090,10 @@ async def process_doc(
     chunk_mode = _parse_process_doc_string(payload.get("chunk_mode"))
     reanalyze_existing = _parse_process_doc_bool(payload.get("reanalyze_existing"), False)
     reference_doc_ids = _parse_process_doc_list(payload.get("reference_doc_ids"))
+    try:
+        focus_manifest = normalize_focus_manifest(payload.get("focus_manifest"))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if not doc_id:
         raise HTTPException(status_code=422, detail="doc_id is required")
     if doc_text is None and doc_text_b64 is None:
@@ -3182,6 +3190,7 @@ async def process_doc(
         reanalyze_existing=reanalyze_existing,
         snapshot_payload_key=staged_payload_key,
         reference_doc_ids=cleaned_reference_doc_ids or None,
+        focus_manifest=focus_manifest,
     )
     task_id = getattr(task_result, "id", None)
 

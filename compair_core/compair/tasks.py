@@ -49,6 +49,7 @@ except (ImportError, ModuleNotFoundError) as exc:
         reanalyze_existing: bool = False,
         snapshot_payload_key: Optional[str] = None,
         reference_doc_ids: Optional[list[str]] = None,
+        focus_manifest: Optional[Mapping[str, object]] = None,
     ) -> Mapping[str, list[str]]:
         SessionMaker, Embedder, Reviewer, log_event, process_document, Document, User, extract_topic_tags, sanitize_text_for_database = _lazy_components()
         with SessionMaker() as session:
@@ -85,6 +86,7 @@ except (ImportError, ModuleNotFoundError) as exc:
                 chunk_mode=chunk_mode,
                 reanalyze_existing=reanalyze_existing,
                 reference_doc_ids=reference_doc_ids,
+                focus_manifest=focus_manifest,
             )
 
             log_event(

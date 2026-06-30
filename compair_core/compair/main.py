@@ -17,6 +17,14 @@ from sqlalchemy.orm import Session as SASession, load_only
 
 from . import feedback as feedback_module
 from .embeddings import create_embedding, create_embeddings, Embedder
+from .focus_manifest import (
+    FocusManifest,
+    focus_manifest_enabled,
+    focus_manifest_hash,
+    focus_score_for_path,
+    focus_selected_counts,
+    reserve_unfocused_indices,
+)
 from .logger import log_event
 from .local_summary import ReferenceText, best_reference_match, extract_artifacts
 from .models import (
@@ -3168,6 +3176,7 @@ def process_document(
     chunk_mode: Optional[str] = None,
     reanalyze_existing: bool = False,
     reference_doc_ids: list[str] | None = None,
+    focus_manifest: FocusManifest = None,
 ) -> Mapping[str, int]:
     new = False
     doc.content = sanitize_text_for_database(doc.content)
@@ -3223,6 +3232,7 @@ def process_document(
             new_chunks=new_chunks,
             threshold=significance_threshold,
             code_focus=code_focus,
+            focus_manifest=focus_manifest,
         )
         if code_focus:
             prioritized_chunk_indices = [
@@ -3297,6 +3307,7 @@ def process_document(
             code_focus=code_focus,
             feedback_min_tokens=feedback_min_tokens,
             feedback_fallback_min=feedback_fallback_min,
+            focus_manifest=focus_manifest,
         )
         available_existing_candidate_count = len(existing_indices)
         if feedback_limit is None:
@@ -3312,6 +3323,7 @@ def process_document(
             code_focus=code_focus,
             feedback_min_tokens=feedback_min_tokens,
             feedback_fallback_min=feedback_fallback_min,
+            focus_manifest=focus_manifest,
         )
         available_existing_candidate_count = len(existing_indices)
 
@@ -3328,6 +3340,18 @@ def process_document(
             available_existing_candidates=available_existing_candidate_count,
             selected_existing_chunks=len(existing_indices_to_generate_feedback),
             reanalyze_existing=reanalyze_existing,
+            focus_manifest_hash=focus_manifest_hash(focus_manifest),
+            focus_manifest_enabled=focus_manifest_enabled(focus_manifest),
+            selected_new_focus=focus_selected_counts(
+                indices_to_generate_feedback,
+                focus_manifest,
+                lambda idx: _extract_snapshot_file_path(new_chunks[idx]),
+            ),
+            selected_existing_focus=focus_selected_counts(
+                existing_indices_to_generate_feedback,
+                focus_manifest,
+                lambda idx: _extract_snapshot_file_path(chunks[idx]),
+            ),
         )
         if _reference_source_trace_enabled():
             log_event(
@@ -3438,6 +3462,7 @@ def detect_significant_edits(
     new_chunks: list[str],
     threshold: float = 0.5,
     code_focus: bool = False,
+    focus_manifest: FocusManifest = None,
 ) -> list[int]:
     if not new_chunks:
         return []
@@ -3448,6 +3473,7 @@ def detect_significant_edits(
             new_chunks,
             code_focus=code_focus,
             novelty_scores=novelty_scores,
+            focus_manifest=focus_manifest,
         )
     candidate_indices = [
         idx
@@ -3459,6 +3485,7 @@ def detect_significant_edits(
         new_chunks,
         code_focus=code_focus,
         novelty_scores=novelty_scores,
+        focus_manifest=focus_manifest,
     )
 
 
@@ -3468,6 +3495,7 @@ def prioritize_chunks(
     limit: int = 10,
     code_focus: bool = False,
     novelty_scores: Mapping[int, float] | None = None,
+    focus_manifest: FocusManifest = None,
 ) -> list[int]:
     if not indices:
         return []
@@ -3480,6 +3508,19 @@ def prioritize_chunks(
         except ValueError:
             pass
     else:
+        if focus_manifest_enabled(focus_manifest):
+            indices.sort(
+                key=lambda i: (
+                    -focus_score_for_path(_extract_snapshot_file_path(chunks[i]), focus_manifest),
+                    _chunk_priority_key(chunks[i], i, code_focus),
+                )
+            )
+            return reserve_unfocused_indices(
+                indices[:limit],
+                indices,
+                focus_manifest,
+                lambda idx: _extract_snapshot_file_path(chunks[idx]),
+            )
         indices.sort(key=lambda i: _chunk_priority_key(chunks[i], i, code_focus))
         return indices[:limit]
 
@@ -3499,7 +3540,8 @@ def prioritize_chunks(
                     _chunk_redundancy_score(chunks[idx], chunks[chosen_idx], code_focus)
                     for chosen_idx in selected
                 )
-            score = relevance - (_source_redundancy_penalty() * redundancy)
+            focus_boost = focus_score_for_path(_extract_snapshot_file_path(chunks[idx]), focus_manifest)
+            score = relevance + focus_boost - (_source_redundancy_penalty() * redundancy)
             if best_idx < 0 or score > best_score:
                 best_idx = idx
                 best_score = score
@@ -3511,7 +3553,12 @@ def prioritize_chunks(
         remaining = [idx for idx in remaining if idx != best_idx]
 
     if selected:
-        return selected
+        return reserve_unfocused_indices(
+            selected,
+            indices,
+            focus_manifest,
+            lambda idx: _extract_snapshot_file_path(chunks[idx]),
+        )
     indices.sort(key=lambda i: _chunk_priority_key(chunks[i], i, code_focus))
     return indices[:limit]
 
@@ -3523,6 +3570,7 @@ def _existing_feedback_candidate_indices(
     code_focus: bool,
     feedback_min_tokens: int,
     feedback_fallback_min: int,
+    focus_manifest: FocusManifest = None,
 ) -> list[int]:
     if not chunks:
         return []
@@ -3572,6 +3620,7 @@ def _existing_feedback_candidate_indices(
         chunks,
         code_focus=code_focus,
         novelty_scores={idx: 1.0 for idx in candidate_indices},
+        focus_manifest=focus_manifest,
     )
 
 
