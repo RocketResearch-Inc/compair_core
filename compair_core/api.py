@@ -499,6 +499,12 @@ def _dispatch_process_document_task(
     reference_doc_ids: list[str] | None = None,
     focus_manifest: dict[str, Any] | None = None,
 ):
+    task_kwargs: dict[str, Any] = {
+        "snapshot_payload_key": snapshot_payload_key,
+        "reference_doc_ids": reference_doc_ids,
+    }
+    if focus_manifest is not None:
+        task_kwargs["focus_manifest"] = focus_manifest
     task_callable = getattr(process_document_celery, "delay", None)
     if callable(task_callable):
         try:
@@ -509,9 +515,7 @@ def _dispatch_process_document_task(
                 generate_feedback,
                 chunk_mode,
                 reanalyze_existing,
-                snapshot_payload_key=snapshot_payload_key,
-                reference_doc_ids=reference_doc_ids,
-                focus_manifest=focus_manifest,
+                **task_kwargs,
             )
         except TypeError:
             try:
@@ -526,9 +530,7 @@ def _dispatch_process_document_task(
             generate_feedback,
             chunk_mode,
             reanalyze_existing,
-            snapshot_payload_key=snapshot_payload_key,
-            reference_doc_ids=reference_doc_ids,
-            focus_manifest=focus_manifest,
+            **task_kwargs,
         )
     except TypeError:
         try:
