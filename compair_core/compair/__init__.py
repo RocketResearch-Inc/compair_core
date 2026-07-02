@@ -114,6 +114,46 @@ def _ensure_reference_chunk_id_column() -> None:
         print(f"[compair_core] reference_chunk_id migration skipped: {exc}", file=sys.stderr)
 
 
+def _ensure_notification_event_fingerprint_columns() -> None:
+    try:
+        from sqlalchemy import inspect, text
+
+        insp = inspect(engine)
+        if "notification_event" not in insp.get_table_names():
+            return
+        cols = {c["name"] for c in insp.get_columns("notification_event")}
+        statements: list[str] = []
+        if "pair_fingerprint" not in cols:
+            statements.append("ALTER TABLE notification_event ADD COLUMN pair_fingerprint VARCHAR(128)")
+        if "claim_fingerprint" not in cols:
+            statements.append("ALTER TABLE notification_event ADD COLUMN claim_fingerprint VARCHAR(128)")
+        if "fingerprint_version" not in cols:
+            statements.append("ALTER TABLE notification_event ADD COLUMN fingerprint_version VARCHAR(32)")
+        with engine.begin() as conn:
+            for statement in statements:
+                conn.execute(text(statement))
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_notification_event_pair_fingerprint "
+                    "ON notification_event (pair_fingerprint)"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_notification_event_claim_fingerprint "
+                    "ON notification_event (claim_fingerprint)"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_notification_event_pair_claim_fingerprint "
+                    "ON notification_event (pair_fingerprint, claim_fingerprint)"
+                )
+            )
+    except Exception as exc:
+        print(f"[compair_core] notification_event fingerprint migration skipped: {exc}", file=sys.stderr)
+
+
 def _ensure_pgvector_extension() -> None:
     try:
         from sqlalchemy import text
@@ -135,6 +175,7 @@ def initialize_database() -> None:
     _ensure_user_retrial_count_default()
     _ensure_notification_preferences_delivery_columns()
     _ensure_reference_chunk_id_column()
+    _ensure_notification_event_fingerprint_columns()
     if edition == "core":
         _ensure_topic_tags_column()
     elif not initialize_database_override:

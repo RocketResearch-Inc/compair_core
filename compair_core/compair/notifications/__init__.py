@@ -16,7 +16,13 @@ from .parse_llm_structured_output import (
     conservative_default,
     parse_llm_assessment,
 )
-from .service import NotificationCandidate, PeerCandidate, is_scoring_enabled, score_and_route_candidate
+from .service import (
+    NotificationCandidate,
+    PeerCandidate,
+    is_scoring_enabled,
+    notification_pair_claim_fingerprints,
+    score_and_route_candidate,
+)
 
 __all__ = [
     "CandidateContext",
@@ -36,6 +42,7 @@ __all__ = [
     "intent_digest_bucket",
     "is_scoring_enabled",
     "maybe_escalate_conflict",
+    "notification_pair_claim_fingerprints",
     "parse_llm_assessment",
     "score_and_route_candidate",
 ]

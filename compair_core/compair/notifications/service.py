@@ -7,6 +7,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+import hashlib
+import json
 import logging
 import os
 import re
@@ -30,6 +32,7 @@ from .parse_llm_structured_output import ParsedLLMNotificationAssessment
 
 logger = logging.getLogger(__name__)
 _NOTIFICATION_EVIDENCE_CHARS = 600
+NOTIFICATION_FINGERPRINT_VERSION = "pair-claim-v1"
 _CONFLICT_SUMMARY_TERMS = (
     "conflict",
     "drift",
@@ -109,6 +112,15 @@ def _notification_score_trace_enabled() -> bool:
     return _bool_env("COMPAIR_NOTIFICATION_SCORING_TRACE", False) or _bool_env("NOTIFICATION_SCORING_TRACE", False)
 
 
+def _normalize_fingerprint_text(value: str) -> str:
+    return " ".join((value or "").casefold().split())
+
+
+def _fingerprint_payload(prefix: str, payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return f"{prefix}_{hashlib.sha256(encoded.encode('utf-8')).hexdigest()}"
+
+
 @dataclass(frozen=True)
 class PeerCandidate:
     doc_id: str
@@ -175,6 +187,38 @@ def _feedback_focus_text(candidate: NotificationCandidate) -> str:
         return ""
     focus_text = candidate.generated_feedback.get("focus_text")
     return focus_text.strip() if isinstance(focus_text, str) else ""
+
+
+def notification_pair_claim_fingerprints(
+    candidate: NotificationCandidate,
+    assessment: ParsedLLMNotificationAssessment,
+) -> tuple[str, str]:
+    target = _normalize_fingerprint_text(
+        assessment.evidence_target or _feedback_focus_text(candidate) or candidate.target_text
+    )
+    peer_fallback = candidate.peer_candidates[0].chunk_text if candidate.peer_candidates else ""
+    peer = _normalize_fingerprint_text(assessment.evidence_peer or peer_fallback)
+    if not target or not peer:
+        return "", ""
+    pair_payload = {
+        "version": NOTIFICATION_FINGERPRINT_VERSION,
+        "target_evidence": target,
+        "peer_evidence": peer,
+    }
+    claim_text = _normalize_fingerprint_text(
+        " ".join(
+            [
+                assessment.intent,
+                _feedback_summary(candidate),
+                " ".join(assessment.rationale or []),
+            ]
+        )
+    )
+    claim_payload = {
+        **pair_payload,
+        "claim": claim_text,
+    }
+    return _fingerprint_payload("npair", pair_payload), _fingerprint_payload("nclaim", claim_payload)
 
 
 def _extract_snapshot_file_path(text: str) -> str:
@@ -477,6 +521,34 @@ def _seen_dedupe_key(session: Session, dedupe_key: str, hours: int) -> bool:
         return False
 
 
+def _seen_dismissed_fingerprint(
+    session: Session,
+    *,
+    user_id: str,
+    group_id: str,
+    pair_fingerprint: str,
+    claim_fingerprint: str,
+) -> bool:
+    if not pair_fingerprint or not claim_fingerprint:
+        return False
+    try:
+        exists = (
+            session.query(NotificationEvent.event_id)
+            .filter(
+                NotificationEvent.user_id == user_id,
+                NotificationEvent.group_id == group_id,
+                NotificationEvent.pair_fingerprint == pair_fingerprint,
+                NotificationEvent.claim_fingerprint == claim_fingerprint,
+                NotificationEvent.dismissed_at.isnot(None),
+            )
+            .first()
+        )
+        return bool(exists)
+    except Exception as exc:
+        logger.warning("NotificationEvent fingerprint suppression lookup failed: %s", exc)
+        return False
+
+
 def _times_seen_in_last_7d(session: Session, dedupe_key: str) -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(days=7)
     try:
@@ -519,6 +591,8 @@ def _persist_event(
     model: str,
     channel: Optional[str],
     run_id: str,
+    pair_fingerprint: str = "",
+    claim_fingerprint: str = "",
 ) -> Optional[NotificationEvent]:
     try:
         target_doc_id = candidate.target_doc_id or None
@@ -540,6 +614,9 @@ def _persist_event(
             group_id=candidate.group_id,
             intent=assessment.intent,
             dedupe_key=decision.dedupe_key,
+            pair_fingerprint=pair_fingerprint or None,
+            claim_fingerprint=claim_fingerprint or None,
+            fingerprint_version=NOTIFICATION_FINGERPRINT_VERSION if pair_fingerprint and claim_fingerprint else None,
             target_doc_id=target_doc_id,
             target_chunk_id=target_chunk_id,
             peer_doc_ids=[p.doc_id for p in candidate.peer_candidates],
@@ -619,6 +696,14 @@ def score_and_route_candidate(
     )
 
     dedupe_key = compute_dedupe_key(ctx, assessment)
+    pair_fingerprint, claim_fingerprint = notification_pair_claim_fingerprints(candidate, assessment)
+    seen_dismissed_fingerprint = _seen_dismissed_fingerprint(
+        session,
+        user_id=candidate.user_id,
+        group_id=candidate.group_id,
+        pair_fingerprint=pair_fingerprint,
+        claim_fingerprint=claim_fingerprint,
+    )
     pushes_sent = _count_pushes_last_24h(session, candidate.user_id)
     last_push = _last_push_sent_at(session, candidate.user_id)
     seen_dedupe = _seen_dedupe_key(session, dedupe_key, policy.dedupe_window_hours)
@@ -639,6 +724,15 @@ def score_and_route_candidate(
         times_seen_in_last_7d=_times_seen_in_last_7d(session, final_decision.dedupe_key),
         times_acknowledged_in_last_7d=_times_acknowledged_in_last_7d(session, final_decision.dedupe_key),
     )
+    if seen_dismissed_fingerprint:
+        final_decision = replace(
+            final_decision,
+            action="drop",
+            reason="Exact notification pair/claim was dismissed previously.",
+            priority=0,
+            requires_human_review=False,
+        )
+        digest_item = None
 
     channel = None if final_decision.action == "drop" else delivery_channel
     event = _persist_event(
@@ -649,6 +743,8 @@ def score_and_route_candidate(
         model=scorer.config.model,
         channel=channel,
         run_id=candidate.run_id,
+        pair_fingerprint=pair_fingerprint,
+        claim_fingerprint=claim_fingerprint,
     )
 
     if commit:

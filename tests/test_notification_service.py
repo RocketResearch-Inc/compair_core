@@ -222,3 +222,57 @@ class NotificationServiceTests(unittest.TestCase):
 
         self.assertEqual(calibrated.intent, "potential_conflict")
         self.assertIn("Generated feedback describes a mismatch/drift", calibrated.rationale[-1])
+
+    def test_pair_claim_fingerprint_requires_same_pair_and_claim(self) -> None:
+        candidate = service.NotificationCandidate(
+            user_id="u1",
+            group_id="g1",
+            target_doc_id="d1",
+            target_chunk_id="c1",
+            target_text="Target says use /youtube.",
+            peer_candidates=(
+                service.PeerCandidate(
+                    doc_id="d2",
+                    doc_title="docs",
+                    chunk_id="p1",
+                    chunk_text="Peer says use /embed.",
+                ),
+            ),
+            generated_feedback={"summary": "The embed path is inconsistent."},
+        )
+        assessment = service.ParsedLLMNotificationAssessment(
+            intent="potential_conflict",
+            relevance="MEDIUM",
+            novelty="MEDIUM",
+            severity="MEDIUM",
+            certainty="HIGH",
+            delivery="digest",
+            rationale=["These docs describe the same embed command."],
+            evidence_target="Target says use /youtube.",
+            evidence_peer="Peer says use /embed.",
+            parse_mode="json_schema_rubric",
+            raw_extracted=None,
+            errors=[],
+        )
+        changed_target_assessment = service.ParsedLLMNotificationAssessment(
+            intent=assessment.intent,
+            relevance=assessment.relevance,
+            novelty=assessment.novelty,
+            severity=assessment.severity,
+            certainty=assessment.certainty,
+            delivery=assessment.delivery,
+            rationale=assessment.rationale,
+            evidence_target="Target says use /watch.",
+            evidence_peer=assessment.evidence_peer,
+            parse_mode=assessment.parse_mode,
+            raw_extracted=None,
+            errors=[],
+        )
+
+        pair, claim = service.notification_pair_claim_fingerprints(candidate, assessment)
+        same_pair, same_claim = service.notification_pair_claim_fingerprints(candidate, assessment)
+        changed_pair, changed_claim = service.notification_pair_claim_fingerprints(candidate, changed_target_assessment)
+
+        self.assertEqual((pair, claim), (same_pair, same_claim))
+        self.assertNotEqual(pair, changed_pair)
+        self.assertNotEqual(claim, changed_claim)
