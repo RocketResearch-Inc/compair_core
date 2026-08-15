@@ -6,6 +6,7 @@ import sys
 from . import embeddings, feedback, logger, main, models, tasks, utils
 from compair_core.db import SessionLocal as Session
 from compair_core.db import engine
+from compair_core.schema_migrations import run_schema_migrations
 from .default_groups import initialize_default_groups
 
 edition = os.getenv("COMPAIR_EDITION", "core").lower()
@@ -196,6 +197,10 @@ def initialize_database() -> None:
         _ensure_topic_tags_column()
     if initialize_database_override and edition != "cloud":
         initialize_database_override(engine)
+    # This marker recognizes and validates the schema produced above. Future
+    # additive changes must be registered here instead of adding another
+    # best-effort create/ensure helper.
+    run_schema_migrations(engine)
 
 
 def _initialize_defaults() -> None:
