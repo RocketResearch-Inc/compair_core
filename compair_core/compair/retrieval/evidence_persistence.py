@@ -90,6 +90,7 @@ class BaselineEvidencePersistenceCommand:
     source_document_id: str
     idempotency_key: str
     retrieval_result: RetrievalResult
+    caller_user_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,6 +351,11 @@ class BaselineEvidencePersistenceService:
         chunk_id = _identifier(command.source_chunk_id, "source_chunk_id", 36)
         document_id = _identifier(command.source_document_id, "source_document_id", 36)
         idempotency_key = _identifier(command.idempotency_key, "idempotency_key", 256)
+        caller_user_id = (
+            _identifier(command.caller_user_id, "caller_user_id", 36)
+            if command.caller_user_id is not None
+            else None
+        )
         result = command.retrieval_result
         if not isinstance(result, RetrievalResult):
             raise BaselineEvidencePersistenceError(
@@ -361,6 +367,7 @@ class BaselineEvidencePersistenceService:
             group_id=group_id,
             chunk_id=chunk_id,
             document_id=document_id,
+            caller_user_id=caller_user_id,
         )
         corpus, generation, _ingestion, publication, build = self._lock_publication(
             session,
@@ -582,6 +589,7 @@ class BaselineEvidencePersistenceService:
         group_id: str,
         chunk_id: str,
         document_id: str,
+        caller_user_id: str | None,
     ) -> None:
         # Deliberately use stable Core tables rather than ORM relationships.
         # This boundary only needs an authorization fact, and avoiding mapper
@@ -611,6 +619,26 @@ class BaselineEvidencePersistenceService:
                 "source_unauthorized",
                 "source chunk/document is absent or unauthorized for the group",
             )
+        if caller_user_id is not None:
+            membership = session.execute(
+                text(
+                    'SELECT utg.user_id FROM user_to_group utg JOIN "user" u '
+                    "ON u.user_id = utg.user_id "
+                    "WHERE utg.user_id = :caller_user_id "
+                    "AND utg.group_id = :group_id"
+                    + (
+                        " FOR UPDATE OF utg, u"
+                        if session.get_bind().dialect.name == "postgresql"
+                        else ""
+                    )
+                ),
+                {"caller_user_id": caller_user_id, "group_id": group_id},
+            ).one_or_none()
+            if membership is None:
+                raise BaselineEvidencePersistenceError(
+                    "caller_unauthorized",
+                    "caller is absent or unauthorized for the selected group",
+                )
 
     @staticmethod
     def _lock_publication(

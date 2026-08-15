@@ -113,6 +113,13 @@ def _seed_core_scope(engine: Engine) -> tuple[str, str, str, str, str]:
             ),
             {"group_id": group_id, "now": now},
         )
+        connection.execute(
+            text(
+                "INSERT INTO user_to_group (user_id, group_id) "
+                "VALUES (:user_id, :group_id)"
+            ),
+            {"user_id": user_id, "group_id": group_id},
+        )
         for document_id, title in (
             (source_document_id, "Changed repository"),
             (peer_document_id, "Legacy peer"),

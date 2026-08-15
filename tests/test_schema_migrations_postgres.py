@@ -15,6 +15,7 @@ from uuid import uuid4
 import pytest
 from test_baseline_evidence_schema import (
     IntegrityError,
+    _add_mutable_corpus_lifecycle,
     _add_scope,
     _artifact_values,
     _run_values,
@@ -126,7 +127,7 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
         scoped_engine = core_db.create_engine(
             POSTGRES_URL,
             pool_pre_ping=True,
-            connect_args={"options": f"-csearch_path={schema_name},public"},
+            connect_args={"options": f"-csearch_path={schema_name}"},
         )
         from compair_core.compair.retrieval.corpus import (
             ensure_retrieval_corpus_schema,
@@ -140,6 +141,7 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
         assert baseline.applied == (
             "0000_core_schema_baseline",
             "0001_baseline_evidence_bridge_v1",
+            "0002_baseline_evidence_retention_v1",
         )
         with scoped_engine.connect() as connection:
             assert connection.execute(
@@ -182,6 +184,7 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
 
         with scoped_engine.begin() as connection:
             group_id, document_id, chunk_id = _add_scope(connection, "postgres")
+            _add_mutable_corpus_lifecycle(connection, "postgres")
             connection.execute(
                 baseline_retrieval_run.insert(),
                 _run_values(
@@ -263,9 +266,118 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
                 )
             )
 
+        with pytest.raises(IntegrityError), scoped_engine.begin() as connection:
+            connection.execute(
+                baseline_retrieval_run.delete().where(
+                    baseline_retrieval_run.c.run_id == "run-postgres"
+                )
+            )
+
+        # Source Document -> Chunk deletion clears only provenance pointers for
+        # baseline audit rows. The chunk trigger still deletes legacy rows.
+        with scoped_engine.begin() as connection:
+            connection.execute(
+                text("DELETE FROM document WHERE document_id=:document_id"),
+                {"document_id": document_id},
+            )
+            connection.execute(text("DELETE FROM chunk WHERE chunk_id='chunk-source'"))
+        with scoped_engine.connect() as connection:
+            assert connection.execute(
+                text(
+                    "SELECT source_chunk_id, source_document_id "
+                    "FROM baseline_retrieval_run WHERE run_id='run-postgres'"
+                )
+            ).one() == (None, None)
+            assert connection.execute(
+                text(
+                    "SELECT source_chunk_id FROM reference "
+                    "WHERE reference_id='baseline-reference'"
+                )
+            ).scalar_one() is None
+            assert connection.execute(
+                text(
+                    "SELECT source_chunk_id FROM feedback "
+                    "WHERE feedback_id='baseline-feedback'"
+                )
+            ).scalar_one() is None
+            assert connection.execute(
+                text("SELECT count(*) FROM reference WHERE reference_id LIKE 'legacy-%'")
+            ).scalar_one() == 0
+            assert connection.execute(
+                text("SELECT count(*) FROM feedback WHERE feedback_id='legacy-feedback'")
+            ).scalar_one() == 0
+
+        # Re-ingestion/repository rename and publication/generation deletion
+        # cannot reach the immutable copied evidence.
+        with scoped_engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO retrieval_corpus_generation "
+                    "(generation_id, corpus_id, generation_version, expected_repository_count, "
+                    "expected_file_count, status, manifest_hash, created_at, validated_at, activated_at) "
+                    "VALUES ('generation-postgres-v2', 'corpus-postgres', 'generation-v2', "
+                    "1, 1, 'active', :hash, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                ),
+                {"hash": "8" * 64},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO retrieval_corpus_file "
+                    "(file_id, generation_id, repository_id, repository_name, relative_path, "
+                    "file_state, content_hash, byte_size, content) VALUES "
+                    "('file-postgres-v2', 'generation-postgres-v2', 'repository-postgres', "
+                    "'renamed-repo', 'renamed/location.py', 'supported', :hash, 6, 'second')"
+                ),
+                {"hash": "8" * 64},
+            )
+            connection.execute(
+                text(
+                    "UPDATE retrieval_corpus SET active_generation_id='generation-postgres-v2' "
+                    "WHERE corpus_id='corpus-postgres'"
+                )
+            )
+            connection.execute(
+                text(
+                    "DELETE FROM retrieval_baseline_index_publication "
+                    "WHERE corpus_id='corpus-postgres'"
+                )
+            )
+            connection.execute(
+                text(
+                    "DELETE FROM retrieval_corpus_generation "
+                    "WHERE generation_id='generation-postgres'"
+                )
+            )
+        scoped_engine.dispose()
+        scoped_engine = core_db.create_engine(
+            POSTGRES_URL,
+            pool_pre_ping=True,
+            connect_args={"options": f"-csearch_path={schema_name}"},
+        )
+        assert run_schema_migrations(scoped_engine).applied == ()
+        with scoped_engine.connect() as connection:
+            assert connection.execute(
+                text(
+                    "SELECT repository_name, relative_path, complete_content, "
+                    "corpus_generation_id, index_id FROM baseline_evidence_artifact "
+                    "WHERE artifact_id='artifact-postgres'"
+                )
+            ).one() == (
+                "repo-postgres",
+                "src/postgres.py",
+                "postgres evidence",
+                "generation-postgres",
+                "index-postgres",
+            )
+            assert connection.execute(
+                text("SELECT count(*) FROM reference WHERE reference_id='baseline-reference'")
+            ).scalar_one() == 1
+            assert connection.execute(
+                text("SELECT count(*) FROM feedback WHERE feedback_id='baseline-feedback'")
+            ).scalar_one() == 1
+
         # One scope deletion cascades run, selection, Reference, Feedback, and
-        # artifact. The deferred artifact restriction is valid at commit after
-        # the run cascade removes the selected row.
+        # artifact through the direct group privacy boundary.
         with scoped_engine.begin() as connection:
             connection.execute(
                 text('DELETE FROM "group" WHERE group_id = :group_id'),
@@ -347,11 +459,12 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
         scoped_engine = core_db.create_engine(
             POSTGRES_URL,
             pool_pre_ping=True,
-            connect_args={"options": f"-csearch_path={schema_name},public"},
+            connect_args={"options": f"-csearch_path={schema_name}"},
         )
         assert run_schema_migrations(scoped_engine, registry).already_applied == (
             "0000_core_schema_baseline",
             "0001_baseline_evidence_bridge_v1",
+            "0002_baseline_evidence_retention_v1",
             first.migration_id,
         )
 
@@ -376,6 +489,7 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
         assert [(row.migration_id, row.state) for row in read_schema_migration_state(scoped_engine)] == [
             ("0000_core_schema_baseline", "applied"),
             ("0001_baseline_evidence_bridge_v1", "applied"),
+            ("0002_baseline_evidence_retention_v1", "applied"),
             (first.migration_id, "applied"),
             (second.migration_id, "failed"),
         ]

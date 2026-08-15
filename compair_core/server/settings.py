@@ -27,6 +27,7 @@ class Settings(BaseSettings):
 
     # Explicit retrieval-query transport. This is intentionally off by
     # default and can only relax policy for direct/eager/test/loopback paths.
+    retrieval_engine: str = "legacy"
     retrieval_query_allow_insecure_local_transport: bool = False
 
     # Baseline_v1 uses a separate fail-closed embedding provider. It never

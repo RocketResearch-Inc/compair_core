@@ -19,6 +19,18 @@ class UnknownRetrievalEngineError(ValueError):
     """Raised when an engine name is not explicitly registered."""
 
 
+def validate_retrieval_engine_name(engine_name: object) -> str:
+    """Validate explicit configuration without trimming or fallback."""
+
+    if not isinstance(engine_name, str) or not engine_name:
+        raise UnknownRetrievalEngineError(
+            "unknown retrieval engine: configuration must be a non-empty string"
+        )
+    if engine_name not in {DEFAULT_RETRIEVAL_ENGINE, BASELINE_RETRIEVAL_ENGINE}:
+        raise UnknownRetrievalEngineError(f"unknown retrieval engine: {engine_name}")
+    return engine_name
+
+
 class BaselineRetriever(Protocol):
     def retrieve(self, request: RetrievalRequest) -> RetrievalResult: ...
 
@@ -57,6 +69,9 @@ def _baseline_query_unavailable(
             code="explicit_retrieval_query_absent",
             message="baseline_v1 requires a non-empty explicit change-set query",
         ),
+        query_provenance=(
+            request.query_provenance if request is not None else None
+        ),
     )
 
 
@@ -82,6 +97,9 @@ def _baseline_inputs_unavailable(
                 "sibling-file corpus, and an injected dense provider"
             ),
         ),
+        query_provenance=(
+            request.query_provenance if request is not None else None
+        ),
     )
 
 
@@ -93,7 +111,11 @@ def create_retrieval_engine(
 ) -> LegacyRetriever[ChunkT] | BaselineV1Invocation:
     """Construct one registered engine; omitted names resolve to legacy."""
 
-    selected_name = DEFAULT_RETRIEVAL_ENGINE if engine_name is None else engine_name
+    selected_name = (
+        DEFAULT_RETRIEVAL_ENGINE
+        if engine_name is None
+        else validate_retrieval_engine_name(engine_name)
+    )
     if selected_name == DEFAULT_RETRIEVAL_ENGINE:
         if legacy_selector is None:
             raise ValueError("legacy retrieval requires the existing selector")

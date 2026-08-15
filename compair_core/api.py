@@ -13,18 +13,40 @@ from typing import Any, Mapping, Optional, Tuple
 
 import httpx
 from celery.result import AsyncResult
-from fastapi import APIRouter, Body, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.routing import APIRoute
-from sqlalchemy import distinct, func, select, or_, cast
+from sqlalchemy import distinct, func, select, or_, cast, text
 from sqlalchemy import inspect as sqlalchemy_inspect
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import joinedload, load_only, Session
 
-from .server.deps import get_analytics, get_billing, get_ocr, get_settings_dependency, get_storage
+from .server.deps import (
+    get_analytics,
+    get_billing,
+    get_ocr,
+    get_settings_dependency,
+    get_storage,
+)
 from .server.feature_flags import review_now_backend_enabled, review_now_disabled_detail
-from .server.providers.contracts import Analytics, BillingProvider, OCRProvider, StorageProvider
+from .server.providers.contracts import (
+    Analytics,
+    BillingProvider,
+    OCRProvider,
+    StorageProvider,
+)
 from .server.resource_metrics import attach_service_resource_metrics
 from .server.settings import Settings
 
@@ -32,8 +54,16 @@ from . import compair
 from .compair import models, schema
 from .compair.embeddings import create_embedding, Embedder
 from .compair.focus_manifest import normalize_focus_manifest
-from .compair.logger import log_event 
-from .compair.retrieval import RetrievalQueryOrigin, retrieval_query_provenance
+from .compair.logger import log_event
+from .compair.retrieval import (
+    DEFAULT_RETRIEVAL_ENGINE,
+    RetrievalQueryOrigin,
+    UnknownRetrievalEngineError,
+    new_processing_run_key,
+    retrieval_query_provenance,
+    validate_processing_run_key,
+    validate_retrieval_engine_name,
+)
 from .compair.retrieval.transport import (
     REDACTED_TASK_ARGS_REPR,
     REDACTED_TASK_KWARGS_REPR,
@@ -51,13 +81,13 @@ from .compair.utils import (
 )
 from .compair_email.email import emailer, EMAIL_USER
 from .compair_email.templates import (
-    ACCOUNT_VERIFY_TEMPLATE, 
-    GROUP_INVITATION_TEMPLATE, 
-    GROUP_JOIN_TEMPLATE, 
-    INDIVIDUAL_INVITATION_TEMPLATE, 
+    ACCOUNT_VERIFY_TEMPLATE,
+    GROUP_INVITATION_TEMPLATE,
+    GROUP_JOIN_TEMPLATE,
+    INDIVIDUAL_INVITATION_TEMPLATE,
     NOTIFICATION_DELIVERY_VERIFY_TEMPLATE,
-    PASSWORD_RESET_TEMPLATE, 
-    REFERRAL_CREDIT_TEMPLATE
+    PASSWORD_RESET_TEMPLATE,
+    REFERRAL_CREDIT_TEMPLATE,
 )
 from .compair.tasks import (
     process_document_task as process_document_celery,
@@ -83,9 +113,10 @@ def _getenv(*names: str, default: Optional[str] = None) -> Optional[str]:
             return value
     return default
 
+
 redis_url = _getenv("COMPAIR_REDIS_URL", "REDIS_URL")
 redis_client = redis.Redis.from_url(redis_url) if (redis and redis_url) else None
-#from compair.main import process_document
+# from compair.main import process_document
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _SNAPSHOT_FILE_RE = re.compile(r"^### File:\s+(.+?)(?:\s+\(.*)?$", re.MULTILINE)
@@ -144,13 +175,17 @@ def _reference_file_path(ref: models.Reference) -> Optional[str]:
     return _extract_snapshot_file_path(chunk.content)
 
 
-def _notification_pref_payload_value(payload: Optional[dict[str, Any]], key: str, fallback: Any) -> Any:
+def _notification_pref_payload_value(
+    payload: Optional[dict[str, Any]], key: str, fallback: Any
+) -> Any:
     if isinstance(payload, dict) and key in payload:
         return payload[key]
     return fallback
 
 
-def _is_legacy_notification_pref_defaults(prefs: models.NotificationPreferences) -> bool:
+def _is_legacy_notification_pref_defaults(
+    prefs: models.NotificationPreferences,
+) -> bool:
     created_at = getattr(prefs, "created_at", None)
     updated_at = getattr(prefs, "updated_at", None)
     untouched = False
@@ -173,7 +208,11 @@ def _is_legacy_notification_pref_defaults(prefs: models.NotificationPreferences)
 
 
 def _notification_unsubscribe_secret(settings: Settings) -> Optional[str]:
-    secret = (settings.notification_unsubscribe_secret or settings.google_oauth_state_secret or "").strip()
+    secret = (
+        settings.notification_unsubscribe_secret
+        or settings.google_oauth_state_secret
+        or ""
+    ).strip()
     return secret or None
 
 
@@ -232,7 +271,9 @@ def _normalize_notification_delivery_email(value: Optional[str]) -> str:
 
 def _notification_delivery_verified(prefs: models.NotificationPreferences) -> bool:
     return bool(
-        _normalize_notification_delivery_email(getattr(prefs, "notification_delivery_email", None))
+        _normalize_notification_delivery_email(
+            getattr(prefs, "notification_delivery_email", None)
+        )
         and getattr(prefs, "notification_delivery_email_verified_at", None)
     )
 
@@ -251,14 +292,24 @@ def _serialize_notification_preferences(
     prefs: models.NotificationPreferences,
 ) -> dict[str, Any]:
     verified = _notification_delivery_verified(prefs)
-    verified_email = _normalize_notification_delivery_email(prefs.notification_delivery_email) if verified else None
-    pending_email = _normalize_notification_delivery_email(prefs.notification_delivery_email_pending) or None
+    verified_email = (
+        _normalize_notification_delivery_email(prefs.notification_delivery_email)
+        if verified
+        else None
+    )
+    pending_email = (
+        _normalize_notification_delivery_email(
+            prefs.notification_delivery_email_pending
+        )
+        or None
+    )
     return {
         "preferences_id": prefs.preferences_id,
         "email_digest_enabled": prefs.email_digest_enabled,
         "email_digest_frequency": prefs.email_digest_frequency,
         "push_notifications_enabled": prefs.push_notifications_enabled,
-        "digest_buckets_enabled": prefs.digest_buckets_enabled or DEFAULT_NOTIFICATION_BUCKETS,
+        "digest_buckets_enabled": prefs.digest_buckets_enabled
+        or DEFAULT_NOTIFICATION_BUCKETS,
         "quiet_hours_start": prefs.quiet_hours_start,
         "quiet_hours_end": prefs.quiet_hours_end,
         "max_daily_push_emails": prefs.max_daily_push_emails,
@@ -271,7 +322,9 @@ def _serialize_notification_preferences(
             if prefs.notification_delivery_email_verified_at
             else None
         ),
-        "notification_delivery_email_effective": _notification_delivery_effective_email(current_user, prefs),
+        "notification_delivery_email_effective": _notification_delivery_effective_email(
+            current_user, prefs
+        ),
         "notification_delivery_email_source": "alternate" if verified else "account",
     }
 
@@ -280,9 +333,11 @@ def _get_or_create_notification_preferences(
     session: Session,
     current_user: models.User,
 ) -> models.NotificationPreferences:
-    prefs = session.query(models.NotificationPreferences).filter(
-        models.NotificationPreferences.user_id == current_user.user_id
-    ).first()
+    prefs = (
+        session.query(models.NotificationPreferences)
+        .filter(models.NotificationPreferences.user_id == current_user.user_id)
+        .first()
+    )
     if not prefs:
         prefs = models.NotificationPreferences(
             user_id=current_user.user_id,
@@ -318,7 +373,10 @@ def _purge_notification_events_for_docs(session: Session, doc_ids: list[str]) ->
     if hasattr(notification_model, "peer_doc_ids"):
         peer_expr = notification_model.peer_doc_ids
         try:
-            if session.get_bind() is not None and session.get_bind().dialect.name == "postgresql":
+            if (
+                session.get_bind() is not None
+                and session.get_bind().dialect.name == "postgresql"
+            ):
                 peer_expr = cast(notification_model.peer_doc_ids, JSONB)
         except Exception:
             pass
@@ -344,16 +402,14 @@ def _member_group_ids(
     stmt = (
         select(models.Group.group_id)
         .select_from(models.Group)
-        .join(user_to_group_table, models.Group.group_id == user_to_group_table.c.group_id)
+        .join(
+            user_to_group_table, models.Group.group_id == user_to_group_table.c.group_id
+        )
         .where(user_to_group_table.c.user_id == user_id)
     )
     if exclude_compair:
         stmt = stmt.where(models.Group.category != "Compair")
-    return {
-        group_id
-        for group_id in session.execute(stmt).scalars().all()
-        if group_id
-    }
+    return {group_id for group_id in session.execute(stmt).scalars().all() if group_id}
 
 
 def _invited_group_ids(session: Session, email: str | None) -> set[str]:
@@ -363,11 +419,7 @@ def _invited_group_ids(session: Session, email: str | None) -> set[str]:
         models.GroupInvitation.email == email,
         models.GroupInvitation.status == "sent",
     )
-    return {
-        group_id
-        for group_id in session.execute(stmt).scalars().all()
-        if group_id
-    }
+    return {group_id for group_id in session.execute(stmt).scalars().all() if group_id}
 
 
 def _group_user_counts(session: Session, group_ids: list[str]) -> dict[str, int]:
@@ -382,7 +434,9 @@ def _group_user_counts(session: Session, group_ids: list[str]) -> dict[str, int]
         .where(user_to_group_table.c.group_id.in_(group_ids))
         .group_by(user_to_group_table.c.group_id)
     )
-    return {group_id: int(count or 0) for group_id, count in session.execute(stmt).all()}
+    return {
+        group_id: int(count or 0) for group_id, count in session.execute(stmt).all()
+    }
 
 
 def _group_document_counts(session: Session, group_ids: list[str]) -> dict[str, int]:
@@ -397,10 +451,14 @@ def _group_document_counts(session: Session, group_ids: list[str]) -> dict[str, 
         .where(document_to_group_table.c.group_id.in_(group_ids))
         .group_by(document_to_group_table.c.group_id)
     )
-    return {group_id: int(count or 0) for group_id, count in session.execute(stmt).all()}
+    return {
+        group_id: int(count or 0) for group_id, count in session.execute(stmt).all()
+    }
 
 
-def _group_first_three_profile_images(session: Session, group_ids: list[str]) -> dict[str, list[str | None]]:
+def _group_first_three_profile_images(
+    session: Session, group_ids: list[str]
+) -> dict[str, list[str | None]]:
     user_to_group_table = getattr(models, "user_to_group_table", None)
     if user_to_group_table is None or not group_ids:
         return {}
@@ -411,10 +469,12 @@ def _group_first_three_profile_images(session: Session, group_ids: list[str]) ->
             select(
                 user_to_group_table.c.group_id.label("group_id"),
                 models.User.profile_image.label("profile_image"),
-                func.row_number().over(
+                func.row_number()
+                .over(
                     partition_by=user_to_group_table.c.group_id,
                     order_by=models.User.user_id,
-                ).label("rn"),
+                )
+                .label("rn"),
             )
             .select_from(user_to_group_table)
             .join(models.User, models.User.user_id == user_to_group_table.c.user_id)
@@ -453,9 +513,14 @@ def _public_web_base_url() -> str:
     if raw.startswith("http://") or raw.startswith("https://"):
         return raw.rstrip("/")
     host = raw.lower()
-    if host.startswith("localhost") or host.startswith("127.0.0.1") or host.startswith("[::1]"):
+    if (
+        host.startswith("localhost")
+        or host.startswith("127.0.0.1")
+        or host.startswith("[::1]")
+    ):
         return f"http://{raw}".rstrip("/")
     return f"https://{raw}".rstrip("/")
+
 
 router = APIRouter()
 core_router = APIRouter()
@@ -464,7 +529,9 @@ ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")
 
 CLOUDFLARE_IMAGES_ACCOUNT = os.environ.get("CLOUDFLARE_IMAGES_ACCOUNT")
 CLOUDFLARE_IMAGES_URL_ACCOUNT = os.environ.get("CLOUDFLARE_IMAGES_URL_ACCOUNT")
-CLOUDFLARE_IMAGES_BASE_URL = f"https://imagedelivery.net/{CLOUDFLARE_IMAGES_URL_ACCOUNT}"
+CLOUDFLARE_IMAGES_BASE_URL = (
+    f"https://imagedelivery.net/{CLOUDFLARE_IMAGES_URL_ACCOUNT}"
+)
 CLOUDFLARE_IMAGES_TOKEN = os.environ.get("CLOUDFLARE_IMAGES_TOKEN")
 CLOUDFLARE_IMAGES_UPLOAD_URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_IMAGES_ACCOUNT}/images/v1"
 
@@ -504,14 +571,25 @@ def _dispatch_process_document_task(
     reference_doc_ids: list[str] | None = None,
     focus_manifest: dict[str, Any] | None = None,
     retrieval_query: str | None = None,
+    retrieval_engine: str = DEFAULT_RETRIEVAL_ENGINE,
+    processing_run_key: str | None = None,
+    group_id: str | None = None,
     allow_insecure_local_query_transport: bool = False,
 ):
+    selected_engine = validate_retrieval_engine_name(retrieval_engine)
+    parent_run_key = validate_processing_run_key(
+        processing_run_key or new_processing_run_key()
+    )
     task_kwargs: dict[str, Any] = {
         "snapshot_payload_key": snapshot_payload_key,
         "reference_doc_ids": reference_doc_ids,
+        "retrieval_engine": selected_engine,
+        "processing_run_key": parent_run_key,
     }
     if retrieval_query is not None:
         task_kwargs["retrieval_query"] = retrieval_query
+    if group_id is not None:
+        task_kwargs["group_id"] = group_id
     if focus_manifest is not None:
         task_kwargs["focus_manifest"] = focus_manifest
     if retrieval_query is not None:
@@ -536,25 +614,7 @@ def _dispatch_process_document_task(
             )
     task_callable = getattr(process_document_celery, "delay", None)
     if callable(task_callable):
-        try:
-            return task_callable(
-                user_id,
-                doc_id,
-                doc_text or "",
-                generate_feedback,
-                chunk_mode,
-                reanalyze_existing,
-                **task_kwargs,
-            )
-        except TypeError:
-            if retrieval_query is not None:
-                raise
-            try:
-                return task_callable(user_id, doc_id, doc_text or "", generate_feedback, chunk_mode)
-            except TypeError:
-                return task_callable(user_id, doc_id, doc_text or "", generate_feedback)
-    try:
-        return process_document_celery(
+        return task_callable(
             user_id,
             doc_id,
             doc_text or "",
@@ -563,13 +623,15 @@ def _dispatch_process_document_task(
             reanalyze_existing,
             **task_kwargs,
         )
-    except TypeError:
-        if retrieval_query is not None:
-            raise
-        try:
-            return process_document_celery(user_id, doc_id, doc_text or "", generate_feedback, chunk_mode)
-        except TypeError:
-            return process_document_celery(user_id, doc_id, doc_text or "", generate_feedback)
+    return process_document_celery(
+        user_id,
+        doc_id,
+        doc_text or "",
+        generate_feedback,
+        chunk_mode,
+        reanalyze_existing,
+        **task_kwargs,
+    )
 
 
 def _process_document_async_result(task_id: str):
@@ -703,7 +765,9 @@ def _parse_task_datetime(value: Any) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
-def _task_time_payload(meta: Mapping[str, Any], key: str) -> tuple[Optional[str], Optional[float]]:
+def _task_time_payload(
+    meta: Mapping[str, Any], key: str
+) -> tuple[Optional[str], Optional[float]]:
     parsed = _parse_task_datetime(meta.get(key))
     if parsed is None:
         return None, None
@@ -729,7 +793,9 @@ def _extract_task_ids_from_payload(payload: Any) -> list[str]:
     return ids
 
 
-def _task_lifecycle(status: str, meta: Mapping[str, Any], children: Optional[Mapping[str, Any]]) -> tuple[str, str, bool, bool, str]:
+def _task_lifecycle(
+    status: str, meta: Mapping[str, Any], children: Optional[Mapping[str, Any]]
+) -> tuple[str, str, bool, bool, str]:
     status = status.upper()
     child_failed = int((children or {}).get("failed", 0) or 0)
     child_revoked = int((children or {}).get("revoked", 0) or 0)
@@ -755,13 +821,20 @@ def _task_lifecycle(status: str, meta: Mapping[str, Any], children: Optional[Map
     if (
         stale_after_sec > 0
         and last_progress_at is not None
-        and (datetime.now(timezone.utc) - last_progress_at).total_seconds() >= stale_after_sec
+        and (datetime.now(timezone.utc) - last_progress_at).total_seconds()
+        >= stale_after_sec
         and not child_running
         and not child_queued
     ):
         stage = str(meta.get("stage") or "").strip().lower()
         if stage in {"preparing", "chunking", "prioritizing"}:
-            return "running", "stale_prechunk", False, False, "resubmit_smaller_or_inspect_worker"
+            return (
+                "running",
+                "stale_prechunk",
+                False,
+                False,
+                "resubmit_smaller_or_inspect_worker",
+            )
         return "running", "stale", False, False, "inspect_worker"
 
     if status == "PENDING" and not meta:
@@ -771,7 +844,9 @@ def _task_lifecycle(status: str, meta: Mapping[str, Any], children: Optional[Map
     return "unknown", "unknown", False, False, "continue_waiting"
 
 
-def _task_status_payload(task_id: str, *, include_children: bool = True) -> dict[str, Any]:
+def _task_status_payload(
+    task_id: str, *, include_children: bool = True
+) -> dict[str, Any]:
     try:
         task_result = _process_document_async_result(task_id)
     except Exception as exc:
@@ -792,11 +867,19 @@ def _task_status_payload(task_id: str, *, include_children: bool = True) -> dict
     info = _task_info_value(task_result)
     result = _task_result_value(task_result, status, info)
     meta = _task_meta_from_info(info)
-    child_task_ids = _extract_task_ids_from_payload(result) or _extract_task_ids_from_payload(meta)
-    children = _summarize_child_task_statuses(child_task_ids) if include_children else None
-    lifecycle, health, retryable, terminal, recommended_action = _task_lifecycle(status, meta, children)
+    child_task_ids = _extract_task_ids_from_payload(
+        result
+    ) or _extract_task_ids_from_payload(meta)
+    children = (
+        _summarize_child_task_statuses(child_task_ids) if include_children else None
+    )
+    lifecycle, health, retryable, terminal, recommended_action = _task_lifecycle(
+        status, meta, children
+    )
     started_at, started_age_sec = _task_time_payload(meta, "started_at")
-    last_progress_at, last_progress_age_sec = _task_time_payload(meta, "last_progress_at")
+    last_progress_at, last_progress_age_sec = _task_time_payload(
+        meta, "last_progress_at"
+    )
 
     payload: dict[str, Any] = {
         "task_id": task_id,
@@ -921,7 +1004,11 @@ def _ensure_single_user(session: Session, settings: Settings) -> models.User:
             changed = True
         group = next((g for g in user.groups if g.name == user.username), None)
         if group is None:
-            group = session.query(models.Group).filter(models.Group.name == user.username).first()
+            group = (
+                session.query(models.Group)
+                .filter(models.Group.name == user.username)
+                .first()
+            )
             if group is None:
                 group = models.Group(
                     name=user.username,
@@ -936,7 +1023,11 @@ def _ensure_single_user(session: Session, settings: Settings) -> models.User:
             if group not in user.groups:
                 user.groups.append(group)
                 changed = True
-        admin = session.query(models.Administrator).filter(models.Administrator.user_id == user.user_id).first()
+        admin = (
+            session.query(models.Administrator)
+            .filter(models.Administrator.user_id == user.user_id)
+            .first()
+        )
         if admin is None:
             admin = models.Administrator(user_id=user.user_id)
             session.add(admin)
@@ -964,7 +1055,10 @@ def _ensure_single_user_session(session: Session, user: models.User) -> models.S
     now = datetime.now(timezone.utc)
     existing = (
         session.query(models.Session)
-        .filter(models.Session.user_id == user.user_id, models.Session.datetime_valid_until >= now)
+        .filter(
+            models.Session.user_id == user.user_id,
+            models.Session.datetime_valid_until >= now,
+        )
         .order_by(models.Session.datetime_valid_until.desc())
         .first()
     )
@@ -984,7 +1078,10 @@ def _ensure_single_user_session(session: Session, user: models.User) -> models.S
 
 def require_cloud(feature: str) -> None:
     if not IS_CLOUD:
-        raise HTTPException(status_code=501, detail=f"{feature} is only available in the Compair Cloud edition.")
+        raise HTTPException(
+            status_code=501,
+            detail=f"{feature} is only available in the Compair Cloud edition.",
+        )
 
 
 def _user_plan(user: models.User) -> str:
@@ -1030,7 +1127,10 @@ def _process_doc_payload_stage_backend(*, prefer_storage: bool = False) -> str:
 
 def require_feature(flag: bool, feature: str) -> None:
     if not flag and not IS_CLOUD:
-        raise HTTPException(status_code=501, detail=f"{feature} is only available in the Compair Cloud edition.")
+        raise HTTPException(
+            status_code=501,
+            detail=f"{feature} is only available in the Compair Cloud edition.",
+        )
 
 
 def _decode_optional_base64(value: str | None, field_name: str) -> str | None:
@@ -1039,11 +1139,15 @@ def _decode_optional_base64(value: str | None, field_name: str) -> str | None:
     try:
         decoded = base64.b64decode(value.encode("utf-8"), validate=True)
     except (binascii.Error, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid base64 payload for {field_name}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"Invalid base64 payload for {field_name}"
+        ) from exc
     try:
         return sanitize_text_for_database(decoded.decode("utf-8"))
     except UnicodeDecodeError:
-        logger.warning("%s contained invalid UTF-8; replacing invalid bytes", field_name)
+        logger.warning(
+            "%s contained invalid UTF-8; replacing invalid bytes", field_name
+        )
         return sanitize_text_for_database(decoded.decode("utf-8", errors="replace"))
 
 
@@ -1055,7 +1159,9 @@ def _estimate_b64_decoded_bytes(value: str) -> int:
     return max(0, (len(stripped) * 3 // 4) - padding)
 
 
-def _build_process_doc_payload(*, doc_text: str | None, doc_text_b64: str | None) -> dict[str, str] | None:
+def _build_process_doc_payload(
+    *, doc_text: str | None, doc_text_b64: str | None
+) -> dict[str, str] | None:
     payload: dict[str, str] = {}
     if doc_text_b64 is not None:
         payload["doc_text_b64"] = doc_text_b64
@@ -1066,7 +1172,9 @@ def _build_process_doc_payload(*, doc_text: str | None, doc_text_b64: str | None
     return payload
 
 
-def _stage_process_doc_payload_storage(storage: StorageProvider, payload: dict[str, str]) -> str:
+def _stage_process_doc_payload_storage(
+    storage: StorageProvider, payload: dict[str, str]
+) -> str:
     key = f"process_doc_payloads/{secrets.token_urlsafe(24)}.json"
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     storage.put_file(key, io.BytesIO(body), "application/json")
@@ -1077,7 +1185,9 @@ def _stage_process_doc_payload_redis(payload: dict[str, str]) -> str | None:
     if not HAS_REDIS or redis_client is None:
         return None
     key = f"process_doc_payload:{secrets.token_urlsafe(24)}"
-    redis_client.setex(key, _PROCESS_DOC_PAYLOAD_TTL_SEC, json.dumps(payload, ensure_ascii=False))
+    redis_client.setex(
+        key, _PROCESS_DOC_PAYLOAD_TTL_SEC, json.dumps(payload, ensure_ascii=False)
+    )
     return key
 
 
@@ -1144,20 +1254,26 @@ def _parse_process_doc_list(value: Any) -> list[str]:
 
 
 async def _read_process_doc_payload(request: Request) -> dict[str, Any]:
-    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    content_type = (
+        request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    )
     if content_type == "application/json":
         try:
             payload = await request.json()
         except json.JSONDecodeError as exc:
             raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
         if not isinstance(payload, dict):
-            raise HTTPException(status_code=422, detail="JSON payload must be an object")
+            raise HTTPException(
+                status_code=422, detail="JSON payload must be an object"
+            )
         return dict(payload)
 
     form = await request.form(
         max_files=1000,
         max_fields=1000,
-        max_part_size=int(os.getenv("COMPAIR_PROCESS_DOC_FORM_MAX_PART_SIZE", str(64 * 1024 * 1024))),
+        max_part_size=int(
+            os.getenv("COMPAIR_PROCESS_DOC_FORM_MAX_PART_SIZE", str(64 * 1024 * 1024))
+        ),
     )
     payload: dict[str, Any] = dict(form)
     if hasattr(form, "getlist"):
@@ -1173,32 +1289,43 @@ def get_current_user(auth_token: str | None = Header(None)):
     if not auth_token:
         raise HTTPException(status_code=401, detail="Missing session token")
     with compair.Session() as session:
-        user_session = session.query(models.Session).filter(models.Session.id == auth_token).first()
+        user_session = (
+            session.query(models.Session)
+            .filter(models.Session.id == auth_token)
+            .first()
+        )
         if not user_session:
-            raise HTTPException(status_code=401, detail="Invalid or expired session token")
+            raise HTTPException(
+                status_code=401, detail="Invalid or expired session token"
+            )
         # Ensure datetime_valid_until is timezone-aware
         valid_until = user_session.datetime_valid_until
         if valid_until.tzinfo is None:
             valid_until = valid_until.replace(tzinfo=timezone.utc)
         if valid_until < datetime.now(timezone.utc):
-            raise HTTPException(status_code=401, detail="Invalid or expired session token")
-        user = session.query(
-            models.User
-        ).filter(
-            models.User.user_id == user_session.user_id
-        ).options(
-            joinedload(models.User.groups)
-        ).first()
+            raise HTTPException(
+                status_code=401, detail="Invalid or expired session token"
+            )
+        user = (
+            session.query(models.User)
+            .filter(models.User.user_id == user_session.user_id)
+            .options(joinedload(models.User.groups))
+            .first()
+        )
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         return user
 
+
 def get_current_user_with_access_to_doc(
-    document_id: str,
-    current_user: models.User = Depends(get_current_user)
+    document_id: str, current_user: models.User = Depends(get_current_user)
 ) -> models.User:
     with compair.Session() as session:
-        doc = session.query(models.Document).filter(models.Document.document_id == document_id).first()
+        doc = (
+            session.query(models.Document)
+            .filter(models.Document.document_id == document_id)
+            .first()
+        )
         if not doc:
             raise HTTPException(status_code=404, detail="Document not found")
         # Allow if user is author
@@ -1212,7 +1339,10 @@ def get_current_user_with_access_to_doc(
         # Optionally, allow if document is published
         if doc.is_published:
             return current_user
-        raise HTTPException(status_code=403, detail="Not authorized to access this document")
+        raise HTTPException(
+            status_code=403, detail="Not authorized to access this document"
+        )
+
 
 @router.post("/login")
 def login(request: schema.LoginRequest) -> dict:
@@ -1229,10 +1359,14 @@ def login(request: schema.LoginRequest) -> dict:
                 "role": user.role,
                 "auth_token": user_session.id,
             }
-        user = session.query(models.User).filter(models.User.username == request.username).first()
+        user = (
+            session.query(models.User)
+            .filter(models.User.username == request.username)
+            .first()
+        )
         if not user or not user.check_password(request.password):
             raise HTTPException(status_code=401, detail="Invalid credentials")
-        if user.status == 'inactive':
+        if user.status == "inactive":
             raise HTTPException(status_code=403, detail="User account is not verified")
         now = datetime.now(tz=timezone.utc)
         user_session = models.Session(
@@ -1256,7 +1390,10 @@ def login(request: schema.LoginRequest) -> dict:
 @router.get("/username_exists")
 def username_exists(username: str) -> dict:
     with compair.Session() as session:
-        exists = session.query(models.User).filter(models.User.username == username).first() is not None
+        exists = (
+            session.query(models.User).filter(models.User.username == username).first()
+            is not None
+        )
         return {"exists": exists}
 
 
@@ -1265,9 +1402,7 @@ def load_user(
     username: str,
 ) -> schema.User | None:
     with compair.Session() as session:
-        q = select(models.User).filter(
-            models.User.username == username
-        )
+        q = select(models.User).filter(models.User.username == username)
         user = session.execute(q).fetchone()
         if user is None:
             return
@@ -1278,10 +1413,8 @@ def load_user(
 
 
 @router.get("/load_user_plan")
-def load_user(
-    current_user: models.User = Depends(get_current_user)
-) -> dict:
-    return {'plan': _user_plan(current_user)}
+def load_user(current_user: models.User = Depends(get_current_user)) -> dict:
+    return {"plan": _user_plan(current_user)}
 
 
 @router.get("/load_user_by_id")
@@ -1289,9 +1422,7 @@ def load_user(
     user_id: str,
 ) -> schema.User | None:
     with compair.Session() as session:
-        q = select(models.User).filter(
-            models.User.user_id==user_id
-        )
+        q = select(models.User).filter(models.User.user_id == user_id)
         user = session.execute(q).fetchone()
         if user is None:
             return
@@ -1307,36 +1438,55 @@ def load_user_files(
     page: int = 1,
     page_size: int = 10,
     filter_type: str | None = None,
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ) -> dict:
     with compair.Session() as session:
         # Validate connection
-        connection = session.query(models.User).filter(models.User.user_id == connection_id).first()
+        connection = (
+            session.query(models.User)
+            .filter(models.User.user_id == connection_id)
+            .first()
+        )
         if not connection:
             return {"files": [], "message": "User or connection not found."}
 
         # Security: must share a group
-        shared_group_ids = set(g.group_id for g in current_user.groups).intersection(g.group_id for g in connection.groups)
+        shared_group_ids = set(g.group_id for g in current_user.groups).intersection(
+            g.group_id for g in connection.groups
+        )
         if not shared_group_ids:
-            return {"files": [], "message": "You do not have permission to view this user's affiliations, as you do not share a group together."}
+            return {
+                "files": [],
+                "message": "You do not have permission to view this user's affiliations, as you do not share a group together.",
+            }
 
         # Privacy: check setting
         if connection.hide_affiliations:
-            return {"files": [], "message": f"{connection.username} has set their profile to private."}
+            return {
+                "files": [],
+                "message": f"{connection.username} has set their profile to private.",
+            }
 
         now = datetime.now(timezone.utc)
         week_ago = now - timedelta(days=7)
         # Fetch documents belonging to shared or public groups
-        q = select(models.Document).join(models.Document.groups).filter(
-            models.Document.user_id == connection_id,
-            models.Group.group_id.in_(shared_group_ids) |  # Shared groups
-            (
-                (models.Group.visibility == "public") &  # Public groups
-                models.Group.users.any(models.User.user_id == connection_id)  # Associated with the connection
+        q = (
+            select(models.Document)
+            .join(models.Document.groups)
+            .filter(
+                models.Document.user_id == connection_id,
+                models.Group.group_id.in_(shared_group_ids)  # Shared groups
+                | (
+                    (models.Group.visibility == "public")  # Public groups
+                    & models.Group.users.any(
+                        models.User.user_id == connection_id
+                    )  # Associated with the connection
+                ),
             )
-        ).options(
-            joinedload(models.Document.groups),
-            joinedload(models.Document.user).joinedload(models.User.groups)
+            .options(
+                joinedload(models.Document.groups),
+                joinedload(models.Document.user).joinedload(models.User.groups),
+            )
         )
 
         # --- Filter logic ---
@@ -1349,34 +1499,40 @@ def load_user_files(
             q = q.outerjoin(models.Document.notes).filter(
                 or_(
                     models.Document.datetime_modified >= week_ago,
-                    models.Note.datetime_created >= week_ago
+                    models.Note.datetime_created >= week_ago,
                 )
             )
         elif filter_type == "recently_compaired":
             # Documents with feedback in the past week
-            q = q.join(models.Document.chunks).join(models.Chunk.feedbacks).filter(
-                models.Feedback.timestamp >= week_ago
+            q = (
+                q.join(models.Document.chunks)
+                .join(models.Chunk.feedbacks)
+                .filter(models.Feedback.timestamp >= week_ago)
             )
         # Default: all, sorted by last update
         q = q.order_by(models.Document.datetime_modified.desc())
 
         documents = session.execute(q).unique().fetchall()
 
-        if documents is None or len(documents)==0:
-            return {
-                "documents": [],
-                "total_count": 0,
-                "message": None
-            }
+        if documents is None or len(documents) == 0:
+            return {"documents": [], "total_count": 0, "message": None}
 
         total_count = len(documents)
         # Paging
         offset = (page - 1) * page_size
-        documents = session.execute(q.order_by(models.Document.datetime_created.desc()).offset(offset).limit(page_size)).unique().fetchall()
+        documents = (
+            session.execute(
+                q.order_by(models.Document.datetime_created.desc())
+                .offset(offset)
+                .limit(page_size)
+            )
+            .unique()
+            .fetchall()
+        )
 
         files = [d[0] for d in documents] if documents else []
         return {
-            "files": [schema.Document.model_validate(f) for f in files], 
+            "files": [schema.Document.model_validate(f) for f in files],
             "message": None,
             "total_count": total_count,
         }
@@ -1388,35 +1544,50 @@ def load_user_groups(
     page: int = 1,
     page_size: int = 10,
     filter_type: str | None = None,
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ) -> dict:
     with compair.Session() as session:
         now = datetime.now(timezone.utc)
         week_ago = now - timedelta(days=7)
         # Validate connection
-        connection = session.query(models.User).filter(models.User.user_id == connection_id).first()
+        connection = (
+            session.query(models.User)
+            .filter(models.User.user_id == connection_id)
+            .first()
+        )
         if not connection:
             return {"groups": [], "message": "User or connection not found."}
 
         # Check if the connection is valid
-        shared_group_ids = set([g.group_id for g in current_user.groups]).intersection([g.group_id for g in connection.groups])
+        shared_group_ids = set([g.group_id for g in current_user.groups]).intersection(
+            [g.group_id for g in connection.groups]
+        )
         if not shared_group_ids:
-            return {"groups": [], "message": "You do not have permission to view this user's affiliations, as you do not share a group together."}
-        
+            return {
+                "groups": [],
+                "message": "You do not have permission to view this user's affiliations, as you do not share a group together.",
+            }
+
         # Privacy: check setting
         if connection.hide_affiliations:
-            return {"groups": [], "message": f"{connection.username} has set their profile to private."}
+            return {
+                "groups": [],
+                "message": f"{connection.username} has set their profile to private.",
+            }
 
         # Fetch shared or public groups of the connection
-        groups_query = session.query(models.Group).filter(
-            models.Group.group_id.in_(shared_group_ids) |  # Shared groups
-            (
-                (models.Group.visibility == "public") &  # Public groups
-                models.Group.users.any(models.User.user_id == connection_id)  # Associated with the connection
+        groups_query = (
+            session.query(models.Group)
+            .filter(
+                models.Group.group_id.in_(shared_group_ids)  # Shared groups
+                | (
+                    (models.Group.visibility == "public")  # Public groups
+                    & models.Group.users.any(
+                        models.User.user_id == connection_id
+                    )  # Associated with the connection
+                )
             )
-        ).options(
-            joinedload(models.Group.users),
-            joinedload(models.Group.documents)
+            .options(joinedload(models.Group.users), joinedload(models.Group.documents))
         )
 
         # --- Filter logic (match /load_groups) ---
@@ -1448,7 +1619,9 @@ def load_user_groups(
                 "visibility": group.visibility,
                 "document_count": getattr(group, "document_count", None),
                 "user_count": getattr(group, "user_count", None),
-                "first_three_user_profile_images": getattr(group, "first_three_user_profile_images", None)
+                "first_three_user_profile_images": getattr(
+                    group, "first_three_user_profile_images", None
+                ),
             }
             for group in groups
         ]
@@ -1456,10 +1629,8 @@ def load_user_groups(
 
 
 @router.get("/load_user_status")
-def load_user_status(
-    current_user: models.User = Depends(get_current_user)
-) -> str:
-    user_status = 'inactive'
+def load_user_status(current_user: models.User = Depends(get_current_user)) -> str:
+    user_status = "inactive"
     with compair.Session() as session:
         user_status = current_user.status
         return user_status
@@ -1467,44 +1638,51 @@ def load_user_status(
 
 @router.get("/load_user_status_date")
 def load_user_status_date(
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ) -> datetime:
     if not (HAS_TRIALS or HAS_BILLING) and not IS_CLOUD:
-        raise HTTPException(status_code=501, detail="User status dates are only tracked in the Compair Cloud edition.")
+        raise HTTPException(
+            status_code=501,
+            detail="User status dates are only tracked in the Compair Cloud edition.",
+        )
     with compair.Session() as session:
         user_status = current_user.status
-        if user_status=='active':
+        if user_status == "active":
             require_feature(HAS_BILLING, "Billing history")
             user_status_date = (
                 getattr(current_user, "last_payment_date", None)
                 or getattr(current_user, "status_change_date", None)
                 or getattr(current_user, "datetime_registered", None)
             )
-        elif user_status=='trial':
+        elif user_status == "trial":
             require_feature(HAS_TRIALS, "Trial management")
             user_status_date = (
                 getattr(current_user, "trial_expiration_date", None)
                 or getattr(current_user, "status_change_date", None)
                 or getattr(current_user, "datetime_registered", None)
             )
-        elif user_status=='suspended':
-            user_status_date = (
-                getattr(current_user, "status_change_date", None)
-                or getattr(current_user, "datetime_registered", None)
-            )
+        elif user_status == "suspended":
+            user_status_date = getattr(
+                current_user, "status_change_date", None
+            ) or getattr(current_user, "datetime_registered", None)
         else:
-            raise HTTPException(status_code=403, detail='User Inactive')
+            raise HTTPException(status_code=403, detail="User Inactive")
         if user_status_date is None:
-            raise HTTPException(status_code=404, detail="User status date is not available.")
+            raise HTTPException(
+                status_code=404, detail="User status date is not available."
+            )
         return user_status_date
 
 
 @router.get("/load_referral_credits")
 def load_referral_credits(
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ) -> Tuple[int, int]:
     if not HAS_REFERRALS and not IS_CLOUD:
-        raise HTTPException(status_code=501, detail="Referral credits are only available in the Compair Cloud edition.")
+        raise HTTPException(
+            status_code=501,
+            detail="Referral credits are only available in the Compair Cloud edition.",
+        )
     with compair.Session() as session:
         referral_credits_earned = current_user.referral_credits
         referral_credits_pending = current_user.pending_referral_credits
@@ -1521,7 +1699,9 @@ def create_user(
     analytics: Analytics | None = None,
 ):
     token, expiration = generate_verification_token()
-    existing_user = session.query(models.User).filter(models.User.username == username).first()
+    existing_user = (
+        session.query(models.User).filter(models.User.username == username).first()
+    )
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already in use")
 
@@ -1537,10 +1717,14 @@ def create_user(
     session.commit()
 
     if HAS_TEAM:
-        team_invitations = session.query(models.TeamInvitation).filter(
-            models.TeamInvitation.email == username,
-            models.TeamInvitation.status == "pending",
-        ).all()
+        team_invitations = (
+            session.query(models.TeamInvitation)
+            .filter(
+                models.TeamInvitation.email == username,
+                models.TeamInvitation.status == "pending",
+            )
+            .all()
+        )
 
         for invitation in team_invitations:
             emailer.connect()
@@ -1551,7 +1735,7 @@ def create_user(
                 html=f"""
                 <p>{invitation.inviter.name} has invited you to join their team on Compair!</p>
                 <p>Click <a href="https://{WEB_URL}/accept-invitation?token={invitation.invitation_id}">here</a> to join.</p>
-                """
+                """,
             )
             invitation.status = "sent"
             session.commit()
@@ -1565,7 +1749,7 @@ def create_user(
             group_image=None,
             category="Private",
             description=f"A private group for {username}",
-            visibility="private"
+            visibility="private",
         )
         admin = models.Administrator(user_id=user.user_id)
         session.add(admin)
@@ -1573,11 +1757,15 @@ def create_user(
         session.commit()
         group.admins.append(admin)
         user.groups = [group]
-    
+
     # Track referral if a code is provided
     if referral_code:
         require_feature(HAS_REFERRALS, "Referral program")
-        referrer = session.query(models.User).filter(models.User.referral_code == referral_code).first()
+        referrer = (
+            session.query(models.User)
+            .filter(models.User.referral_code == referral_code)
+            .first()
+        )
         if referrer and hasattr(referrer, "referral_credits"):
             max_credits = 3
             if referrer.referral_credits <= max_credits * 10:  # $10 per credit
@@ -1586,7 +1774,7 @@ def create_user(
                 if hasattr(referrer, "pending_referral_credits"):
                     referrer.pending_referral_credits += 10  # Add pending credit
                 session.commit()
-    
+
     session.add(user)
     session.commit()
     if analytics is not None:
@@ -1613,10 +1801,14 @@ def _activate_user_account(
     if not send_group_invites:
         return
 
-    pending_invitations = session.query(models.GroupInvitation).filter(
-        models.GroupInvitation.email == user.username,
-        models.GroupInvitation.status == "pending"
-    ).all()
+    pending_invitations = (
+        session.query(models.GroupInvitation)
+        .filter(
+            models.GroupInvitation.email == user.username,
+            models.GroupInvitation.status == "pending",
+        )
+        .all()
+    )
     for invitation in pending_invitations:
         invitation.status = "sent"
         if not invitation.token:
@@ -1632,13 +1824,9 @@ def _activate_user_account(
             subject="You’re Invited to Join a Group on Compair",
             sender=EMAIL_USER,
             receivers=[user.username],
-            html=GROUP_INVITATION_TEMPLATE.replace(
-                "{{inviter_name}}", inviter.name
-            ).replace(
-                "{{group_name}}", group.name
-            ).replace(
-                "{{invitation_link}}", invitation_link
-            )
+            html=GROUP_INVITATION_TEMPLATE.replace("{{inviter_name}}", inviter.name)
+            .replace("{{group_name}}", group.name)
+            .replace("{{invitation_link}}", invitation_link),
         )
 
 
@@ -1652,15 +1840,24 @@ def load_session(auth_token: str | None = None) -> schema.Session | None:
             return schema.Session.model_validate(session_model, from_attributes=True)
     with compair.Session() as session:
         if not auth_token:
-            raise HTTPException(status_code=400, detail="auth_token is required when authentication is enabled.")
-        user_session = session.query(models.Session).filter(models.Session.id == auth_token).first()
+            raise HTTPException(
+                status_code=400,
+                detail="auth_token is required when authentication is enabled.",
+            )
+        user_session = (
+            session.query(models.Session)
+            .filter(models.Session.id == auth_token)
+            .first()
+        )
         if not user_session:
             raise HTTPException(status_code=404, detail="Session not found")
         valid_until = user_session.datetime_valid_until
         if valid_until.tzinfo is None:
             valid_until = valid_until.replace(tzinfo=timezone.utc)
         if valid_until < datetime.now(timezone.utc):
-            raise HTTPException(status_code=401, detail="Invalid or expired session token")
+            raise HTTPException(
+                status_code=401, detail="Invalid or expired session token"
+            )
         return schema.Session.model_validate(user_session, from_attributes=True)
 
 
@@ -1673,7 +1870,7 @@ def update_user(
     default_publish: str = Form(None),
     preferred_feedback_length: str = Form(None),
     hide_affiliations: str = Form(None),
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ):
     with compair.Session() as session:
         if name is not None:
@@ -1686,7 +1883,9 @@ def update_user(
             current_user.groups.extend(groups)
         if include_own_documents_in_feedback is not None:
             # Convert string to bool
-            current_user.include_own_documents_in_feedback = include_own_documents_in_feedback.lower() == "true"
+            current_user.include_own_documents_in_feedback = (
+                include_own_documents_in_feedback.lower() == "true"
+            )
         if default_publish is not None:
             current_user.default_publish = default_publish.lower() == "true"
         if preferred_feedback_length is not None:
@@ -1702,18 +1901,19 @@ def update_user(
         session.add(current_user)
         session.commit()
 
+
 @router.get("/update_session_duration")
 def update_session_duration(
     user_session: schema.Session,
     new_valid_until: datetime,
 ) -> None:
     with compair.Session() as session:
-        user_session = session.query(
-            models.Session
-        ).filter(
-            models.Session.id == user_session.id
-        ).first()
-        user_session.update({'datetime_valid_until': new_valid_until})
+        user_session = (
+            session.query(models.Session)
+            .filter(models.Session.id == user_session.id)
+            .first()
+        )
+        user_session.update({"datetime_valid_until": new_valid_until})
         session.commit()
 
 
@@ -1729,29 +1929,33 @@ def _delete_note_records(session: Session, note_ids: list[str]) -> None:
     if chunk_model is not None:
         chunk_ids = [
             row[0]
-            for row in session.query(chunk_model.chunk_id).filter(chunk_model.note_id.in_(note_ids)).all()
+            for row in session.query(chunk_model.chunk_id)
+            .filter(chunk_model.note_id.in_(note_ids))
+            .all()
         ]
     if feedback_model is not None and chunk_ids:
         session.query(feedback_model).filter(
-            feedback_model.source_chunk_id.in_(chunk_ids)
+            feedback_model.source_chunk_id.in_(chunk_ids),
+            text("baseline_retrieval_run_id IS NULL"),
         ).delete(synchronize_session=False)
     if reference_model is not None:
         if chunk_ids:
             session.query(reference_model).filter(
-                reference_model.source_chunk_id.in_(chunk_ids)
+                reference_model.source_chunk_id.in_(chunk_ids),
+                text("baseline_selected_evidence_id IS NULL"),
             ).delete(synchronize_session=False)
         if hasattr(reference_model, "reference_note_id"):
             session.query(reference_model).filter(
                 reference_model.reference_note_id.in_(note_ids)
             ).delete(synchronize_session=False)
     if chunk_model is not None and chunk_ids:
-        session.query(chunk_model).filter(
-            chunk_model.chunk_id.in_(chunk_ids)
-        ).delete(synchronize_session=False)
+        session.query(chunk_model).filter(chunk_model.chunk_id.in_(chunk_ids)).delete(
+            synchronize_session=False
+        )
     if note_model is not None:
-        session.query(note_model).filter(
-            note_model.note_id.in_(note_ids)
-        ).delete(synchronize_session=False)
+        session.query(note_model).filter(note_model.note_id.in_(note_ids)).delete(
+            synchronize_session=False
+        )
 
 
 def _delete_document_records(session: Session, doc_ids: list[str]) -> None:
@@ -1769,7 +1973,9 @@ def _delete_document_records(session: Session, doc_ids: list[str]) -> None:
     if note_model is not None:
         note_ids = [
             row[0]
-            for row in session.query(note_model.note_id).filter(note_model.document_id.in_(doc_ids)).all()
+            for row in session.query(note_model.note_id)
+            .filter(note_model.document_id.in_(doc_ids))
+            .all()
         ]
         _delete_note_records(session, note_ids)
 
@@ -1777,25 +1983,29 @@ def _delete_document_records(session: Session, doc_ids: list[str]) -> None:
     if chunk_model is not None:
         chunk_ids = [
             row[0]
-            for row in session.query(chunk_model.chunk_id).filter(chunk_model.document_id.in_(doc_ids)).all()
+            for row in session.query(chunk_model.chunk_id)
+            .filter(chunk_model.document_id.in_(doc_ids))
+            .all()
         ]
     if feedback_model is not None and chunk_ids:
         session.query(feedback_model).filter(
-            feedback_model.source_chunk_id.in_(chunk_ids)
+            feedback_model.source_chunk_id.in_(chunk_ids),
+            text("baseline_retrieval_run_id IS NULL"),
         ).delete(synchronize_session=False)
     if reference_model is not None:
         if chunk_ids:
             session.query(reference_model).filter(
-                reference_model.source_chunk_id.in_(chunk_ids)
+                reference_model.source_chunk_id.in_(chunk_ids),
+                text("baseline_selected_evidence_id IS NULL"),
             ).delete(synchronize_session=False)
         if hasattr(reference_model, "reference_document_id"):
             session.query(reference_model).filter(
                 reference_model.reference_document_id.in_(doc_ids)
             ).delete(synchronize_session=False)
     if chunk_model is not None and chunk_ids:
-        session.query(chunk_model).filter(
-            chunk_model.chunk_id.in_(chunk_ids)
-        ).delete(synchronize_session=False)
+        session.query(chunk_model).filter(chunk_model.chunk_id.in_(chunk_ids)).delete(
+            synchronize_session=False
+        )
     if document_to_group_table is not None:
         session.execute(
             document_to_group_table.delete().where(
@@ -1820,22 +2030,31 @@ def _cleanup_user_group_memberships(session: Session, db_user: models.User) -> N
         .filter(models.Group.users.any(models.User.user_id == db_user.user_id))
     )
     for group in group_query.all():
-        remaining_users = [user for user in group.users if user.user_id != db_user.user_id]
-        current_admin = next((admin for admin in group.admins if admin.user_id == db_user.user_id), None)
+        remaining_users = [
+            user for user in group.users if user.user_id != db_user.user_id
+        ]
+        current_admin = next(
+            (admin for admin in group.admins if admin.user_id == db_user.user_id), None
+        )
 
         if not remaining_users:
-            unique_doc_ids = [doc.document_id for doc in group.documents if len(doc.groups) <= 1]
+            unique_doc_ids = [
+                doc.document_id for doc in group.documents if len(doc.groups) <= 1
+            ]
             _delete_document_records(session, unique_doc_ids)
             session.delete(group)
             continue
 
         if current_admin and admin_model is not None:
-            remaining_admins = [admin for admin in group.admins if admin.user_id != db_user.user_id]
+            remaining_admins = [
+                admin for admin in group.admins if admin.user_id != db_user.user_id
+            ]
             if not remaining_admins:
                 promoted_user = sorted(
                     remaining_users,
                     key=lambda candidate: (
-                        candidate.datetime_registered or datetime(1970, 1, 1, tzinfo=timezone.utc),
+                        candidate.datetime_registered
+                        or datetime(1970, 1, 1, tzinfo=timezone.utc),
                         candidate.user_id,
                     ),
                 )[0]
@@ -1848,7 +2067,9 @@ def _cleanup_user_group_memberships(session: Session, db_user: models.User) -> N
                     promoted_admin = admin_model(user_id=promoted_user.user_id)
                     session.add(promoted_admin)
                     session.flush()
-                if not any(admin.user_id == promoted_user.user_id for admin in group.admins):
+                if not any(
+                    admin.user_id == promoted_user.user_id for admin in group.admins
+                ):
                     group.admins.append(promoted_admin)
         for admin in list(group.admins):
             if admin.user_id == db_user.user_id:
@@ -1860,7 +2081,9 @@ def _cleanup_user_group_memberships(session: Session, db_user: models.User) -> N
     user_to_group_table = getattr(models, "user_to_group_table", None)
     if user_to_group_table is not None:
         session.execute(
-            user_to_group_table.delete().where(user_to_group_table.c.user_id == db_user.user_id)
+            user_to_group_table.delete().where(
+                user_to_group_table.c.user_id == db_user.user_id
+            )
         )
 
 
@@ -1872,7 +2095,9 @@ def _delete_user_related_rows(session: Session, user_id: str, username: str) -> 
     if document_model is not None and hasattr(document_model, "user_id"):
         doc_ids = [
             row[0]
-            for row in session.query(document_model.document_id).filter(document_model.user_id == user_id).all()
+            for row in session.query(document_model.document_id)
+            .filter(document_model.user_id == user_id)
+            .all()
         ]
     _delete_document_records(session, doc_ids)
 
@@ -1880,7 +2105,9 @@ def _delete_user_related_rows(session: Session, user_id: str, username: str) -> 
     if note_model is not None and hasattr(note_model, "author_id"):
         note_ids = [
             row[0]
-            for row in session.query(note_model.note_id).filter(note_model.author_id == user_id).all()
+            for row in session.query(note_model.note_id)
+            .filter(note_model.author_id == user_id)
+            .all()
         ]
     _delete_note_records(session, note_ids)
 
@@ -1900,7 +2127,9 @@ def _delete_user_related_rows(session: Session, user_id: str, username: str) -> 
         model = getattr(models, model_name, None)
         if model is None or not hasattr(model, field_name):
             continue
-        session.query(model).filter(getattr(model, field_name) == value).delete(synchronize_session=False)
+        session.query(model).filter(getattr(model, field_name) == value).delete(
+            synchronize_session=False
+        )
 
     group_invitation_model = getattr(models, "GroupInvitation", None)
     if group_invitation_model is not None:
@@ -1910,7 +2139,9 @@ def _delete_user_related_rows(session: Session, user_id: str, username: str) -> 
         if hasattr(group_invitation_model, "email") and username:
             clauses.append(func.lower(group_invitation_model.email) == username.lower())
         if clauses:
-            session.query(group_invitation_model).filter(or_(*clauses)).delete(synchronize_session=False)
+            session.query(group_invitation_model).filter(or_(*clauses)).delete(
+                synchronize_session=False
+            )
 
     team_invitation_model = getattr(models, "TeamInvitation", None)
     if team_invitation_model is not None:
@@ -1920,7 +2151,9 @@ def _delete_user_related_rows(session: Session, user_id: str, username: str) -> 
         if hasattr(team_invitation_model, "email") and username:
             clauses.append(func.lower(team_invitation_model.email) == username.lower())
         if clauses:
-            session.query(team_invitation_model).filter(or_(*clauses)).delete(synchronize_session=False)
+            session.query(team_invitation_model).filter(or_(*clauses)).delete(
+                synchronize_session=False
+            )
 
 
 def _scrub_deleted_user(session: Session, db_user: models.User) -> None:
@@ -1958,14 +2191,19 @@ def _scrub_deleted_user(session: Session, db_user: models.User) -> None:
 
 
 @router.get("/delete_user")
-def delete_user(
-    current_user: models.User = Depends(get_current_user)
-):
+def delete_user(current_user: models.User = Depends(get_current_user)):
     settings = get_settings_dependency()
     if not settings.require_authentication:
-        raise HTTPException(status_code=403, detail="Deleting the local user is not supported when authentication is disabled.")
+        raise HTTPException(
+            status_code=403,
+            detail="Deleting the local user is not supported when authentication is disabled.",
+        )
     with compair.Session() as session:
-        db_user = session.query(models.User).filter(models.User.user_id == current_user.user_id).first()
+        db_user = (
+            session.query(models.User)
+            .filter(models.User.user_id == current_user.user_id)
+            .first()
+        )
         if not db_user:
             raise HTTPException(status_code=404, detail="User not found")
         username = str(db_user.username or "").strip()
@@ -1977,11 +2215,17 @@ def delete_user(
             return {"message": "User deleted", "anonymized": False}
         except IntegrityError:
             session.rollback()
-            db_user = session.query(models.User).filter(models.User.user_id == current_user.user_id).first()
+            db_user = (
+                session.query(models.User)
+                .filter(models.User.user_id == current_user.user_id)
+                .first()
+            )
             if not db_user:
                 return {"message": "User deleted", "anonymized": False}
             _cleanup_user_group_memberships(session, db_user)
-            _delete_user_related_rows(session, db_user.user_id, str(db_user.username or "").strip())
+            _delete_user_related_rows(
+                session, db_user.user_id, str(db_user.username or "").strip()
+            )
             _scrub_deleted_user(session, db_user)
             session.commit()
             return {"message": "User deleted", "anonymized": True}
@@ -1992,16 +2236,21 @@ def load_connections(
     page: int = 1,
     page_size: int = 10,
     filter_type: str | None = None,
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ) -> dict | None:
     with compair.Session() as session:
         now = datetime.now(timezone.utc)
         week_ago = now - timedelta(days=7)
 
         # Get all groups the user belongs to
-        groups = session.query(models.Group).options(joinedload(models.Group.users)).filter(
-            models.Group.group_id.in_([g.group_id for g in current_user.groups])
-        ).all()
+        groups = (
+            session.query(models.Group)
+            .options(joinedload(models.Group.users))
+            .filter(
+                models.Group.group_id.in_([g.group_id for g in current_user.groups])
+            )
+            .all()
+        )
         if not groups:
             return {"connections": [], "total_count": 0}
 
@@ -2009,29 +2258,39 @@ def load_connections(
         connection_ids = set()
         for group in groups:
             for group_user in group.users:
-                if group_user.user_id != current_user.user_id:  # Exclude the requesting user
+                if (
+                    group_user.user_id != current_user.user_id
+                ):  # Exclude the requesting user
                     connection_ids.add(group_user.user_id)
 
         # Fetch the User objects for the collected IDs
         q = session.query(models.User).filter(models.User.user_id.in_(connection_ids))
-        
+
         # --- Filter logic ---
         if filter_type == "recently_active":
             q = q.join(models.User.activities).filter(
                 models.Activity.action == "create",
-                models.Activity.timestamp >= week_ago
+                models.Activity.timestamp >= week_ago,
             )
         elif filter_type == "recently_compaired":
             # Their doc was used for feedback on your doc, or vice versa, in the past week
-            q = q.join(models.User.documents).join(models.Document.chunks).join(models.Chunk.feedbacks).filter(
-                models.Feedback.timestamp >= week_ago
+            q = (
+                q.join(models.User.documents)
+                .join(models.Document.chunks)
+                .join(models.Chunk.feedbacks)
+                .filter(models.Feedback.timestamp >= week_ago)
             )
         else:
             q = q.order_by(models.User.name.asc())
-        
+
         total_count = q.count()
         offset = (page - 1) * page_size
-        connections = q.order_by(models.User.datetime_registered.desc()).offset(offset).limit(page_size).all()
+        connections = (
+            q.order_by(models.User.datetime_registered.desc())
+            .offset(offset)
+            .limit(page_size)
+            .all()
+        )
 
         # Convert users to dictionary format
         return {
@@ -2047,14 +2306,12 @@ def load_connections(
                 }
                 for connection in connections
             ],
-            "total_count": total_count
+            "total_count": total_count,
         }
 
 
 @router.get("/all_group_categories")
-def all_group_categories(
-    current_user: models.User = Depends(get_current_user)
-):
+def all_group_categories(current_user: models.User = Depends(get_current_user)):
     """Return all unique group categories."""
     with compair.Session() as session:
         categories = (
@@ -2063,7 +2320,7 @@ def all_group_categories(
             .all()
         )
         # Flatten list of tuples and filter out None/empty
-        categories = [c[0] for c in categories if c[0] and c[0]!='Compair']
+        categories = [c[0] for c in categories if c[0] and c[0] != "Compair"]
         return {"categories": categories}
 
 
@@ -2078,16 +2335,16 @@ def load_groups(
     sort: str | None = None,
     query: str | None = None,
     own_groups_only: bool = False,
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ) -> dict | None:
     with compair.Session() as session:
         # --- User-based group selection ---
         if user_id is None:
-            q = session.query(models.Group).filter(
-                models.Group.visibility != 'private'
-            )
+            q = session.query(models.Group).filter(models.Group.visibility != "private")
         else:
-            user_group_ids = _member_group_ids(session, current_user.user_id, exclude_compair=True)
+            user_group_ids = _member_group_ids(
+                session, current_user.user_id, exclude_compair=True
+            )
             invited_group_ids = _invited_group_ids(session, current_user.username)
             accessible_group_ids = set(user_group_ids) | invited_group_ids
 
@@ -2099,8 +2356,8 @@ def load_groups(
             else:
                 # All groups user can access: public, or private/internal if a member, or groups with an invitation
                 q = session.query(models.Group).filter(
-                    (models.Group.visibility == "public") |
-                    (models.Group.group_id.in_(accessible_group_ids))
+                    (models.Group.visibility == "public")
+                    | (models.Group.group_id.in_(accessible_group_ids))
                 )
 
         # --- Filtering ---
@@ -2109,27 +2366,43 @@ def load_groups(
         if visibility and visibility.lower() != "all":
             q = q.filter(models.Group.visibility == visibility)
         if filter_type == "joined" and user_id:
-            #user = session.query(models.User).filter(models.User.user_id == user_id).first()
-            #q = q.filter(models.Group.group_id.in_([g.group_id for g in user.groups]))
+            # user = session.query(models.User).filter(models.User.user_id == user_id).first()
+            # q = q.filter(models.Group.group_id.in_([g.group_id for g in user.groups]))
             # Already constrained above if own_groups_only is True
             pass
         if filter_type == "pending" and user_id:
             # Groups with pending join requests or invitations for this user
-            user = session.query(models.User).filter(models.User.user_id == current_user.user_id).first()
+            user = (
+                session.query(models.User)
+                .filter(models.User.user_id == current_user.user_id)
+                .first()
+            )
             pending_group_ids = set()
-            invitations = session.query(models.GroupInvitation).filter(
-                models.GroupInvitation.email == user.username,
-                models.GroupInvitation.status == "sent"
-            ).all()
+            invitations = (
+                session.query(models.GroupInvitation)
+                .filter(
+                    models.GroupInvitation.email == user.username,
+                    models.GroupInvitation.status == "sent",
+                )
+                .all()
+            )
             pending_group_ids.update([i.group_id for i in invitations])
             q = q.filter(models.Group.group_id.in_(pending_group_ids))
         if query:
             q = q.filter(models.Group.name.ilike(f"%{query}%"))
         # --- Sorting ---
         if sort == "popular":
-            q = q.outerjoin(models.Group.users).group_by(models.Group.group_id).order_by(func.count(models.User.user_id).desc())
+            q = (
+                q.outerjoin(models.Group.users)
+                .group_by(models.Group.group_id)
+                .order_by(func.count(models.User.user_id).desc())
+            )
         elif sort == "recently_updated":
-            q = q.outerjoin(models.Group.documents).group_by(models.Group.group_id).order_by(func.max(models.Document.datetime_modified).desc())
+            q = (
+                q.outerjoin(models.Group.documents)
+                .group_by(models.Group.group_id)
+                .order_by(func.max(models.Document.datetime_modified).desc())
+            )
         elif sort == "recently_created":
             q = q.order_by(models.Group.datetime_created.desc())
         else:
@@ -2154,7 +2427,9 @@ def load_groups(
                 "visibility": group.visibility,
                 "document_count": document_counts.get(group.group_id, 0),
                 "user_count": user_counts.get(group.group_id, 0),
-                "first_three_user_profile_images": profile_images.get(group.group_id, []),
+                "first_three_user_profile_images": profile_images.get(
+                    group.group_id, []
+                ),
             }
             for group in groups
         ]
@@ -2163,37 +2438,27 @@ def load_groups(
 
 def load_groups_by_ids(group_ids: list[str]) -> list[schema.Group]:
     with compair.Session() as session:
-        q = session.query(models.Group).filter(
-            models.Group.group_id.in_(group_ids)
-        )
+        q = session.query(models.Group).filter(models.Group.group_id.in_(group_ids))
         return q.all()  # Returns list of Group objects directly
 
 
 @router.get("/load_group")
 def load_group(
-    name: str | None = None,
-    group_id: str | None = None
+    name: str | None = None, group_id: str | None = None
 ) -> schema.Group | None:
     if (name is not None) or (group_id is not None):
         with compair.Session() as session:
             if group_id is not None:
-                q = select(models.Group).filter(
-                    models.Group.group_id==group_id
-                )
+                q = select(models.Group).filter(models.Group.group_id == group_id)
             else:
-                q = select(models.Group).filter(
-                    models.Group.name.match(name)
-                )
+                q = select(models.Group).filter(models.Group.name.match(name))
             group = session.execute(q).fetchone()
             if group is None:
                 return None
             return group[0]
 
 
-def notify_group_admins(
-    group: models.Group, 
-    user_id: str
-):
+def notify_group_admins(group: models.Group, user_id: str):
     """Send an email notification to group admins."""
     with compair.Session() as session:
         admin_emails = [admin.user.username for admin in group.admins]
@@ -2206,42 +2471,45 @@ def notify_group_admins(
             subject="Group Join Request",
             sender=EMAIL_USER,
             receivers=admin_emails,
-            html=GROUP_JOIN_TEMPLATE.replace(
-                "{{ user_name }}", user.username
-            ).replace(
-                "{{ group_name }}", group.name
-            ).replace(
-                "{{ admin_panel_url }}", f"http://{WEB_URL}/admin/groups"
-            )
+            html=GROUP_JOIN_TEMPLATE.replace("{{ user_name }}", user.username)
+            .replace("{{ group_name }}", group.name)
+            .replace("{{ admin_panel_url }}", f"http://{WEB_URL}/admin/groups"),
         )
+
 
 @router.post("/join_group")
 def join_group(
-    group_id: str = Form(...),
-    current_user: models.User = Depends(get_current_user)
+    group_id: str = Form(...), current_user: models.User = Depends(get_current_user)
 ):
-    return join_group_direct(
-        user_id=current_user.user_id, 
-        group_id=group_id
-    )
+    return join_group_direct(user_id=current_user.user_id, group_id=group_id)
 
-def join_group_direct(
-    user_id: str, 
-    group_id: str
-):
+
+def join_group_direct(user_id: str, group_id: str):
     """Join a group based on its visibility."""
     with compair.Session() as session:
-        group = session.query(models.Group).filter(models.Group.group_id == group_id).first()
+        group = (
+            session.query(models.Group)
+            .filter(models.Group.group_id == group_id)
+            .first()
+        )
         if not group:
             raise HTTPException(status_code=404, detail="Group not found")
         if group.visibility in ["public", "internal"]:
-            user = session.query(models.User).filter(models.User.user_id == user_id).first()
+            user = (
+                session.query(models.User)
+                .filter(models.User.user_id == user_id)
+                .first()
+            )
             # Look for any existing invitations associated with this group
-            invitations = session.query(models.GroupInvitation).filter(
-                models.GroupInvitation.group_id == group_id,
-                models.GroupInvitation.email == user.username,
-                models.GroupInvitation.status == "sent"
-            ).all()
+            invitations = (
+                session.query(models.GroupInvitation)
+                .filter(
+                    models.GroupInvitation.group_id == group_id,
+                    models.GroupInvitation.email == user.username,
+                    models.GroupInvitation.status == "sent",
+                )
+                .all()
+            )
             for invitation in invitations:
                 invitation.status = "accepted"
 
@@ -2249,32 +2517,36 @@ def join_group_direct(
                 group.users.append(user)
                 session.commit()
                 log_activity(
-                    session=session, 
-                    user_id=user_id, 
+                    session=session,
+                    user_id=user_id,
                     group_id=group.group_id,
-                    action="join", 
-                    object_id=group.group_id, 
+                    action="join",
+                    object_id=group.group_id,
                     object_name=group.name,
-                    object_type="group"
+                    object_type="group",
                 )
                 return {"message": "Joined group successfully"}
-            
+
             elif group.visibility == "internal":
-                if len(invitations)>0:
-                     # Invitation found; add to group
+                if len(invitations) > 0:
+                    # Invitation found; add to group
                     group.users.append(user)
                     session.commit()
                 else:
                     # Create a JoinRequest if not already present
-                    existing_request = session.query(models.JoinRequest).filter(
-                        models.JoinRequest.user_id == user_id,
-                        models.JoinRequest.group_id == group_id
-                    ).first()
+                    existing_request = (
+                        session.query(models.JoinRequest)
+                        .filter(
+                            models.JoinRequest.user_id == user_id,
+                            models.JoinRequest.group_id == group_id,
+                        )
+                        .first()
+                    )
                     if not existing_request:
                         join_request = models.JoinRequest(
                             user_id=user_id,
                             group_id=group_id,
-                            datetime_requested=datetime.now(timezone.utc)
+                            datetime_requested=datetime.now(timezone.utc),
                         )
                         session.add(join_request)
                         session.commit()
@@ -2282,7 +2554,9 @@ def join_group_direct(
                 return {"message": "Join request sent to group admins"}
 
         elif group.visibility == "private":
-            raise HTTPException(status_code=403, detail="Cannot join private group without an invite")
+            raise HTTPException(
+                status_code=403, detail="Cannot join private group without an invite"
+            )
 
 
 @router.post("/create_group")
@@ -2292,17 +2566,19 @@ async def create_group(
     description: str = Form(None),
     visibility: str = Form("public"),
     file: UploadFile = File(None),  # Allow optional file upload
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ):
     with compair.Session() as session:
-        if category not in all_group_categories()['categories']:
+        if category not in all_group_categories()["categories"]:
             category = "Other"  # Default to "Other" if category is not valid
 
         # Limit internal group creation to active, team plans
-        if visibility == 'internal' and not (current_user.status == 'active' and _user_plan(current_user) == 'team'):
+        if visibility == "internal" and not (
+            current_user.status == "active" and _user_plan(current_user) == "team"
+        ):
             raise HTTPException(
-                status_code=403, 
-                detail="Internal groups can only be created by users with an active team plan"
+                status_code=403,
+                detail="Internal groups can only be created by users with an active team plan",
             )
 
         created_group = models.Group(
@@ -2315,7 +2591,7 @@ async def create_group(
         )
         # Check if user has an admin ID
         q = select(models.Administrator).filter(
-            models.Administrator.user_id==current_user.user_id
+            models.Administrator.user_id == current_user.user_id
         )
         admin = session.execute(q).fetchone()
         if admin is None:
@@ -2331,13 +2607,13 @@ async def create_group(
 
         # Log activity
         log_activity(
-            session=session, 
-            user_id=current_user.user_id, 
+            session=session,
+            user_id=current_user.user_id,
             group_id=created_group.group_id,
-            action="create", 
-            object_id=created_group.group_id, 
+            action="create",
+            object_id=created_group.group_id,
             object_name=created_group.name,
-            object_type="group"
+            object_type="group",
         )
 
         # Add group to user
@@ -2347,9 +2623,7 @@ async def create_group(
 
         if file is not None:
             await upload_group_image(
-                group_id=created_group.group_id,
-                upload_type='group',
-                file=file
+                group_id=created_group.group_id, upload_type="group", file=file
             )
         return {
             "group_id": created_group.group_id,
@@ -2380,10 +2654,15 @@ def _document_user_list_item(user: models.User | None) -> dict[str, Any] | None:
         "name": getattr(user, "name", ""),
         "datetime_registered": getattr(user, "datetime_registered", None),
         "status": getattr(user, "status", ""),
-        "groups": [_document_group_list_item(group) for group in (getattr(user, "groups", None) or [])],
+        "groups": [
+            _document_group_list_item(group)
+            for group in (getattr(user, "groups", None) or [])
+        ],
         "profile_image": getattr(user, "profile_image", None),
         "role": getattr(user, "role", None),
-        "include_own_documents_in_feedback": getattr(user, "include_own_documents_in_feedback", None),
+        "include_own_documents_in_feedback": getattr(
+            user, "include_own_documents_in_feedback", None
+        ),
         "preferred_feedback_length": getattr(user, "preferred_feedback_length", None),
     }
 
@@ -2393,7 +2672,10 @@ def _document_list_item(document: models.Document) -> dict[str, Any]:
         "document_id": document.document_id,
         "user_id": document.user_id,
         "author_id": document.author_id,
-        "groups": [_document_group_list_item(group) for group in (getattr(document, "groups", None) or [])],
+        "groups": [
+            _document_group_list_item(group)
+            for group in (getattr(document, "groups", None) or [])
+        ],
         "user": _document_user_list_item(getattr(document, "user", None)),
         "title": document.title,
         # List views should never ship full repo snapshots; callers can fetch one document by id.
@@ -2425,17 +2707,25 @@ def _document_content_slice(
 ) -> tuple[str, int | None, bool]:
     length_expr = func.length(models.Document.content)
     if full_content:
-        row = session.query(models.Document.content, length_expr).filter(
-            models.Document.document_id == document_id
-        ).first()
+        row = (
+            session.query(models.Document.content, length_expr)
+            .filter(models.Document.document_id == document_id)
+            .first()
+        )
     elif content_max_chars > 0:
-        row = session.query(func.substr(models.Document.content, 1, content_max_chars), length_expr).filter(
-            models.Document.document_id == document_id
-        ).first()
+        row = (
+            session.query(
+                func.substr(models.Document.content, 1, content_max_chars), length_expr
+            )
+            .filter(models.Document.document_id == document_id)
+            .first()
+        )
     else:
-        row = session.query(length_expr).filter(
-            models.Document.document_id == document_id
-        ).first()
+        row = (
+            session.query(length_expr)
+            .filter(models.Document.document_id == document_id)
+            .first()
+        )
         if row is not None:
             return "", int(row[0] or 0), bool(row[0] or 0)
 
@@ -2473,7 +2763,7 @@ def load_doc(
     page_size: int = 10,
     filter_type: str | None = None,
     own_documents_only: bool = True,
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ) -> Mapping[str, Any] | None:
     page = max(page, 1)
     page_size = min(max(page_size, 1), 50)
@@ -2494,10 +2784,8 @@ def load_doc(
             if group_id:
                 q = q.filter(models.Group.group_id == group_id)
             q = q.filter(
-                (models.Group.visibility == "public") |
-                (
-                    models.Group.group_id.in_(user_group_ids)
-                )
+                (models.Group.visibility == "public")
+                | (models.Group.group_id.in_(user_group_ids))
             )
 
         if group_id is not None and own_documents_only:
@@ -2512,38 +2800,172 @@ def load_doc(
             q = q.filter(
                 or_(
                     models.Document.is_published == True,
-                    models.Document.user_id == current_user.user_id
+                    models.Document.user_id == current_user.user_id,
                 )
             )
-        
+
         # --- Filter logic: other ---
         if filter_type == "recently_updated":
             # Documents updated OR with a note in the past week
             q = q.outerjoin(models.Document.notes).filter(
                 or_(
                     models.Document.datetime_modified >= week_ago,
-                    models.Note.datetime_created >= week_ago
+                    models.Note.datetime_created >= week_ago,
                 )
             )
         elif filter_type == "recently_compaired":
             # Documents with feedback in the past week
-            q = q.join(models.Document.chunks).join(models.Chunk.feedbacks).filter(
-                models.Feedback.timestamp >= week_ago
+            q = (
+                q.join(models.Document.chunks)
+                .join(models.Chunk.feedbacks)
+                .filter(models.Feedback.timestamp >= week_ago)
             )
         # Default: all, sorted by last update
         q = q.order_by(models.Document.datetime_modified.desc())
 
         total_count = q.order_by(None).count()
         if total_count == 0:
-            return {
-                "documents": [],
-                "total_count": 0
-            }
+            return {"documents": [], "total_count": 0}
 
         # Paging
         offset = (page - 1) * page_size
-        documents = session.execute(
-            q.options(
+        documents = (
+            session.execute(
+                q.options(
+                    load_only(
+                        models.Document.document_id,
+                        models.Document.user_id,
+                        models.Document.author_id,
+                        models.Document.title,
+                        models.Document.doc_type,
+                        models.Document.datetime_created,
+                        models.Document.datetime_modified,
+                        models.Document.is_published,
+                        models.Document.file_key,
+                        models.Document.image_key,
+                        models.Document.topic_tags,
+                    ),
+                    joinedload(models.Document.groups).load_only(
+                        models.Group.group_id,
+                        models.Group.name,
+                        models.Group.datetime_created,
+                        models.Group.group_image,
+                        models.Group.category,
+                        models.Group.description,
+                        models.Group.visibility,
+                    ),
+                    joinedload(models.Document.user).load_only(
+                        models.User.user_id,
+                        models.User.username,
+                        models.User.name,
+                        models.User.datetime_registered,
+                        models.User.status,
+                        models.User.profile_image,
+                        models.User.role,
+                        models.User.include_own_documents_in_feedback,
+                        models.User.preferred_feedback_length,
+                    ),
+                    joinedload(models.Document.user)
+                    .joinedload(models.User.groups)
+                    .load_only(
+                        models.Group.group_id,
+                        models.Group.name,
+                        models.Group.datetime_created,
+                        models.Group.group_image,
+                        models.Group.category,
+                        models.Group.description,
+                        models.Group.visibility,
+                    ),
+                )
+                .order_by(models.Document.datetime_created.desc())
+                .offset(offset)
+                .limit(page_size)
+            )
+            .unique()
+            .fetchall()
+        )
+        if documents is None or len(documents) == 0:
+            return {"documents": [], "total_count": 0}
+        return {
+            "documents": [_document_list_item(d[0]) for d in documents],
+            "total_count": total_count,
+        }
+
+
+@router.get("/load_group_users")
+def load_group_users(
+    group_id: str,
+    page: int = 1,
+    page_size: int = 10,
+    filter_type: str | None = None,
+    current_user: models.User = Depends(get_current_user),
+) -> dict:
+    with compair.Session() as session:
+        # Check if the group exists
+        group = (
+            session.query(models.Group)
+            .filter(models.Group.group_id == group_id)
+            .first()
+        )
+        if not group:
+            raise HTTPException(status_code=404, detail="Group not found")
+
+        if (current_user not in group.users) & (group.visibility != "public"):
+            raise HTTPException(
+                status_code=403, detail="User does not belong to the group"
+            )
+
+        # Retrieve all users associated with the group
+        users_query = (
+            session.query(models.User)
+            .join(models.User.groups)
+            .filter(models.Group.group_id == group_id)
+        )
+
+        # --- Filter logic ---
+        if filter_type == "recently_active":
+            users_query = users_query.order_by(models.User.status_change_date.desc())
+        elif filter_type == "recently_joined":
+            users_query = users_query.order_by(models.User.datetime_registered.desc())
+        else:
+            users_query = users_query.order_by(models.User.name.asc())
+
+        total_count = users_query.count()
+        offset = (page - 1) * page_size
+        users = users_query.offset(offset).limit(page_size).all()
+
+        # Convert users to schema objects
+        return {
+            "users": [
+                {
+                    "user_id": u.user_id,
+                    "username": u.username,
+                    "name": u.name,
+                    "datetime_registered": u.datetime_registered,
+                    "status": u.status,
+                    "profile_image": u.profile_image,
+                    "role": u.role,
+                }
+                for u in users
+            ],
+            "total_count": total_count,
+        }
+
+
+@router.get("/load_document")
+def load_doc(
+    title: str,
+    full_content: bool = False,
+    content_max_chars: int = DEFAULT_DOCUMENT_DETAIL_CONTENT_CHARS,
+    current_user: models.User = Depends(get_current_user),
+) -> Mapping[str, Any] | None:
+    content_max_chars = _clamp_content_max_chars(content_max_chars)
+    with compair.Session() as session:
+        q = (
+            select(models.Document)
+            .filter(models.Document.user_id == current_user.user_id)
+            .filter(models.Document.title.match(title))
+            .options(
                 load_only(
                     models.Document.document_id,
                     models.Document.user_id,
@@ -2577,7 +2999,9 @@ def load_doc(
                     models.User.include_own_documents_in_feedback,
                     models.User.preferred_feedback_length,
                 ),
-                joinedload(models.Document.user).joinedload(models.User.groups).load_only(
+                joinedload(models.Document.user)
+                .joinedload(models.User.groups)
+                .load_only(
                     models.Group.group_id,
                     models.Group.name,
                     models.Group.datetime_created,
@@ -2587,129 +3011,6 @@ def load_doc(
                     models.Group.visibility,
                 ),
             )
-            .order_by(models.Document.datetime_created.desc())
-            .offset(offset)
-            .limit(page_size)
-        ).unique().fetchall()
-        if documents is None or len(documents)==0:
-            return {
-                "documents": [],
-                "total_count": 0
-            }
-        return {
-            "documents": [
-                _document_list_item(d[0]) for d in documents
-            ],
-            "total_count": total_count
-        }
-
-
-@router.get("/load_group_users")
-def load_group_users(
-    group_id: str,
-    page: int = 1,
-    page_size: int = 10,
-    filter_type: str | None = None,
-    current_user: models.User = Depends(get_current_user)
-) -> dict:
-    with compair.Session() as session:
-        # Check if the group exists
-        group = session.query(models.Group).filter(models.Group.group_id == group_id).first()
-        if not group:
-            raise HTTPException(status_code=404, detail="Group not found")
-
-        if (current_user not in group.users) & (group.visibility!='public'):
-            raise HTTPException(status_code=403, detail="User does not belong to the group")
-
-        # Retrieve all users associated with the group
-        users_query = session.query(models.User).join(models.User.groups).filter(models.Group.group_id == group_id)
-
-        # --- Filter logic ---
-        if filter_type == "recently_active":
-            users_query = users_query.order_by(models.User.status_change_date.desc())
-        elif filter_type == "recently_joined":
-            users_query = users_query.order_by(models.User.datetime_registered.desc())
-        else:
-            users_query = users_query.order_by(models.User.name.asc())
-
-        total_count = users_query.count()
-        offset = (page - 1) * page_size
-        users = users_query.offset(offset).limit(page_size).all()
-
-        # Convert users to schema objects
-        return {
-            "users": [
-                {
-                    "user_id": u.user_id,
-                    "username": u.username,
-                    "name": u.name,
-                    "datetime_registered": u.datetime_registered,
-                    "status": u.status,
-                    "profile_image": u.profile_image,
-                    "role": u.role,
-                }
-                for u in users
-            ],
-            "total_count": total_count
-        }
-
-
-@router.get("/load_document")
-def load_doc(
-    title: str,
-    full_content: bool = False,
-    content_max_chars: int = DEFAULT_DOCUMENT_DETAIL_CONTENT_CHARS,
-    current_user: models.User = Depends(get_current_user)
-) -> Mapping[str, Any] | None:
-    content_max_chars = _clamp_content_max_chars(content_max_chars)
-    with compair.Session() as session:
-        q = select(models.Document).filter(
-            models.Document.user_id==current_user.user_id
-        ).filter(
-            models.Document.title.match(title)
-        ).options(
-            load_only(
-                models.Document.document_id,
-                models.Document.user_id,
-                models.Document.author_id,
-                models.Document.title,
-                models.Document.doc_type,
-                models.Document.datetime_created,
-                models.Document.datetime_modified,
-                models.Document.is_published,
-                models.Document.file_key,
-                models.Document.image_key,
-                models.Document.topic_tags,
-            ),
-            joinedload(models.Document.groups).load_only(
-                models.Group.group_id,
-                models.Group.name,
-                models.Group.datetime_created,
-                models.Group.group_image,
-                models.Group.category,
-                models.Group.description,
-                models.Group.visibility,
-            ),
-            joinedload(models.Document.user).load_only(
-                models.User.user_id,
-                models.User.username,
-                models.User.name,
-                models.User.datetime_registered,
-                models.User.status,
-                models.User.profile_image,
-                models.User.role,
-                models.User.include_own_documents_in_feedback,
-                models.User.preferred_feedback_length,
-            ),
-            joinedload(models.Document.user).joinedload(models.User.groups).load_only(
-                models.Group.group_id,
-                models.Group.name,
-                models.Group.datetime_created,
-                models.Group.group_image,
-                models.Group.category,
-                models.Group.description,
-                models.Group.visibility,
-            ),
         )
         document = session.execute(q).unique().fetchone()
         if document is None:
@@ -2727,55 +3028,59 @@ def load_doc(
     document_id: str,
     full_content: bool = False,
     content_max_chars: int = DEFAULT_DOCUMENT_DETAIL_CONTENT_CHARS,
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ) -> Mapping[str, Any] | None:
     content_max_chars = _clamp_content_max_chars(content_max_chars)
     with compair.Session() as session:
-        q = select(models.Document).filter(
-            models.Document.document_id==document_id
-        ).options(
-            load_only(
-                models.Document.document_id,
-                models.Document.user_id,
-                models.Document.author_id,
-                models.Document.title,
-                models.Document.doc_type,
-                models.Document.datetime_created,
-                models.Document.datetime_modified,
-                models.Document.is_published,
-                models.Document.file_key,
-                models.Document.image_key,
-                models.Document.topic_tags,
-            ),
-            joinedload(models.Document.groups).load_only(
-                models.Group.group_id,
-                models.Group.name,
-                models.Group.datetime_created,
-                models.Group.group_image,
-                models.Group.category,
-                models.Group.description,
-                models.Group.visibility,
-            ),
-            joinedload(models.Document.user).load_only(
-                models.User.user_id,
-                models.User.username,
-                models.User.name,
-                models.User.datetime_registered,
-                models.User.status,
-                models.User.profile_image,
-                models.User.role,
-                models.User.include_own_documents_in_feedback,
-                models.User.preferred_feedback_length,
-            ),
-            joinedload(models.Document.user).joinedload(models.User.groups).load_only(
-                models.Group.group_id,
-                models.Group.name,
-                models.Group.datetime_created,
-                models.Group.group_image,
-                models.Group.category,
-                models.Group.description,
-                models.Group.visibility,
-            ),
+        q = (
+            select(models.Document)
+            .filter(models.Document.document_id == document_id)
+            .options(
+                load_only(
+                    models.Document.document_id,
+                    models.Document.user_id,
+                    models.Document.author_id,
+                    models.Document.title,
+                    models.Document.doc_type,
+                    models.Document.datetime_created,
+                    models.Document.datetime_modified,
+                    models.Document.is_published,
+                    models.Document.file_key,
+                    models.Document.image_key,
+                    models.Document.topic_tags,
+                ),
+                joinedload(models.Document.groups).load_only(
+                    models.Group.group_id,
+                    models.Group.name,
+                    models.Group.datetime_created,
+                    models.Group.group_image,
+                    models.Group.category,
+                    models.Group.description,
+                    models.Group.visibility,
+                ),
+                joinedload(models.Document.user).load_only(
+                    models.User.user_id,
+                    models.User.username,
+                    models.User.name,
+                    models.User.datetime_registered,
+                    models.User.status,
+                    models.User.profile_image,
+                    models.User.role,
+                    models.User.include_own_documents_in_feedback,
+                    models.User.preferred_feedback_length,
+                ),
+                joinedload(models.Document.user)
+                .joinedload(models.User.groups)
+                .load_only(
+                    models.Group.group_id,
+                    models.Group.name,
+                    models.Group.datetime_created,
+                    models.Group.group_image,
+                    models.Group.category,
+                    models.Group.description,
+                    models.Group.visibility,
+                ),
+            )
         )
         document = session.execute(q).unique().fetchone()
         if document is None:
@@ -2784,7 +3089,9 @@ def load_doc(
         doc_group_ids = {g.group_id for g in doc.groups}
         user_group_ids = {g.group_id for g in current_user.groups}
         if not doc_group_ids & user_group_ids and current_user.user_id != doc.author_id:
-            raise HTTPException(status_code=403, detail="Not authorized to view this document")
+            raise HTTPException(
+                status_code=403, detail="Not authorized to view this document"
+            )
         return _document_detail_item(
             session,
             doc,
@@ -2799,18 +3106,20 @@ def load_document_metadata(
     current_user: models.User = Depends(get_current_user),
 ) -> Mapping[str, Any]:
     with compair.Session() as session:
-        doc = session.query(
-            models.Document.document_id,
-            models.Document.user_id,
-            models.Document.author_id,
-            models.Document.title,
-            models.Document.doc_type,
-            models.Document.datetime_created,
-            models.Document.datetime_modified,
-            models.Document.is_published,
-        ).filter(
-            models.Document.document_id == document_id
-        ).first()
+        doc = (
+            session.query(
+                models.Document.document_id,
+                models.Document.user_id,
+                models.Document.author_id,
+                models.Document.title,
+                models.Document.doc_type,
+                models.Document.datetime_created,
+                models.Document.datetime_modified,
+                models.Document.is_published,
+            )
+            .filter(models.Document.document_id == document_id)
+            .first()
+        )
         if doc is None:
             raise HTTPException(status_code=404, detail="Document not found")
 
@@ -2822,7 +3131,9 @@ def load_document_metadata(
         }
         user_group_ids = {g.group_id for g in current_user.groups}
         if not doc_group_ids & user_group_ids and current_user.user_id != doc.author_id:
-            raise HTTPException(status_code=403, detail="Not authorized to view this document")
+            raise HTTPException(
+                status_code=403, detail="Not authorized to view this document"
+            )
 
         return {
             "document_id": doc.document_id,
@@ -2845,13 +3156,17 @@ def update_doc(
     group_ids: list[str] = Form(None),
     image_url: str = Form(None),
     is_published: str = Form(None),
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ):
     with compair.Session() as session:
-        doc = session.query(models.Document).filter(
-            models.Document.document_id == doc_id,
-            models.Document.user_id == current_user.user_id
-        ).first()
+        doc = (
+            session.query(models.Document)
+            .filter(
+                models.Document.document_id == doc_id,
+                models.Document.user_id == current_user.user_id,
+            )
+            .first()
+        )
         if doc:
             if author_id is not None:
                 doc.author_id = author_id
@@ -2877,17 +3192,30 @@ def create_doc(
     document_type: str = Form(None),
     document_content: str = Form(""),
     document_content_b64: str | None = Form(None),
-    groups: str = Form(None), # TODO: Fix how these get submitted; current comma-separated list string
+    groups: str = Form(
+        None
+    ),  # TODO: Fix how these get submitted; current comma-separated list string
     is_published: bool = Form(False),
     current_user: models.User = Depends(get_current_user),
     analytics: Analytics = Depends(get_analytics),
 ):
     with compair.Session() as session:
         # Check if the trial has expired
-        current_user = session.query(models.User).filter(models.User.user_id == current_user.user_id).first()
+        current_user = (
+            session.query(models.User)
+            .filter(models.User.user_id == current_user.user_id)
+            .first()
+        )
         trial_expiration = _trial_expiration(current_user)
-        if HAS_TRIALS and trial_expiration and current_user.status == "trial" and trial_expiration < datetime.now(timezone.utc):
-            current_user.status = "suspended"  # Mark as suspended once the trial expires
+        if (
+            HAS_TRIALS
+            and trial_expiration
+            and current_user.status == "trial"
+            and trial_expiration < datetime.now(timezone.utc)
+        ):
+            current_user.status = (
+                "suspended"  # Mark as suspended once the trial expires
+            )
             current_user.status_change_date = datetime.now(timezone.utc)
             session.commit()
 
@@ -2896,7 +3224,11 @@ def create_doc(
         document_limit: int | None = None
         if IS_CLOUD and HAS_TEAM and team and current_user.status == "active":
             document_limit = team.total_documents_limit  # type: ignore[union-attr]
-        elif IS_CLOUD and _user_plan(current_user) == "individual" and current_user.status == "active":
+        elif (
+            IS_CLOUD
+            and _user_plan(current_user) == "individual"
+            and current_user.status == "active"
+        ):
             document_limit = 100
         else:
             raw_core_limit = os.getenv("COMPAIR_CORE_DOCUMENT_LIMIT")
@@ -2906,7 +3238,11 @@ def create_doc(
                 except ValueError:
                     document_limit = None
 
-        document_count = session.query(models.Document).filter(models.Document.user_id == current_user.user_id).count()
+        document_count = (
+            session.query(models.Document)
+            .filter(models.Document.user_id == current_user.user_id)
+            .count()
+        )
 
         if document_limit is not None and document_count >= document_limit:
             if IS_CLOUD:
@@ -2924,7 +3260,9 @@ def create_doc(
         if not authorid:
             authorid = current_user.user_id
 
-        decoded_content = _decode_optional_base64(document_content_b64, "document_content_b64")
+        decoded_content = _decode_optional_base64(
+            document_content_b64, "document_content_b64"
+        )
         if decoded_content is not None:
             document_content = decoded_content
         if document_content is not None:
@@ -2937,39 +3275,55 @@ def create_doc(
             content=document_content,
             doc_type=document_type,
             datetime_created=datetime.now(timezone.utc),
-            datetime_modified=datetime.now(timezone.utc)
+            datetime_modified=datetime.now(timezone.utc),
         )
         target_group_ids = []
         if groups:
-            target_group_ids = [gid.strip() for gid in groups.split(',') if gid.strip()]
+            target_group_ids = [gid.strip() for gid in groups.split(",") if gid.strip()]
 
         if target_group_ids:
             q = select(models.Group).filter(models.Group.group_id.in_(target_group_ids))
             resolved_groups = session.execute(q).scalars().all()
             resolved_by_id = {group.group_id: group for group in resolved_groups}
             if not resolved_by_id:
-                raise HTTPException(status_code=404, detail="No matching groups found for provided IDs.")
-            missing_group_ids = [group_id for group_id in target_group_ids if group_id not in resolved_by_id]
+                raise HTTPException(
+                    status_code=404, detail="No matching groups found for provided IDs."
+                )
+            missing_group_ids = [
+                group_id
+                for group_id in target_group_ids
+                if group_id not in resolved_by_id
+            ]
             if missing_group_ids:
                 raise HTTPException(
                     status_code=404,
                     detail="No matching groups found for provided IDs.",
                 )
 
-            member_group_ids = _member_group_ids(session, current_user.user_id, exclude_compair=True)
-            denied_group_ids = [group_id for group_id in target_group_ids if group_id not in member_group_ids]
+            member_group_ids = _member_group_ids(
+                session, current_user.user_id, exclude_compair=True
+            )
+            denied_group_ids = [
+                group_id
+                for group_id in target_group_ids
+                if group_id not in member_group_ids
+            ]
             if denied_group_ids:
                 raise HTTPException(
                     status_code=403,
                     detail="You do not belong to one or more requested groups.",
                 )
 
-            document.groups = [resolved_by_id[group_id] for group_id in target_group_ids]
+            document.groups = [
+                resolved_by_id[group_id] for group_id in target_group_ids
+            ]
         else:
             q = select(models.Group).filter(models.Group.name == current_user.username)
             default_group = session.execute(q).scalars().first()
             if default_group is None:
-                raise HTTPException(status_code=404, detail="Default group not found for user.")
+                raise HTTPException(
+                    status_code=404, detail="Default group not found for user."
+                )
             document.groups = [default_group]
 
         primary_group = document.groups[0]
@@ -2982,18 +3336,18 @@ def create_doc(
             publish_doc(
                 doc_id=document.document_id,
                 is_published=True,
-                current_user=current_user
+                current_user=current_user,
             )
 
         # Log document creation
         log_activity(
-            session=session, 
-            user_id=document.author_id, 
+            session=session,
+            user_id=document.author_id,
             group_id=primary_group.group_id,
-            action="create", 
-            object_id=document.document_id, 
+            action="create",
+            object_id=document.document_id,
             object_name=document.title,
-            object_type="document"
+            object_type="document",
         )
         # Return the document_id for frontend use
         try:
@@ -3007,34 +3361,37 @@ def create_doc(
 def publish_doc(
     doc_id: str,
     is_published: bool,
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ):
     with compair.Session() as session:
         # Check if user can publish or not
         if current_user.status == "suspended":
-            raise HTTPException(status_code=403, detail="Your subscription has expired. Renew to publish.")
+            raise HTTPException(
+                status_code=403,
+                detail="Your subscription has expired. Renew to publish.",
+            )
 
         doc = session.query(models.Document).filter(
             models.Document.document_id == doc_id,
-            models.Document.user_id == current_user.user_id
+            models.Document.user_id == current_user.user_id,
         )
         if not doc.first():
-            raise HTTPException(status_code=404, detail="Document not found or you do not have permission to publish it.")
-        if is_published!=doc.first().is_published:
-            doc.update({'is_published': is_published})
+            raise HTTPException(
+                status_code=404,
+                detail="Document not found or you do not have permission to publish it.",
+            )
+        if is_published != doc.first().is_published:
+            doc.update({"is_published": is_published})
             session.commit()
 
 
 @router.get("/delete_docs")
-def delete_docs(
-    doc_ids: str,
-    current_user: models.User = Depends(get_current_user)
-):
+def delete_docs(doc_ids: str, current_user: models.User = Depends(get_current_user)):
     with compair.Session() as session:
-        doc_ids = doc_ids.split(',')
+        doc_ids = doc_ids.split(",")
         documents = session.query(models.Document).filter(
             models.Document.document_id.in_(doc_ids),
-            models.Document.user_id == current_user.user_id
+            models.Document.user_id == current_user.user_id,
         )
 
         for document in documents:
@@ -3043,13 +3400,13 @@ def delete_docs(
             doc_group: models.Group = document.groups[0]
             group_id = doc_group.group_id
             log_activity(
-                session=session, 
-                user_id=current_user.user_id, 
+                session=session,
+                user_id=current_user.user_id,
                 group_id=group_id,
-                action="delete", 
-                object_id=doc_id, 
+                action="delete",
+                object_id=doc_id,
                 object_name=doc_name,
-                object_type="document"
+                object_type="document",
             )
 
         _purge_notification_events_for_docs(session, doc_ids)
@@ -3058,17 +3415,17 @@ def delete_docs(
 
 
 @router.get("/delete_doc")
-def delete_doc(
-    doc_id: str,
-    current_user: models.User = Depends(get_current_user)
-):
+def delete_doc(doc_id: str, current_user: models.User = Depends(get_current_user)):
     with compair.Session() as session:
         document = session.query(models.Document).filter(
             models.Document.document_id == doc_id,
-            models.Document.user_id == current_user.user_id
+            models.Document.user_id == current_user.user_id,
         )
         if not document.first():
-            raise HTTPException(status_code=404, detail="Document not found or you do not have permission to delete it.")
+            raise HTTPException(
+                status_code=404,
+                detail="Document not found or you do not have permission to delete it.",
+            )
 
         doc_group = document[0].groups[0]
         group_id = doc_group.group_id
@@ -3079,13 +3436,13 @@ def delete_doc(
         session.commit()
 
         log_activity(
-            session=session, 
-            user_id=current_user.user_id, 
+            session=session,
+            user_id=current_user.user_id,
             group_id=group_id,
-            action="delete", 
-            object_id=doc_id, 
+            action="delete",
+            object_id=doc_id,
             object_name=doc_name,
-            object_type="document"
+            object_type="document",
         )
 
 
@@ -3104,9 +3461,18 @@ async def process_doc(
     generate_feedback = _parse_process_doc_bool(payload.get("generate_feedback"), True)
     skip_index = _parse_process_doc_bool(payload.get("skip_index"), False)
     chunk_mode = _parse_process_doc_string(payload.get("chunk_mode"))
-    reanalyze_existing = _parse_process_doc_bool(payload.get("reanalyze_existing"), False)
+    reanalyze_existing = _parse_process_doc_bool(
+        payload.get("reanalyze_existing"), False
+    )
     reference_doc_ids = _parse_process_doc_list(payload.get("reference_doc_ids"))
     retrieval_query = _parse_process_doc_string(payload.get("retrieval_query"))
+    group_id = _parse_process_doc_string(payload.get("group_id"))
+    try:
+        retrieval_engine = validate_retrieval_engine_name(
+            getattr(settings, "retrieval_engine", DEFAULT_RETRIEVAL_ENGINE)
+        )
+    except UnknownRetrievalEngineError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     try:
         focus_manifest = normalize_focus_manifest(payload.get("focus_manifest"))
     except ValueError as exc:
@@ -3114,7 +3480,9 @@ async def process_doc(
     if not doc_id:
         raise HTTPException(status_code=422, detail="doc_id is required")
     if doc_text is None and doc_text_b64 is None:
-        raise HTTPException(status_code=422, detail="doc_text or doc_text_b64 is required")
+        raise HTTPException(
+            status_code=422, detail="doc_text or doc_text_b64 is required"
+        )
     if doc_text is not None:
         doc_text = sanitize_text_for_database(doc_text)
 
@@ -3129,20 +3497,27 @@ async def process_doc(
             )
         except Exception as exc:
             logger.warning("process_doc payload staging failed: %s", exc)
-            raise HTTPException(status_code=503, detail="Unable to stage document payload for background processing") from exc
+            raise HTTPException(
+                status_code=503,
+                detail="Unable to stage document payload for background processing",
+            ) from exc
 
     if staged_payload_key is None:
         decoded_doc_text = _decode_optional_base64(doc_text_b64, "doc_text_b64")
         if decoded_doc_text is not None:
             doc_text = decoded_doc_text
         if doc_text is None:
-            raise HTTPException(status_code=422, detail="doc_text or doc_text_b64 is required")
+            raise HTTPException(
+                status_code=422, detail="doc_text or doc_text_b64 is required"
+            )
     elif skip_index and doc_text is None:
         decoded_doc_text = _decode_optional_base64(doc_text_b64, "doc_text_b64")
         if decoded_doc_text is not None:
             doc_text = decoded_doc_text
         if doc_text is None:
-            raise HTTPException(status_code=422, detail="doc_text or doc_text_b64 is required")
+            raise HTTPException(
+                status_code=422, detail="doc_text or doc_text_b64 is required"
+            )
 
     payload_bytes = (
         _estimate_b64_decoded_bytes(doc_text_b64)
@@ -3163,26 +3538,39 @@ async def process_doc(
         doc_id=doc_id,
         payload_transport="doc_text_b64" if doc_text_b64 is not None else "doc_text",
         payload_bytes=payload_bytes,
-        payload_stage_backend=_process_doc_payload_stage_backend_for_key(staged_payload_key),
-        staged_via_redis=_process_doc_payload_stage_backend_for_key(staged_payload_key) == "redis",
+        payload_stage_backend=_process_doc_payload_stage_backend_for_key(
+            staged_payload_key
+        ),
+        staged_via_redis=_process_doc_payload_stage_backend_for_key(staged_payload_key)
+        == "redis",
         **query_provenance.trace_fields(),
     )
 
     with compair.Session() as session:
-        doc = session.query(models.Document).filter(models.Document.document_id == doc_id).first()
+        doc = (
+            session.query(models.Document)
+            .filter(models.Document.document_id == doc_id)
+            .first()
+        )
         if not doc:
             raise HTTPException(status_code=404, detail="Document not found")
         # Only allow the author to process/edit
         if doc.author_id != current_user.user_id:
-            raise HTTPException(status_code=403, detail="Only the author can edit this document")
+            raise HTTPException(
+                status_code=403, detail="Only the author can edit this document"
+            )
         # If the user is suspended, allow user to edit, but not receive any new feedback for docs
         if current_user.status == "suspended":
-            generate_feedback=False
+            generate_feedback = False
         if skip_index and generate_feedback:
-            raise HTTPException(status_code=422, detail="skip_index requires generate_feedback=false")
+            raise HTTPException(
+                status_code=422, detail="skip_index requires generate_feedback=false"
+            )
         if skip_index:
             if doc_text is None:
-                raise HTTPException(status_code=422, detail="doc_text or doc_text_b64 is required")
+                raise HTTPException(
+                    status_code=422, detail="doc_text or doc_text_b64 is required"
+                )
             _update_document_content_without_index(
                 session=session,
                 doc=doc,
@@ -3193,7 +3581,9 @@ async def process_doc(
                 "process_doc_skip_index",
                 user_id=current_user.user_id,
                 doc_id=doc_id,
-                payload_transport="doc_text_b64" if doc_text_b64 is not None else "doc_text",
+                payload_transport="doc_text_b64"
+                if doc_text_b64 is not None
+                else "doc_text",
                 payload_bytes=payload_bytes,
             )
             return {"task_id": None, "skipped_index": True}
@@ -3207,6 +3597,7 @@ async def process_doc(
         seen_reference_doc_ids.add(cleaned)
         cleaned_reference_doc_ids.append(cleaned)
 
+    processing_run_key = new_processing_run_key()
     try:
         task_result = _dispatch_process_document_task(
             user_id=current_user.user_id,
@@ -3219,6 +3610,9 @@ async def process_doc(
             reference_doc_ids=cleaned_reference_doc_ids or None,
             focus_manifest=focus_manifest,
             retrieval_query=retrieval_query,
+            retrieval_engine=retrieval_engine,
+            processing_run_key=processing_run_key,
+            group_id=group_id,
             allow_insecure_local_query_transport=bool(
                 getattr(
                     settings,
@@ -3266,11 +3660,17 @@ def _load_now_review_scope(
     if group is None:
         raise HTTPException(status_code=404, detail="Group not found")
 
-    is_member = any(member.user_id == current_user_db.user_id for member in (group.users or []))
+    is_member = any(
+        member.user_id == current_user_db.user_id for member in (group.users or [])
+    )
     if not is_member and group.visibility != "public":
         raise HTTPException(status_code=403, detail="User does not belong to the group")
 
-    requested_doc_ids = [doc_id.strip() for doc_id in (payload.document_ids or []) if doc_id and doc_id.strip()]
+    requested_doc_ids = [
+        doc_id.strip()
+        for doc_id in (payload.document_ids or [])
+        if doc_id and doc_id.strip()
+    ]
     q = (
         session.query(models.Document)
         .join(models.Document.groups)
@@ -3290,12 +3690,19 @@ def _load_now_review_scope(
     if requested_doc_ids:
         by_id = {doc.document_id: doc for doc in documents}
         documents = [by_id[doc_id] for doc_id in requested_doc_ids if doc_id in by_id]
-    elif any((getattr(doc, "doc_type", "") or "").strip().lower() == "code-repo" for doc in documents):
+    elif any(
+        (getattr(doc, "doc_type", "") or "").strip().lower() == "code-repo"
+        for doc in documents
+    ):
         documents = [
-            doc for doc in documents if (getattr(doc, "doc_type", "") or "").strip().lower() == "code-repo"
+            doc
+            for doc in documents
+            if (getattr(doc, "doc_type", "") or "").strip().lower() == "code-repo"
         ]
     if not documents:
-        raise HTTPException(status_code=404, detail="No accessible documents found for now review")
+        raise HTTPException(
+            status_code=404, detail="No accessible documents found for now review"
+        )
 
     return current_user_db, group, documents
 
@@ -3306,10 +3713,15 @@ def review_now_quote(
     current_user: models.User = Depends(get_current_user),
 ) -> schema.NowReviewQuoteResponse:
     if not review_now_backend_enabled():
-        raise HTTPException(status_code=403, detail=review_now_disabled_detail() or "Now review is disabled.")
+        raise HTTPException(
+            status_code=403,
+            detail=review_now_disabled_detail() or "Now review is disabled.",
+        )
 
     with compair.Session() as session:
-        current_user_db, group, documents = _load_now_review_scope(session, payload, current_user)
+        current_user_db, group, documents = _load_now_review_scope(
+            session, payload, current_user
+        )
 
         reviewer = compair.feedback.Reviewer()
         try:
@@ -3340,10 +3752,15 @@ def review_now(
     current_user: models.User = Depends(get_current_user),
 ) -> schema.NowReviewResponse:
     if not review_now_backend_enabled():
-        raise HTTPException(status_code=403, detail=review_now_disabled_detail() or "Now review is disabled.")
+        raise HTTPException(
+            status_code=403,
+            detail=review_now_disabled_detail() or "Now review is disabled.",
+        )
 
     with compair.Session() as session:
-        current_user_db, group, documents = _load_now_review_scope(session, payload, current_user)
+        current_user_db, group, documents = _load_now_review_scope(
+            session, payload, current_user
+        )
 
         reviewer = compair.feedback.Reviewer()
         try:
@@ -3380,7 +3797,9 @@ async def upload_ocr_file(
     ocr: OCRProvider = Depends(get_ocr),
 ):
     if not settings.ocr_enabled:
-        raise HTTPException(status_code=501, detail="OCR is not available in this edition.")
+        raise HTTPException(
+            status_code=501, detail="OCR is not available in this edition."
+        )
 
     file_bytes = await file.read()
     try:
@@ -3406,7 +3825,9 @@ def get_ocr_file_result(
     ocr: OCRProvider = Depends(get_ocr),
 ):
     if not settings.ocr_enabled:
-        raise HTTPException(status_code=501, detail="OCR is not available in this edition.")
+        raise HTTPException(
+            status_code=501, detail="OCR is not available in this edition."
+        )
 
     try:
         status = ocr.status(task_id)
@@ -3424,9 +3845,7 @@ def get_ocr_file_result(
 
 
 @router.get("/status/{task_id}")
-async def get_process_status(
-    task_id: str
-):
+async def get_process_status(task_id: str):
     return _task_status_payload(task_id)
 
 
@@ -3441,14 +3860,20 @@ def get_trial_status(
     with compair.Session() as session:
         trial_expiration = getattr(current_user, "trial_expiration_date", None)
         if trial_expiration is None:
-            raise HTTPException(status_code=404, detail="Trial expiration date not found.")
+            raise HTTPException(
+                status_code=404, detail="Trial expiration date not found."
+            )
         days_left = (trial_expiration - datetime.now(timezone.utc)).days
         show_banner = 0 < days_left <= 7
 
         checkout_url = None
         if show_banner and settings.billing_enabled:
             require_feature(HAS_BILLING, "Billing integration")
-            db_user = session.query(models.User).filter(models.User.user_id == current_user.user_id).first()
+            db_user = (
+                session.query(models.User)
+                .filter(models.User.user_id == current_user.user_id)
+                .first()
+            )
             if db_user:
                 if not db_user.stripe_customer_id:
                     try:
@@ -3470,7 +3895,10 @@ def get_trial_status(
                             qty=1,
                             success_url=settings.stripe_success_url,
                             cancel_url=settings.stripe_cancel_url,
-                            metadata={"plan": "individual_monthly", "user_id": db_user.user_id},
+                            metadata={
+                                "plan": "individual_monthly",
+                                "user_id": db_user.user_id,
+                            },
                         )
                         checkout_url = getattr(session_info, "url", None)
                         if checkout_url is None and hasattr(session_info, "get"):
@@ -3547,48 +3975,62 @@ def load_feedback(
 
 
 @router.post("/feedback/{feedback_id}/hide")
-def hide_feedback(
-    feedback_id: str,
-    is_hidden: bool = Form(False)
-):
+def hide_feedback(feedback_id: str, is_hidden: bool = Form(False)):
     with compair.Session() as session:
-        feedback = session.query(models.Feedback).filter(models.Feedback.feedback_id == feedback_id).first()
+        feedback = (
+            session.query(models.Feedback)
+            .filter(models.Feedback.feedback_id == feedback_id)
+            .first()
+        )
         if not feedback:
             raise HTTPException(status_code=404, detail="Feedback not found")
         feedback.is_hidden = is_hidden
         session.commit()
-        return {"message": f"Feedback {'hidden' if is_hidden else 'unhidden'} successfully", "feedback_id": feedback_id}
-
+        return {
+            "message": f"Feedback {'hidden' if is_hidden else 'unhidden'} successfully",
+            "feedback_id": feedback_id,
+        }
 
 
 @router.post("/feedback/{feedback_id}/rate")
 def rate_feedback(
     feedback_id: str,
-    user_feedback: str = Body(..., embed=True)  # expects "positive" or "negative"
+    user_feedback: str = Body(..., embed=True),  # expects "positive" or "negative"
 ):
     if user_feedback not in ("positive", "negative", None):
         raise HTTPException(status_code=400, detail="Invalid feedback label")
     with compair.Session() as session:
-        feedback = session.query(models.Feedback).filter(models.Feedback.feedback_id == feedback_id).first()
+        feedback = (
+            session.query(models.Feedback)
+            .filter(models.Feedback.feedback_id == feedback_id)
+            .first()
+        )
         if not feedback:
             raise HTTPException(status_code=404, detail="Feedback not found")
         feedback.user_feedback = user_feedback
         session.commit()
-        return {"message": "Feedback rated successfully", "feedback_id": feedback_id, "user_feedback": user_feedback}
+        return {
+            "message": "Feedback rated successfully",
+            "feedback_id": feedback_id,
+            "user_feedback": user_feedback,
+        }
 
 
 @router.get("/documents/{document_id}/feedback")
 def list_document_feedback(
-    document_id: str,
-    current_user: models.User = Depends(get_current_user)
+    document_id: str, current_user: models.User = Depends(get_current_user)
 ):
     """Return feedback entries for a document the current user can access."""
     with compair.Session() as session:
-        doc = session.query(
-            models.Document.user_id,
-            models.Document.author_id,
-            models.Document.is_published,
-        ).filter(models.Document.document_id == document_id).first()
+        doc = (
+            session.query(
+                models.Document.user_id,
+                models.Document.author_id,
+                models.Document.is_published,
+            )
+            .filter(models.Document.document_id == document_id)
+            .first()
+        )
         if not doc:
             raise HTTPException(status_code=404, detail="Document not found")
         # Access control: owner, member of a group with access, or published
@@ -3599,12 +4041,20 @@ def list_document_feedback(
             .filter(models.document_to_group_table.c.document_id == document_id)
             .all()
         }
-        if not (doc.user_id == current_user.user_id or doc_group_ids & user_group_ids or doc.is_published):
-            raise HTTPException(status_code=403, detail="Not authorized to access this document")
+        if not (
+            doc.user_id == current_user.user_id
+            or doc_group_ids & user_group_ids
+            or doc.is_published
+        ):
+            raise HTTPException(
+                status_code=403, detail="Not authorized to access this document"
+            )
         # Join through chunks
         q = (
             session.query(models.Feedback)
-            .join(models.Chunk, models.Feedback.source_chunk_id == models.Chunk.chunk_id)
+            .join(
+                models.Chunk, models.Feedback.source_chunk_id == models.Chunk.chunk_id
+            )
             .options(
                 joinedload(models.Feedback.chunk)
                 .joinedload(models.Chunk.references)
@@ -3652,17 +4102,25 @@ def list_document_feedback(
                             "document_id": ref.reference_document_id,
                             "note_id": ref.reference_note_id,
                             "reference_chunk_id": ref.reference_chunk_id,
-                            "title": getattr(ref.document, "title", None) if ref.document else getattr(ref.note, "title", None),
+                            "title": getattr(ref.document, "title", None)
+                            if ref.document
+                            else getattr(ref.note, "title", None),
                             "author": (
-                                getattr(getattr(ref.document, "user", None), "name", None)
-                                if ref.document else getattr(getattr(ref.note, "author", None), "name", None)
+                                getattr(
+                                    getattr(ref.document, "user", None), "name", None
+                                )
+                                if ref.document
+                                else getattr(
+                                    getattr(ref.note, "author", None), "name", None
+                                )
                             ),
                             "content": _reference_content(ref),
                             "file_path": _reference_file_path(ref),
                         }
                         for ref in getattr(f.chunk, "references", []) or []
                     ],
-                } for f in rows
+                }
+                for f in rows
             ],
         }
 
@@ -3685,7 +4143,9 @@ def load_references(
                     models.Document.datetime_modified,
                     models.Document.is_published,
                 ),
-                joinedload(models.Reference.document).joinedload(models.Document.user).load_only(
+                joinedload(models.Reference.document)
+                .joinedload(models.Document.user)
+                .load_only(
                     models.User.user_id,
                     models.User.username,
                     models.User.name,
@@ -3721,28 +4181,41 @@ def load_references(
                     datetime_created=r.document.datetime_created,
                     datetime_modified=r.document.datetime_modified,
                     is_published=r.document.is_published,
-                    groups=[{"group_id":"","datetime_created":datetime.now(),"name":""}],
+                    groups=[
+                        {"group_id": "", "datetime_created": datetime.now(), "name": ""}
+                    ],
                     user=schema.User(
                         user_id=r.document.user.user_id,
                         username=r.document.user.username,
                         name=r.document.user.name,
-                        groups=[{"group_id":"","datetime_created":datetime.now(),"name":""}],
+                        groups=[
+                            {
+                                "group_id": "",
+                                "datetime_created": datetime.now(),
+                                "name": "",
+                            }
+                        ],
                         datetime_registered=r.document.user.datetime_registered,
-                        status=r.document.user.status
-                    )
+                        status=r.document.user.status,
+                    ),
                 ),
                 document_author=r.document.user.username,
-                title=getattr(r.document, "title", None) if r.document else getattr(r.note, "title", None),
+                title=getattr(r.document, "title", None)
+                if r.document
+                else getattr(r.note, "title", None),
                 author=(
                     getattr(getattr(r.document, "user", None), "name", None)
-                    if r.document else getattr(getattr(r.note, "author", None), "name", None)
+                    if r.document
+                    else getattr(getattr(r.note, "author", None), "name", None)
                 ),
                 content=_reference_content(r),
                 file_path=_reference_file_path(r),
-            ) for r in references
+            )
+            for r in references
             if r.document is not None
         ]
         return returned_references
+
 
 @router.get("/verify-email")
 def verify_email(token: str):
@@ -3753,7 +4226,11 @@ def verify_email(token: str):
             detail="Email verification is disabled because authentication is off. Set COMPAIR_REQUIRE_AUTHENTICATION=true to enable account flows.",
         )
     with compair.Session() as session:
-        user = session.query(models.User).filter(models.User.verification_token == token).first()
+        user = (
+            session.query(models.User)
+            .filter(models.User.verification_token == token)
+            .first()
+        )
         if not user:
             raise HTTPException(status_code=400, detail="Invalid or expired token")
         if user.token_expiration < datetime.now(timezone.utc):
@@ -3778,8 +4255,10 @@ def verify_email(token: str):
             "auth_token": user_session.id,
         }
 
+
 def is_valid_email(email):
     return re.match(r"[^@]+@[^@]+\.[^@]+", email)
+
 
 @router.post("/sign-up")
 def sign_up(
@@ -3796,7 +4275,7 @@ def sign_up(
         raise HTTPException(status_code=400, detail="Invalid email address")
     with compair.Session() as session:
         # Call internal function to create the user
-        #user = create_user(email=request.email, password=request.password)
+        # user = create_user(email=request.email, password=request.password)
         user = create_user(
             username=request.username,
             name=request.name,
@@ -3808,7 +4287,9 @@ def sign_up(
         )
         if settings.require_email_verification:
             web_base = _public_web_base_url()
-            verification_link = f"{web_base}/verify-email?token={user.verification_token}"
+            verification_link = (
+                f"{web_base}/verify-email?token={user.verification_token}"
+            )
             emailer.connect()
             emailer.send(
                 subject="Verify your email address",
@@ -3821,9 +4302,12 @@ def sign_up(
                     user_name=user.name or user.username or "there",
                 ),
             )
-            return {"message": "Sign-up successful. Please check your email for verification."}
+            return {
+                "message": "Sign-up successful. Please check your email for verification."
+            }
         _activate_user_account(session, user, send_group_invites=False)
         return {"message": "Sign-up successful. Your account is ready to use."}
+
 
 @router.post("/forgot-password")
 def forgot_password(request: schema.ForgotPasswordRequest) -> dict:
@@ -3834,7 +4318,11 @@ def forgot_password(request: schema.ForgotPasswordRequest) -> dict:
             detail="Password resets are disabled because authentication is off. Set COMPAIR_REQUIRE_AUTHENTICATION=true to enable account flows.",
         )
     with compair.Session() as session:
-        user = session.query(models.User).filter(models.User.username == request.email).first()
+        user = (
+            session.query(models.User)
+            .filter(models.User.username == request.email)
+            .first()
+        )
         if not user:
             return {"message": "If the email exists, a reset link will be sent."}
 
@@ -3844,7 +4332,7 @@ def forgot_password(request: schema.ForgotPasswordRequest) -> dict:
         user.reset_token = token
         user.token_expiration = expiration
         session.commit()
-        
+
         # Send email with reset link
         web_base = _public_web_base_url()
         reset_link = f"{web_base}/reset-password?token={token}"
@@ -3862,6 +4350,7 @@ def forgot_password(request: schema.ForgotPasswordRequest) -> dict:
         )
         return {"message": "If the email exists, a reset link will be sent."}
 
+
 @router.post("/reset-password")
 def reset_password(request: schema.ResetPasswordRequest) -> dict:
     settings = get_settings_dependency()
@@ -3872,17 +4361,26 @@ def reset_password(request: schema.ResetPasswordRequest) -> dict:
         )
     with compair.Session() as session:
         submitted_token = (request.token or "").strip().lower()
-        user = session.query(models.User).filter(models.User.reset_token == submitted_token).first()
-        if not user or not user.token_expiration or user.token_expiration < datetime.now(timezone.utc):
+        user = (
+            session.query(models.User)
+            .filter(models.User.reset_token == submitted_token)
+            .first()
+        )
+        if (
+            not user
+            or not user.token_expiration
+            or user.token_expiration < datetime.now(timezone.utc)
+        ):
             raise HTTPException(status_code=400, detail="Invalid or expired token")
-        
+
         # Update the password
         user.set_password(request.new_password)
         user.reset_token = None  # Invalidate the token
         user.token_expiration = None
         session.commit()
-        
+
         return {"message": "Password has been reset successfully"}
+
 
 @router.get("/admin/groups")
 def get_admin_groups(
@@ -3890,7 +4388,11 @@ def get_admin_groups(
 ):
     """Retrieve groups managed by the given user (admin)."""
     with compair.Session() as session:
-        admin = session.query(models.Administrator).filter(models.Administrator.user_id == current_user.user_id).first()
+        admin = (
+            session.query(models.Administrator)
+            .filter(models.Administrator.user_id == current_user.user_id)
+            .first()
+        )
         if not admin:
             return []  # Not an admin of any groups
 
@@ -3909,35 +4411,53 @@ def get_admin_groups(
             for g in groups
         ]
 
+
 @router.get("/admin/join_requests")
 def get_join_requests(
-    group_id: str,
-    current_user: models.User = Depends(get_current_user)
+    group_id: str, current_user: models.User = Depends(get_current_user)
 ):
     """Retrieve pending join requests for a group."""
     with compair.Session() as session:
-        requests = session.query(models.JoinRequest).filter(
-            models.JoinRequest.group_id == group_id
-        ).filter(
-            models.JoinRequest.group.has(models.Group.admins.any(models.Administrator.user_id == current_user.user_id))
-        ).all()
+        requests = (
+            session.query(models.JoinRequest)
+            .filter(models.JoinRequest.group_id == group_id)
+            .filter(
+                models.JoinRequest.group.has(
+                    models.Group.admins.any(
+                        models.Administrator.user_id == current_user.user_id
+                    )
+                )
+            )
+            .all()
+        )
         return [
-            {"request_id": r.request_id, "user_name": r.user.name, "datetime_requested": r.datetime_requested}
+            {
+                "request_id": r.request_id,
+                "user_name": r.user.name,
+                "datetime_requested": r.datetime_requested,
+            }
             for r in requests
         ]
 
+
 @router.post("/admin/approve_request")
 def approve_request(
-        request_id: int,
-        current_user: models.User = Depends(get_current_user)
-    ):
+    request_id: int, current_user: models.User = Depends(get_current_user)
+):
     """Approve a join request."""
     with compair.Session() as session:
-        request = session.query(models.JoinRequest).filter(
-            models.JoinRequest.request_id == request_id
-        ).filter(
-            models.JoinRequest.group.has(models.Group.admins.any(models.Administrator.user_id == current_user.user_id))
-        ).first()
+        request = (
+            session.query(models.JoinRequest)
+            .filter(models.JoinRequest.request_id == request_id)
+            .filter(
+                models.JoinRequest.group.has(
+                    models.Group.admins.any(
+                        models.Administrator.user_id == current_user.user_id
+                    )
+                )
+            )
+            .first()
+        )
         if not request:
             raise HTTPException(status_code=404, detail="Request not found")
 
@@ -3948,28 +4468,36 @@ def approve_request(
         session.commit()
 
         log_activity(
-            session=session, 
-            user_id=user.user_id, 
+            session=session,
+            user_id=user.user_id,
             group_id=group.group_id,
-            action="join", 
-            object_id=group.group_id, 
+            action="join",
+            object_id=group.group_id,
             object_name=group.name,
-            object_type="group"
+            object_type="group",
         )
 
         return {"message": "Request approved successfully"}
 
+
 @router.post("/admin/reject_request")
 def reject_request(
-    request_id: int,
-    current_user: models.User = Depends(get_current_user)
+    request_id: int, current_user: models.User = Depends(get_current_user)
 ):
     """Reject a join request."""
     with compair.Session() as session:
-        request = session.query(models.JoinRequest).filter(
-            models.JoinRequest.request_id == request_id,
-            models.JoinRequest.group.has(models.Group.admins.any(models.Administrator.user_id == current_user.user_id))
-        ).first()
+        request = (
+            session.query(models.JoinRequest)
+            .filter(
+                models.JoinRequest.request_id == request_id,
+                models.JoinRequest.group.has(
+                    models.Group.admins.any(
+                        models.Administrator.user_id == current_user.user_id
+                    )
+                ),
+            )
+            .first()
+        )
         if not request:
             raise HTTPException(status_code=404, detail="Request not found")
 
@@ -3978,21 +4506,28 @@ def reject_request(
 
         return {"message": "Request rejected successfully"}
 
+
 @router.post("/admin/update_group")
 def update_group(
-    group_id: str, 
-    name: Optional[str] = Form(None), 
-    visibility: Optional[str] = Form(None), 
-    category: Optional[str] = Form(None), 
+    group_id: str,
+    name: Optional[str] = Form(None),
+    visibility: Optional[str] = Form(None),
+    category: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ) -> dict:
     """Update group settings."""
     with compair.Session() as session:
-        group = session.query(models.Group).filter(
-            models.Group.group_id == group_id,
-            models.Group.admins.any(models.Administrator.user_id == current_user.user_id)
-        ).first()
+        group = (
+            session.query(models.Group)
+            .filter(
+                models.Group.group_id == group_id,
+                models.Group.admins.any(
+                    models.Administrator.user_id == current_user.user_id
+                ),
+            )
+            .first()
+        )
         if not group:
             raise HTTPException(status_code=404, detail="Group not found")
         if name:
@@ -4007,47 +4542,69 @@ def update_group(
 
         return {"message": "Group updated successfully"}
 
+
 @router.post("/admin/invite_member")
 def invite_member_to_group(
     request: schema.InviteMemberRequest,
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ):
     """
     Invite an existing Compair user (by username or email) to join a group.
     If the user exists, create a GroupInvitation and send an email.
     """
-    admin_id = request.admin_id, 
-    group_id = request.group_id, 
+    admin_id = (request.admin_id,)
+    group_id = (request.group_id,)
     username = request.username
     with compair.Session() as session:
-        group = session.query(models.Group).filter(
-            models.Group.group_id == group_id,
-            models.Group.admins.any(models.Administrator.user_id == admin_id)
-        ).first()
+        group = (
+            session.query(models.Group)
+            .filter(
+                models.Group.group_id == group_id,
+                models.Group.admins.any(models.Administrator.user_id == admin_id),
+            )
+            .first()
+        )
         if not group:
             raise HTTPException(status_code=404, detail="Group not found")
 
-        admin = session.query(models.Administrator).filter(
-            models.Administrator.user_id == admin_id,
-            models.Administrator.groups.contains(group)
-        ).first()
+        admin = (
+            session.query(models.Administrator)
+            .filter(
+                models.Administrator.user_id == admin_id,
+                models.Administrator.groups.contains(group),
+            )
+            .first()
+        )
         if not admin:
-            raise HTTPException(status_code=403, detail="You are not authorized to manage this group")
+            raise HTTPException(
+                status_code=403, detail="You are not authorized to manage this group"
+            )
 
         # Try to find user by username or email
-        user = session.query(models.User).filter(
-            (models.User.username == username)# | (models.User.email == username_or_email) # if they were different
-        ).first()
+        user = (
+            session.query(models.User)
+            .filter(
+                (
+                    models.User.username
+                    == username  # | (models.User.email == username_or_email) # if they were different
+                )
+            )
+            .first()
+        )
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
         # Check if already a member or already invited
         if user in group.users:
             raise HTTPException(status_code=400, detail="User is already a member")
-        existing_invite = session.query(models.GroupInvitation).filter(
-            models.GroupInvitation.group_id == group_id,
-            models.GroupInvitation.email == user.username
-        ).first()
+        existing_invite = (
+            session.query(models.GroupInvitation)
+            .filter(
+                models.GroupInvitation.group_id == group_id,
+                models.GroupInvitation.email == user.username,
+            )
+            .first()
+        )
         if existing_invite:
             raise HTTPException(status_code=400, detail="User already invited")
 
@@ -4059,7 +4616,7 @@ def invite_member_to_group(
             token=token,
             email=user.username,
             datetime_expiration=datetime.utcnow() + timedelta(days=7),
-            status='pending'
+            status="pending",
         )
         session.add(invitation)
         session.commit()
@@ -4073,39 +4630,48 @@ def invite_member_to_group(
             receivers=[user.username],
             html=GROUP_INVITATION_TEMPLATE.replace(
                 "{{ inviter_name }}", admin.user.name
-            ).replace(
-                "{{ group_name }}", group.name
-            ).replace(
-                "{{ invitation_link }}", invitation_link
             )
+            .replace("{{ group_name }}", group.name)
+            .replace("{{ invitation_link }}", invitation_link),
         )
-        invitation.status = 'sent'
+        invitation.status = "sent"
         session.commit()
         return {"message": "Invitation sent successfully"}
+
 
 @router.post("/admin/invite_new_user")
 def invite_new_user_to_group(
     request: schema.InviteToGroupRequest,
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ) -> dict:
     admin_id = request.admin_id
     group_id = request.group_id
     email = request.email
     """Generate an invitation link to Compair and send it via email, logging a Group request to send on signup."""
     with compair.Session() as session:
-        group = session.query(models.Group).filter(
-            models.Group.group_id == group_id,
-            models.Group.admins.any(models.Administrator.user_id == admin_id)
-        ).first()
+        group = (
+            session.query(models.Group)
+            .filter(
+                models.Group.group_id == group_id,
+                models.Group.admins.any(models.Administrator.user_id == admin_id),
+            )
+            .first()
+        )
         if not group:
             raise HTTPException(status_code=404, detail="Group not found")
 
-        admin = session.query(models.Administrator).filter(
-            models.Administrator.user_id == admin_id,
-            models.Administrator.groups.contains(group)
-        ).first()
+        admin = (
+            session.query(models.Administrator)
+            .filter(
+                models.Administrator.user_id == admin_id,
+                models.Administrator.groups.contains(group),
+            )
+            .first()
+        )
         if not admin:
-            raise HTTPException(status_code=403, detail="You are not authorized to manage this group")
+            raise HTTPException(
+                status_code=403, detail="You are not authorized to manage this group"
+            )
 
         referral_link = generate_referral_link(admin.user.referral_code)
 
@@ -4121,7 +4687,7 @@ def invite_new_user_to_group(
                 token=token,
                 email=email,
                 datetime_expiration=datetime.utcnow() + timedelta(days=7),
-                status="pending"
+                status="pending",
             )
             session.add(invitation)
             session.commit()
@@ -4133,32 +4699,46 @@ def invite_new_user_to_group(
             html=INDIVIDUAL_INVITATION_TEMPLATE.replace(
                 "{{inviter_name}}", admin.user.name
             ).replace(
-                "{{referral_link}}", referral_link,
-            )
+                "{{referral_link}}",
+                referral_link,
+            ),
         )
 
         return {"message": "Invitation to join Compair successful."}
 
+
 @router.post("/admin/remove_member")
 def remove_member(
     request: schema.RemoveMemberRequest,
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ):
     """Remove a member from a group."""
     with compair.Session() as session:
         # Validate that the group exists
-        group = session.query(models.Group).filter(models.Group.group_id == request.group_id).first()
+        group = (
+            session.query(models.Group)
+            .filter(models.Group.group_id == request.group_id)
+            .first()
+        )
         if not group:
             raise HTTPException(status_code=404, detail="Group not found")
 
         # Validate that the current user is an admin of the group
         if not any(admin.user_id == current_user.user_id for admin in group.admins):
-            raise HTTPException(status_code=403, detail="You are not authorized to manage this group")
+            raise HTTPException(
+                status_code=403, detail="You are not authorized to manage this group"
+            )
 
         # Validate that the user to be removed is a member of the group
-        user = session.query(models.User).filter(models.User.user_id == request.user_id).first()
+        user = (
+            session.query(models.User)
+            .filter(models.User.user_id == request.user_id)
+            .first()
+        )
         if not user or user not in group.users:
-            raise HTTPException(status_code=404, detail="User is not a member of this group")
+            raise HTTPException(
+                status_code=404, detail="User is not a member of this group"
+            )
 
         # Remove the user from the group
         group.users.remove(user)
@@ -4172,7 +4752,7 @@ def remove_member(
             action="remove_member",
             object_id=user.user_id,
             object_name=user.name,
-            object_type="user"
+            object_type="user",
         )
 
         return {"message": f"User {user.name} has been removed from the group"}
@@ -4181,7 +4761,7 @@ def remove_member(
 @router.post("/groups/leave")
 def leave_group(
     request: schema.LeaveGroupRequest,
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ):
     """Allow the authenticated user to leave a group they belong to."""
     with compair.Session() as session:
@@ -4198,12 +4778,20 @@ def leave_group(
         if not group:
             raise HTTPException(status_code=404, detail="Group not found")
 
-        user = session.query(models.User).filter(models.User.user_id == current_user.user_id).first()
+        user = (
+            session.query(models.User)
+            .filter(models.User.user_id == current_user.user_id)
+            .first()
+        )
         if not user or user not in group.users:
-            raise HTTPException(status_code=404, detail="You are not a member of this group")
+            raise HTTPException(
+                status_code=404, detail="You are not a member of this group"
+            )
 
         remaining_users = [u for u in group.users if u.user_id != user.user_id]
-        user_admin = next((admin for admin in group.admins if admin.user_id == user.user_id), None)
+        user_admin = next(
+            (admin for admin in group.admins if admin.user_id == user.user_id), None
+        )
         promoted_admin_user_id: str | None = None
 
         # If this user is the final member/admin, delete the empty group to avoid orphaned groups.
@@ -4240,12 +4828,15 @@ def leave_group(
 
         # If user is the only admin and other members remain, promote one member before leaving.
         if user_admin:
-            remaining_admins = [admin for admin in group.admins if admin.user_id != user.user_id]
+            remaining_admins = [
+                admin for admin in group.admins if admin.user_id != user.user_id
+            ]
             if not remaining_admins:
                 promoted_user = sorted(
                     remaining_users,
                     key=lambda candidate: (
-                        candidate.datetime_registered or datetime(1970, 1, 1, tzinfo=timezone.utc),
+                        candidate.datetime_registered
+                        or datetime(1970, 1, 1, tzinfo=timezone.utc),
                         candidate.user_id,
                     ),
                 )[0]
@@ -4258,7 +4849,9 @@ def leave_group(
                     promoted_admin = models.Administrator(user_id=promoted_user.user_id)
                     session.add(promoted_admin)
                     session.flush()
-                if not any(admin.user_id == promoted_user.user_id for admin in group.admins):
+                if not any(
+                    admin.user_id == promoted_user.user_id for admin in group.admins
+                ):
                     group.admins.append(promoted_admin)
                 promoted_admin_user_id = promoted_user.user_id
 
@@ -4290,14 +4883,18 @@ def leave_group(
             "promoted_admin_user_id": promoted_admin_user_id,
         }
 
+
 @router.get("/accept_group_invitation")
 def accept_group_invitation(
-    token: str, 
-    current_user: models.User = Depends(get_current_user)
+    token: str, current_user: models.User = Depends(get_current_user)
 ):
     """Accept a group invitation using a token."""
     with compair.Session() as session:
-        invitation = session.query(models.GroupInvitation).filter(models.GroupInvitation.token == token).first()
+        invitation = (
+            session.query(models.GroupInvitation)
+            .filter(models.GroupInvitation.token == token)
+            .first()
+        )
         if not invitation:
             raise HTTPException(status_code=404, detail="Invalid or expired invitation")
 
@@ -4307,7 +4904,11 @@ def accept_group_invitation(
             raise HTTPException(status_code=400, detail="Invitation has expired")
 
         group = invitation.group
-        user = session.query(models.User).filter(models.User.user_id == current_user.user_id).first()
+        user = (
+            session.query(models.User)
+            .filter(models.User.user_id == current_user.user_id)
+            .first()
+        )
 
         # Add the user to the group
         group.users.append(user)
@@ -4316,20 +4917,26 @@ def accept_group_invitation(
 
         return {"message": "You have successfully joined the group"}
 
+
 @router.get("/accept_team_invitation")
 def accept_team_invitation(
-    token: str, 
-    current_user: models.User = Depends(get_current_user)
+    token: str, current_user: models.User = Depends(get_current_user)
 ):
     """Accept a team invitation using a token."""
     require_feature(HAS_TEAM, "Team collaboration")
     with compair.Session() as session:
-        invitation = session.query(models.TeamInvitation).filter(
-            models.TeamInvitation.invitation_id == token,
-            models.TeamInvitation.status == "sent",
-        ).first()
+        invitation = (
+            session.query(models.TeamInvitation)
+            .filter(
+                models.TeamInvitation.invitation_id == token,
+                models.TeamInvitation.status == "sent",
+            )
+            .first()
+        )
         if not invitation:
-            raise HTTPException(status_code=404, detail="Invalid or expired invitation.")
+            raise HTTPException(
+                status_code=404, detail="Invalid or expired invitation."
+            )
 
         if hasattr(current_user, "team_id"):
             current_user.team_id = invitation.team_id
@@ -4338,28 +4945,34 @@ def accept_team_invitation(
 
         return {"message": "You have successfully joined the team!"}
 
+
 def get_feedback_tooltip(
     feedback_id: str,
 ) -> str:
     """Retrieve feedback details for tooltip display."""
     with compair.Session() as session:
-        feedbacks = session.query(models.Feedback).filter(models.Feedback.feedback_id == feedback_id).all()
+        feedbacks = (
+            session.query(models.Feedback)
+            .filter(models.Feedback.feedback_id == feedback_id)
+            .all()
+        )
         return " | ".join(f.feedback for f in feedbacks)
+
 
 @router.get("/get_activity_feed")
 def get_activity_feed(
-    user_id: Optional[str] = None, 
-    page: int = 1, 
-    page_size: int = 10, 
+    user_id: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 10,
     include_own_activities: bool = True,
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ):
     """Retrieve recent activities for a user's groups."""
     require_feature(HAS_ACTIVITY, "Activity feed")
     with compair.Session() as session:
         # Default to current user if none provided
         user_id = user_id or current_user.user_id
-        
+
         # Query recent activities related to user's groups
         group_ids = [g.group_id for g in current_user.groups]
 
@@ -4387,15 +5000,19 @@ def get_activity_feed(
                     "object_name": activity.object_name,
                     "object_id": activity.object_id,
                     "timestamp": activity.timestamp,
-                    "tooltip": get_feedback_tooltip(activity.object_id) if activity.action == "provided feedback" else None
+                    "tooltip": get_feedback_tooltip(activity.object_id)
+                    if activity.action == "provided feedback"
+                    else None,
                 }
                 for activity in activities
             ],
-            "total_count": total_count
+            "total_count": total_count,
         }
 
 
-def _serialize_notification_event(event: Any, group_name: Optional[str] = None) -> dict[str, Any]:
+def _serialize_notification_event(
+    event: Any, group_name: Optional[str] = None
+) -> dict[str, Any]:
     return {
         "event_id": event.event_id,
         "user_id": event.user_id,
@@ -4502,13 +5119,17 @@ def upload_desktop_metrics_batch(
 
     metric_model = _get_cloud_metric_model("DesktopMetricEvent")
     if metric_model is None:
-        raise HTTPException(status_code=501, detail="Desktop analytics storage is not configured.")
+        raise HTTPException(
+            status_code=501, detail="Desktop analytics storage is not configured."
+        )
 
     raw_events = request_payload.get("events")
     if not isinstance(raw_events, list):
         raise HTTPException(status_code=400, detail="'events' must be a list.")
     if len(raw_events) > 500:
-        raise HTTPException(status_code=400, detail="At most 500 events are allowed per request.")
+        raise HTTPException(
+            status_code=400, detail="At most 500 events are allowed per request."
+        )
 
     now = datetime.now(timezone.utc)
     sanitized: list[dict[str, Any]] = []
@@ -4604,15 +5225,21 @@ def upload_anonymous_client_metrics_batch(
 
     metric_model = _get_cloud_metric_model("AnonymousClientMetricEvent")
     if metric_model is None:
-        raise HTTPException(status_code=501, detail="Anonymous telemetry storage is not configured.")
+        raise HTTPException(
+            status_code=501, detail="Anonymous telemetry storage is not configured."
+        )
 
     raw_events = request_payload.get("events")
     if not isinstance(raw_events, list):
         raise HTTPException(status_code=400, detail="'events' must be a list.")
     if len(raw_events) > 200:
-        raise HTTPException(status_code=400, detail="At most 200 events are allowed per request.")
+        raise HTTPException(
+            status_code=400, detail="At most 200 events are allowed per request."
+        )
 
-    fallback_source = _clean_text(str(request_payload.get("client") or "unknown"), 32) or "unknown"
+    fallback_source = (
+        _clean_text(str(request_payload.get("client") or "unknown"), 32) or "unknown"
+    )
     fallback_install_id = _clean_text(str(request_payload.get("install_id") or ""), 128)
     now = datetime.now(timezone.utc)
     sanitized: list[dict[str, Any]] = []
@@ -4622,7 +5249,9 @@ def upload_anonymous_client_metrics_batch(
         if not isinstance(item, Mapping):
             rejected += 1
             continue
-        install_id = _clean_text(str(item.get("install_id") or fallback_install_id or ""), 128)
+        install_id = _clean_text(
+            str(item.get("install_id") or fallback_install_id or ""), 128
+        )
         client_event_id = _clean_text(str(item.get("client_event_id") or ""), 128)
         event_name = _clean_text(str(item.get("event") or ""), 128)
         if not install_id or not client_event_id or not event_name:
@@ -4634,7 +5263,10 @@ def upload_anonymous_client_metrics_batch(
         seen_keys.add(dedupe_key)
         kind_raw = str(item.get("kind") or "usage").strip().lower()
         kind = "issue" if kind_raw in {"issue", "error", "diagnostic"} else "usage"
-        source = _clean_text(str(item.get("source") or fallback_source), 32) or fallback_source
+        source = (
+            _clean_text(str(item.get("source") or fallback_source), 32)
+            or fallback_source
+        )
         app_version = _clean_text(str(item.get("app_version") or ""), 64)
         os_name = _clean_text(str(item.get("os") or item.get("os_name") or ""), 32)
         arch = _clean_text(str(item.get("arch") or ""), 32)
@@ -4755,12 +5387,18 @@ def get_client_metrics_summary(
                 ids.add(str(actor_id))
             if event_name:
                 event_key = str(event_name)
-                bucket["event_names"][event_key] = bucket["event_names"].get(event_key, 0) + 1
+                bucket["event_names"][event_key] = (
+                    bucket["event_names"].get(event_key, 0) + 1
+                )
                 all_events[event_key] = all_events.get(event_key, 0) + 1
             if app_version:
                 version_key = str(app_version)
-                bucket["versions"][version_key] = bucket["versions"].get(version_key, 0) + 1
-            if when and (bucket["last_seen_at"] is None or when > bucket["last_seen_at"]):
+                bucket["versions"][version_key] = (
+                    bucket["versions"].get(version_key, 0) + 1
+                )
+            if when and (
+                bucket["last_seen_at"] is None or when > bucket["last_seen_at"]
+            ):
                 bucket["last_seen_at"] = when
             if when and (latest_seen is None or when > latest_seen):
                 latest_seen = when
@@ -4777,7 +5415,9 @@ def get_client_metrics_summary(
 
         top_events = [
             {"event": name, "count": count}
-            for name, count in sorted(all_events.items(), key=lambda item: (-item[1], item[0]))[:10]
+            for name, count in sorted(
+                all_events.items(), key=lambda item: (-item[1], item[0])
+            )[:10]
         ]
         return {
             "total_events": total_events,
@@ -4865,7 +5505,9 @@ def get_notification_events(
             q = q.filter(models.NotificationEvent.group_id.in_(group_ids))
         if group_id:
             if group_id not in group_ids:
-                raise HTTPException(status_code=403, detail="Not authorized for this group.")
+                raise HTTPException(
+                    status_code=403, detail="Not authorized for this group."
+                )
             q = q.filter(models.NotificationEvent.group_id == group_id)
         if not include_acknowledged:
             q = q.filter(models.NotificationEvent.acknowledged_at.is_(None))
@@ -4876,10 +5518,19 @@ def get_notification_events(
 
         total_count = q.count()
         offset = (page - 1) * page_size
-        events = q.order_by(models.NotificationEvent.created_at.desc()).offset(offset).limit(page_size).all()
+        events = (
+            q.order_by(models.NotificationEvent.created_at.desc())
+            .offset(offset)
+            .limit(page_size)
+            .all()
+        )
         group_name_map = {}
         if group_ids:
-            groups = session.query(models.Group).filter(models.Group.group_id.in_(group_ids)).all()
+            groups = (
+                session.query(models.Group)
+                .filter(models.Group.group_id.in_(group_ids))
+                .all()
+            )
             group_name_map = {g.group_id: (g.name or g.group_id) for g in groups}
 
         return {
@@ -4906,10 +5557,14 @@ def acknowledge_notification_event(
         if not event:
             raise HTTPException(status_code=404, detail="Notification event not found.")
         if event.user_id != current_user.user_id:
-            raise HTTPException(status_code=403, detail="Not authorized for this event.")
+            raise HTTPException(
+                status_code=403, detail="Not authorized for this event."
+            )
         group_ids = [g.group_id for g in current_user.groups]
         if event.group_id not in group_ids:
-            raise HTTPException(status_code=403, detail="Not authorized for this group.")
+            raise HTTPException(
+                status_code=403, detail="Not authorized for this group."
+            )
 
         event.acknowledged_at = datetime.now(timezone.utc)
         session.commit()
@@ -4934,10 +5589,14 @@ def dismiss_notification_event(
         if not event:
             raise HTTPException(status_code=404, detail="Notification event not found.")
         if event.user_id != current_user.user_id:
-            raise HTTPException(status_code=403, detail="Not authorized for this event.")
+            raise HTTPException(
+                status_code=403, detail="Not authorized for this event."
+            )
         group_ids = [g.group_id for g in current_user.groups]
         if event.group_id not in group_ids:
-            raise HTTPException(status_code=403, detail="Not authorized for this group.")
+            raise HTTPException(
+                status_code=403, detail="Not authorized for this group."
+            )
 
         now = datetime.now(timezone.utc)
         event.dismissed_at = now
@@ -4967,10 +5626,14 @@ def share_notification_event(
         if not event:
             raise HTTPException(status_code=404, detail="Notification event not found.")
         if event.user_id != current_user.user_id:
-            raise HTTPException(status_code=403, detail="Not authorized for this event.")
+            raise HTTPException(
+                status_code=403, detail="Not authorized for this event."
+            )
         group_ids = [g.group_id for g in current_user.groups]
         if event.group_id not in group_ids:
-            raise HTTPException(status_code=403, detail="Not authorized for this group.")
+            raise HTTPException(
+                status_code=403, detail="Not authorized for this group."
+            )
 
         group = (
             session.query(models.Group)
@@ -5042,11 +5705,9 @@ def share_notification_event(
         session.commit()
         return {"shared_count": shared, "skipped": skipped}
 
+
 @router.delete("/delete_group")
-def delete_group(
-    group_id: str,
-    current_user: models.User = Depends(get_current_user)
-):
+def delete_group(group_id: str, current_user: models.User = Depends(get_current_user)):
     """Delete a group. Allowed only if the current user is an admin of the group.
 
     This removes the group and cascades documents that only belong to this group.
@@ -5062,7 +5723,9 @@ def delete_group(
         # Check admin rights
         is_admin = any(a.user_id == current_user.user_id for a in group.admins)
         if not is_admin:
-            raise HTTPException(status_code=403, detail="Not authorized to delete this group")
+            raise HTTPException(
+                status_code=403, detail="Not authorized to delete this group"
+            )
         name = group.name
         # Delete documents that belong only to this group
         docs_to_delete = [d for d in group.documents if len(d.groups) == 1]
@@ -5085,14 +5748,16 @@ def delete_group(
             pass
         return {"message": "Group deleted", "group_id": group_id}
 
+
 plan_to_id = {
-    #"starter": "price_1Rpb5VEPPPghXLIJkgJyWBXb",
-    #"standard": "price_1Qv7etEPPPghXLIJ5SR8KgXD",
-    "individual_monthly": "price_1Ry34UEPPPghXLIJ4OLQNEna",#"price_1RwnRaEPPPghXLIJIPyeVxLq",
-    "individual_annual": "price_1Ry34NEPPPghXLIJeftgEYOD",#"price_1RwoQkEPPPghXLIJyNUCRRo3",
-    "team_monthly": "price_1Ry34HEPPPghXLIJoEyGRm7h",#"price_1RwoRDEPPPghXLIJt7uTCC7E",
-    "team_annual": "price_1Ry34REPPPghXLIJXhLhwpBW"#"price_1RwoP9EPPPghXLIJo16OPgMu",
+    # "starter": "price_1Rpb5VEPPPghXLIJkgJyWBXb",
+    # "standard": "price_1Qv7etEPPPghXLIJ5SR8KgXD",
+    "individual_monthly": "price_1Ry34UEPPPghXLIJ4OLQNEna",  # "price_1RwnRaEPPPghXLIJIPyeVxLq",
+    "individual_annual": "price_1Ry34NEPPPghXLIJeftgEYOD",  # "price_1RwoQkEPPPghXLIJyNUCRRo3",
+    "team_monthly": "price_1Ry34HEPPPghXLIJoEyGRm7h",  # "price_1RwoRDEPPPghXLIJt7uTCC7E",
+    "team_annual": "price_1Ry34REPPPghXLIJXhLhwpBW",  # "price_1RwoP9EPPPghXLIJo16OPgMu",
 }
+
 
 @router.post("/create-checkout-session")
 def create_checkout_session(
@@ -5106,17 +5771,23 @@ def create_checkout_session(
     require_cloud("Billing")
 
     if not settings.billing_enabled:
-        raise HTTPException(status_code=501, detail="Billing is not available in this edition.")
+        raise HTTPException(
+            status_code=501, detail="Billing is not available in this edition."
+        )
 
     plan = checkout_map.get("plan", "individual_monthly")
     team_emails = checkout_map.get("team_emails", []) or []
     if isinstance(team_emails, str):
-        team_emails = [email.strip() for email in team_emails.split(',') if email.strip()]
+        team_emails = [
+            email.strip() for email in team_emails.split(",") if email.strip()
+        ]
     if plan not in plan_to_id:
         raise HTTPException(status_code=400, detail="Unsupported plan selected.")
 
     if plan.startswith("team") and len(team_emails) < 3:
-        raise HTTPException(status_code=400, detail="Team plans require at least 4 emails.")
+        raise HTTPException(
+            status_code=400, detail="Team plans require at least 4 emails."
+        )
 
     price_id = plan_to_id[plan]
 
@@ -5124,7 +5795,11 @@ def create_checkout_session(
 
     try:
         with compair.Session() as session:
-            db_user = session.query(models.User).filter(models.User.user_id == current_user.user_id).first()
+            db_user = (
+                session.query(models.User)
+                .filter(models.User.user_id == current_user.user_id)
+                .first()
+            )
             if not db_user:
                 raise HTTPException(status_code=404, detail="User not found.")
 
@@ -5139,7 +5814,11 @@ def create_checkout_session(
                     raise HTTPException(status_code=501, detail=str(exc)) from exc
                 db_user.stripe_customer_id = customer_id
                 session.commit()
-                log_event("stripe_customer_created", user_id=db_user.user_id, customer_id=customer_id)
+                log_event(
+                    "stripe_customer_created",
+                    user_id=db_user.user_id,
+                    customer_id=customer_id,
+                )
 
             customer_id = db_user.stripe_customer_id
 
@@ -5155,7 +5834,11 @@ def create_checkout_session(
                 session.commit()
 
                 for email in team_emails:
-                    existing_user = session.query(models.User).filter(models.User.username == email).first()
+                    existing_user = (
+                        session.query(models.User)
+                        .filter(models.User.username == email)
+                        .first()
+                    )
                     if not existing_user:
                         invitation = models.TeamInvitation(
                             email=email,
@@ -5190,14 +5873,21 @@ def create_checkout_session(
             if session_url is None and hasattr(session_info, "get"):
                 session_url = session_info.get("url")
             if not session_id or not session_url:
-                raise HTTPException(status_code=500, detail="Billing provider did not return a checkout URL.")
+                raise HTTPException(
+                    status_code=500,
+                    detail="Billing provider did not return a checkout URL.",
+                )
 
             if hasattr(db_user, "checkout_session"):
                 db_user.checkout_session = session_id
             if hasattr(db_user, "plan"):
                 db_user.plan = plan
             session.commit()
-            log_event("stripe_checkout_session_created", user_id=db_user.user_id, session_id=session_id)
+            log_event(
+                "stripe_checkout_session_created",
+                user_id=db_user.user_id,
+                session_id=session_id,
+            )
             return {"url": session_url}
     except HTTPException:
         raise
@@ -5218,7 +5908,9 @@ def redirect_to_checkout(
     with compair.Session() as session:
         user = session.query(models.User).filter(models.User.user_id == user_id).first()
         if not user or not user.checkout_session:
-            raise HTTPException(status_code=500, detail=f"No checkout session found for user {user_id}")
+            raise HTTPException(
+                status_code=500, detail=f"No checkout session found for user {user_id}"
+            )
 
         session_id = user.checkout_session
         try:
@@ -5232,23 +5924,27 @@ def redirect_to_checkout(
     return {"url": checkout_url}
 
 
-
 def track_payment_method(fingerprint: str):
     """
     Track the number of credits associated with a payment fingerprint.
     """
     with compair.Session() as session:
-        total_credits = session.query(models.User).filter(
-            models.User.payment_fingerprint == fingerprint,
-            models.User.referral_credits > 0
-        ).count()
+        total_credits = (
+            session.query(models.User)
+            .filter(
+                models.User.payment_fingerprint == fingerprint,
+                models.User.referral_credits > 0,
+            )
+            .count()
+        )
 
         max_credits_per_payment = 3
         if total_credits >= max_credits_per_payment:
             raise HTTPException(
                 status_code=400,
-                detail="Referral credit limit reached for this payment method."
+                detail="Referral credit limit reached for this payment method.",
             )
+
 
 def handle_successful_checkout(session):
     """
@@ -5261,41 +5957,53 @@ def handle_successful_checkout(session):
     payment_method = session.get("payment_method")  # Might not exist if using trial
     if payment_method:
         with compair.Session() as session:
-            user = session.query(models.User).filter(
-                models.User.stripe_customer_id == customer_id
-            ).first()
+            user = (
+                session.query(models.User)
+                .filter(models.User.stripe_customer_id == customer_id)
+                .first()
+            )
             if user:
                 user.payment_fingerprint = payment_method
                 track_payment_method(user.payment_fingerprint)
                 session.commit()
-    
+
     payment_status = session["payment_status"]
     if payment_status != "paid":
         return
-    
+
     with compair.Session() as db_session:
-        user = db_session.query(models.User).filter(
-            models.User.stripe_customer_id == customer_id
-        ).first()
+        user = (
+            db_session.query(models.User)
+            .filter(models.User.stripe_customer_id == customer_id)
+            .first()
+        )
         if not user:
             return
 
         if user.plan.startswith("team"):
-            team = db_session.query(models.Team).filter(
-                models.Team.ownership.has(owner_id=user.user_id)
-            ).first()
+            team = (
+                db_session.query(models.Team)
+                .filter(models.Team.ownership.has(owner_id=user.user_id))
+                .first()
+            )
             if not team:
                 return
 
             # Update invitations with the new team ID and send emails
-            invitations = db_session.query(models.TeamInvitation).filter(
-                models.TeamInvitation.inviter_id == user.user_id,
-                models.TeamInvitation.status == "pending",
-            ).all()
+            invitations = (
+                db_session.query(models.TeamInvitation)
+                .filter(
+                    models.TeamInvitation.inviter_id == user.user_id,
+                    models.TeamInvitation.status == "pending",
+                )
+                .all()
+            )
             for invitation in invitations:
-                existing_user = db_session.query(models.User).filter(
-                    models.User.username == invitation.email
-                ).first()
+                existing_user = (
+                    db_session.query(models.User)
+                    .filter(models.User.username == invitation.email)
+                    .first()
+                )
 
                 if existing_user:
                     # Send team invitation email to existing user
@@ -5307,7 +6015,7 @@ def handle_successful_checkout(session):
                         html=f"""
                         <p>{user.name} has invited you to join their team on Compair!</p>
                         <p>Click <a href="https://{WEB_URL}/accept-invitation?token={invitation.invitation_id}">here</a> to join.</p>
-                        """
+                        """,
                     )
                     invitation.status = "sent"
                 else:
@@ -5316,6 +6024,7 @@ def handle_successful_checkout(session):
                         invitee_emails=invitation.email,
                         current_user=user,
                     )
+
 
 def handle_successful_payment_intent(intent):
     """
@@ -5326,13 +6035,16 @@ def handle_successful_payment_intent(intent):
     payment_method = intent.get("payment_method")
     if payment_method:
         with compair.Session() as session:
-            user = session.query(models.User).filter(
-                models.User.stripe_customer_id == customer_id
-            ).first()
+            user = (
+                session.query(models.User)
+                .filter(models.User.stripe_customer_id == customer_id)
+                .first()
+            )
             if user and hasattr(user, "payment_fingerprint"):
                 user.payment_fingerprint = payment_method
                 track_payment_method(user.payment_fingerprint)
                 session.commit()
+
 
 def handle_successful_invoice_payment(
     invoice,
@@ -5349,7 +6061,7 @@ def handle_successful_invoice_payment(
         if "price" in line and "id" in line["price"]:
             price_id = line["price"]["id"]
             break
-    
+
     plan = None
     for k, v in plan_to_id.items():
         if v == price_id:
@@ -5359,21 +6071,25 @@ def handle_successful_invoice_payment(
     payment_method = invoice.get("payment_method")
     if payment_method:
         with compair.Session() as session:
-            user = session.query(models.User).filter(
-                models.User.stripe_customer_id == customer_id
-            ).first()
+            user = (
+                session.query(models.User)
+                .filter(models.User.stripe_customer_id == customer_id)
+                .first()
+            )
             if user:
                 user.payment_fingerprint = payment_method
                 track_payment_method(user.payment_fingerprint)
                 session.commit()
 
     with compair.Session() as session:
-        user = session.query(models.User).filter(
-            models.User.stripe_customer_id == customer_id
-        ).first()
+        user = (
+            session.query(models.User)
+            .filter(models.User.stripe_customer_id == customer_id)
+            .first()
+        )
         if user:
             # user.stripe_subscription_id = subscription_id ## Can track if needed
-            user.status = 'active'  # Mark the user as subscribed
+            user.status = "active"  # Mark the user as subscribed
             if hasattr(user, "last_payment_date"):
                 user.last_payment_date = datetime.now(timezone.utc)
             user.status_change_date = datetime.now(timezone.utc)
@@ -5381,10 +6097,16 @@ def handle_successful_invoice_payment(
                 user.plan = plan
             # Handle referrer logic
             if hasattr(user, "referred_by") and user.referred_by:
-                referrer = session.query(models.User).filter(
-                    models.User.user_id == user.referred_by
-                ).first()
-                if referrer and hasattr(referrer, "pending_referral_credits") and referrer.pending_referral_credits > 0:
+                referrer = (
+                    session.query(models.User)
+                    .filter(models.User.user_id == user.referred_by)
+                    .first()
+                )
+                if (
+                    referrer
+                    and hasattr(referrer, "pending_referral_credits")
+                    and referrer.pending_referral_credits > 0
+                ):
                     # Convert pending credits to earned credits
                     if hasattr(referrer, "referral_credits"):
                         referrer.referral_credits += 10
@@ -5398,17 +6120,21 @@ def handle_successful_invoice_payment(
                         html=REFERRAL_CREDIT_TEMPLATE.replace(
                             "{{user_name}}", referrer.name
                         ).replace(
-                            "{{referral_credits}}", str(referrer.referral_credits),
-                        )
+                            "{{referral_credits}}",
+                            str(referrer.referral_credits),
+                        ),
                     )
                     # Create and apply a $15 coupon in Stripe ($25 if team plan)
                     amount = 15
-                    if referrer.plan == 'team':
-                        amount=25
+                    if referrer.plan == "team":
+                        amount = 25
                     try:
                         coupon_id = billing.create_coupon(amount)
                         if referrer.stripe_customer_id:
-                            billing.apply_coupon(customer_id=referrer.stripe_customer_id, coupon_id=coupon_id)
+                            billing.apply_coupon(
+                                customer_id=referrer.stripe_customer_id,
+                                coupon_id=coupon_id,
+                            )
                     except NotImplementedError:
                         pass
 
@@ -5420,20 +6146,24 @@ def handle_successful_invoice_payment(
 
             session.commit()
 
+
 def handle_subscription_cancellation(subscription):
     """
     Revoke access if a subscription is canceled.
     """
     customer_id = subscription["customer"]
     with compair.Session() as session:
-        user = session.query(models.User).filter(
-            models.User.stripe_customer_id == customer_id
-        ).first()
+        user = (
+            session.query(models.User)
+            .filter(models.User.stripe_customer_id == customer_id)
+            .first()
+        )
 
         if user:
-            user.status = 'suspended'  # Remove access
+            user.status = "suspended"  # Remove access
             user.status_change_date = datetime.now(timezone.utc)
             session.commit()
+
 
 def handle_failed_payment(invoice):
     """
@@ -5441,14 +6171,17 @@ def handle_failed_payment(invoice):
     """
     customer_id = invoice["customer"]
     with compair.Session() as session:
-        user = session.query(models.User).filter(
-            models.User.stripe_customer_id == customer_id
-        ).first()
+        user = (
+            session.query(models.User)
+            .filter(models.User.stripe_customer_id == customer_id)
+            .first()
+        )
 
         if user:
-            user.status = 'suspended'  # Suspend access until payment is made
+            user.status = "suspended"  # Suspend access until payment is made
             user.status_change_date = datetime.now(timezone.utc)
             session.commit()
+
 
 @router.post("/webhook")
 async def stripe_webhook(
@@ -5465,7 +6198,11 @@ async def stripe_webhook(
     try:
         event = billing.construct_event(payload, sig_header)
 
-        log_event("stripe_webhook_start", event_type=event['type'], data=event['data']['object'])
+        log_event(
+            "stripe_webhook_start",
+            event_type=event["type"],
+            data=event["data"]["object"],
+        )
 
         if event["type"] == "payment_intent.succeeded":
             intent = event["data"]["object"]
@@ -5489,12 +6226,15 @@ async def stripe_webhook(
             invoice = event["data"]["object"]
             handle_failed_payment(invoice)
 
-        log_event("stripe_webhook_complete", event_type=event['type'], data=event['data']['object'])
+        log_event(
+            "stripe_webhook_complete",
+            event_type=event["type"],
+            data=event["data"]["object"],
+        )
 
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
 
 
 def generate_referral_link(referral_code: str) -> str:
@@ -5504,6 +6244,7 @@ def generate_referral_link(referral_code: str) -> str:
     require_cloud("Referral program")
     base_url = f"{_public_web_base_url()}/login"
     return f"{base_url}?ref={referral_code}"
+
 
 @router.post("/send-invite")
 def send_invite(
@@ -5516,9 +6257,8 @@ def send_invite(
     If group_id is provided, track the invitation for group auto-invite on sign-up.
     """
     require_cloud("Referral program")
-    invitee_emails = invitee_emails.split(',')
+    invitee_emails = invitee_emails.split(",")
     with compair.Session() as session:
-
         referral_link = generate_referral_link(current_user.referral_code)
 
         # Send email notification
@@ -5534,7 +6274,7 @@ def send_invite(
                     token=token,
                     email=invitee_email,
                     datetime_expiration=datetime.utcnow() + timedelta(days=7),
-                    status="pending"
+                    status="pending",
                 )
                 session.add(invitation)
                 session.commit()
@@ -5546,11 +6286,13 @@ def send_invite(
                 html=INDIVIDUAL_INVITATION_TEMPLATE.replace(
                     "{{inviter_name}}", current_user.name
                 ).replace(
-                    "{{referral_link}}", referral_link,
-                )
+                    "{{referral_link}}",
+                    referral_link,
+                ),
             )
 
         return {"message": "Invitation sent successfully"}
+
 
 @router.post("/get-customer-portal")
 def get_customer_portal(
@@ -5561,15 +6303,23 @@ def get_customer_portal(
     """Generate a billing portal session link through the billing provider."""
 
     if not settings.billing_enabled:
-        raise HTTPException(status_code=501, detail="Billing is not available in this edition.")
+        raise HTTPException(
+            status_code=501, detail="Billing is not available in this edition."
+        )
 
     return_url = f"http://{WEB_URL}/home" if WEB_URL else "https://compair.sh/home"
 
     try:
         with compair.Session() as session:
-            user = session.query(models.User).filter(models.User.user_id == current_user.user_id).first()
+            user = (
+                session.query(models.User)
+                .filter(models.User.user_id == current_user.user_id)
+                .first()
+            )
             if not user or not user.stripe_customer_id:
-                raise HTTPException(status_code=400, detail="No billing profile found for this user.")
+                raise HTTPException(
+                    status_code=400, detail="No billing profile found for this user."
+                )
 
             try:
                 portal_url = billing.create_customer_portal(
@@ -5586,15 +6336,13 @@ def get_customer_portal(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-
-
 @router.post("/upload/profile")
 async def upload_profile_image(
     upload_type: str = Form(...),
     file: UploadFile = File(...),
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ) -> Mapping[str, str]:
-    if upload_type!='profile':
+    if upload_type != "profile":
         raise HTTPException(status_code=400, detail="Invalid upload type")
 
     allowed_types = ["image/jpg", "image/jpeg", "image/png", "image/webp"]
@@ -5602,15 +6350,9 @@ async def upload_profile_image(
         raise HTTPException(status_code=400, detail="Invalid file type")
 
     # Upload to Cloudflare Images
-    headers = {
-        "Authorization": f"Bearer {CLOUDFLARE_IMAGES_TOKEN}"
-    }
-    data = {
-        "requireSignedURLs": "false"
-    }
-    files = {
-        "file": (file.filename, await file.read(), file.content_type)
-    }
+    headers = {"Authorization": f"Bearer {CLOUDFLARE_IMAGES_TOKEN}"}
+    data = {"requireSignedURLs": "false"}
+    files = {"file": (file.filename, await file.read(), file.content_type)}
 
     async with httpx.AsyncClient() as client:
         response = await client.post(
@@ -5618,7 +6360,7 @@ async def upload_profile_image(
             headers=headers,
             data=data,
             files=files,
-            timeout=30
+            timeout=30,
         )
     if response.status_code != 200:
         raise HTTPException(status_code=500, detail="Cloudflare Images upload failed")
@@ -5630,10 +6372,14 @@ async def upload_profile_image(
     image_id = result["result"]["id"]
 
     with compair.Session() as session:
-        user = session.query(models.User).filter(models.User.user_id == current_user.user_id).first()
+        user = (
+            session.query(models.User)
+            .filter(models.User.user_id == current_user.user_id)
+            .first()
+        )
         user.profile_image = image_id
         session.commit()
-    
+
     # Read file bytes to get size
     file_bytes = await file.read()
     file_size = len(file_bytes)
@@ -5645,7 +6391,7 @@ async def upload_profile_image(
         user_id=current_user.user_id,
         file_size=file_size,
         file_key=image_id,
-        content_type=file.content_type
+        content_type=file.content_type,
     )
 
     return {"image_id": image_id}
@@ -5654,7 +6400,7 @@ async def upload_profile_image(
 @router.get("/get_profile_image")
 def get_profile_image(
     variant: str = Query("public", enum=["public", "avatar", "preview"]),
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ) -> Mapping[str, str]:
     with compair.Session() as session:
         image_id = (current_user.profile_image or "").strip()
@@ -5674,10 +6420,10 @@ async def upload_file(
     current_user: models.User = Depends(get_current_user),
     storage: StorageProvider = Depends(get_storage),
 ) -> Mapping[str, str]:
-    if upload_type != 'file':
+    if upload_type != "file":
         raise HTTPException(status_code=400, detail="Invalid upload type")
 
-    allowed_types = ["application/pdf"]#, "document/docx"]
+    allowed_types = ["application/pdf"]  # , "document/docx"]
     if file.content_type not in allowed_types:
         raise HTTPException(status_code=400, detail="Invalid file type")
 
@@ -5701,13 +6447,17 @@ async def upload_file(
 
     with compair.Session() as session:
         # Fetch the document
-        document = session.query(models.Document).filter(models.Document.document_id == document_id).first()
+        document = (
+            session.query(models.Document)
+            .filter(models.Document.document_id == document_id)
+            .first()
+        )
         if not document:
             raise HTTPException(status_code=404, detail="Document not found")
 
         document.file_key = file_key
         session.commit()
-    
+
     # Log the upload event
     log_event(
         "cloudflare_upload",
@@ -5716,7 +6466,7 @@ async def upload_file(
         document_id=document_id,
         file_size=file_size,
         file_key=file_key,
-        content_type=content_type
+        content_type=content_type,
     )
 
     return {"url": upload_url}
@@ -5724,11 +6474,9 @@ async def upload_file(
 
 @router.post("/upload/group")
 async def upload_group_image(
-    group_id: str,
-    upload_type: str,
-    file: UploadFile = File(...)
+    group_id: str, upload_type: str, file: UploadFile = File(...)
 ) -> Mapping[str, str]:
-    if upload_type!='group':
+    if upload_type != "group":
         raise HTTPException(status_code=400, detail="Invalid upload type")
 
     allowed_types = ["image/jpg", "image/jpeg", "image/png", "image/webp"]
@@ -5736,15 +6484,9 @@ async def upload_group_image(
         raise HTTPException(status_code=400, detail="Invalid file type")
 
     # Upload to Cloudflare Images
-    headers = {
-        "Authorization": f"Bearer {CLOUDFLARE_IMAGES_TOKEN}"
-    }
-    data = {
-        "requireSignedURLs": "false"
-    }
-    files = {
-        "file": (file.filename, await file.read(), file.content_type)
-    }
+    headers = {"Authorization": f"Bearer {CLOUDFLARE_IMAGES_TOKEN}"}
+    data = {"requireSignedURLs": "false"}
+    files = {"file": (file.filename, await file.read(), file.content_type)}
 
     async with httpx.AsyncClient() as client:
         response = await client.post(
@@ -5752,7 +6494,7 @@ async def upload_group_image(
             headers=headers,
             data=data,
             files=files,
-            timeout=30
+            timeout=30,
         )
     if response.status_code != 200:
         raise HTTPException(status_code=500, detail="Cloudflare Images upload failed")
@@ -5764,7 +6506,11 @@ async def upload_group_image(
     image_id = result["result"]["id"]
 
     with compair.Session() as session:
-        group = session.query(models.Group).filter(models.Group.group_id == group_id).first()
+        group = (
+            session.query(models.Group)
+            .filter(models.Group.group_id == group_id)
+            .first()
+        )
         group.group_image = image_id
         session.commit()
 
@@ -5779,8 +6525,9 @@ async def upload_group_image(
         group_id=group_id,
         file_size=file_size,
         file_key=image_id,
-        content_type=file.content_type
+        content_type=file.content_type,
     )
+
 
 @router.post("/send-feature-announcement")
 def send_feature_announcement(admin_key: str = Header(None)):
@@ -5789,7 +6536,10 @@ def send_feature_announcement(admin_key: str = Header(None)):
     Requires an admin API key.
     """
     if not IS_CLOUD or send_feature_announcement_task is None:
-        raise HTTPException(status_code=501, detail="Feature announcements require the Compair Cloud edition.")
+        raise HTTPException(
+            status_code=501,
+            detail="Feature announcements require the Compair Cloud edition.",
+        )
     if admin_key != ADMIN_API_KEY:
         raise HTTPException(status_code=403, detail="Unauthorized")
 
@@ -5804,12 +6554,16 @@ def grant_retrial(user_id: str):
     Reactivate a churned user's trial for 2 weeks.
     """
     if not IS_CLOUD:
-        raise HTTPException(status_code=501, detail="Re-trials require the Compair Cloud edition.")
+        raise HTTPException(
+            status_code=501, detail="Re-trials require the Compair Cloud edition."
+        )
     with Session() as session:
         user = session.query(models.User).filter(models.User.user_id == user_id).first()
 
         if not user or user.status != "suspended":
-            raise HTTPException(status_code=400, detail="User not eligible for a re-trial.")
+            raise HTTPException(
+                status_code=400, detail="User not eligible for a re-trial."
+            )
 
         if user.retrial_count >= 1:
             raise HTTPException(status_code=403, detail="Re-trial limit reached.")
@@ -5824,16 +6578,21 @@ def grant_retrial(user_id: str):
 
         return {"message": "Your re-trial has been activated!"}
 
+
 @router.post("/documents/{document_id}/notes")
 def create_note(
     document_id: str,
     content: str = Form(...),
     group_id: str = Form(None),
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ):
     """Create a Note for a Document. User must be in the Document's group. Also chunk/embed Note content."""
     with compair.Session() as session:
-        document = session.query(models.Document).filter(models.Document.document_id == document_id).first()
+        document = (
+            session.query(models.Document)
+            .filter(models.Document.document_id == document_id)
+            .first()
+        )
         if not document:
             raise HTTPException(status_code=404, detail="Document not found")
         # Check group membership
@@ -5846,7 +6605,7 @@ def create_note(
             author_id=current_user.user_id,
             group_id=group_id or (doc_group_ids[0] if doc_group_ids else None),
             content=content,
-            datetime_created=datetime.now(timezone.utc)
+            datetime_created=datetime.now(timezone.utc),
         )
         session.add(note)
         session.commit()
@@ -5875,7 +6634,7 @@ def create_note(
             action="create",
             object_id=note.note_id,
             object_name=f"Note on {document.title}",
-            object_type="note"
+            object_type="note",
         )
 
         return schema.Note(
@@ -5893,50 +6652,66 @@ def create_note(
                 status=current_user.status,
                 profile_image=current_user.profile_image,
                 role=current_user.role,
-            )
+            ),
         )
+
 
 @router.get("/documents/{document_id}/notes")
 def list_notes(
-    document_id: str,
-    current_user: models.User = Depends(get_current_user)
+    document_id: str, current_user: models.User = Depends(get_current_user)
 ) -> list[schema.Note]:
     """List all Notes for a Document."""
     with compair.Session() as session:
-        notes = session.query(models.Note).filter(models.Note.document_id == document_id).all()
+        notes = (
+            session.query(models.Note)
+            .filter(models.Note.document_id == document_id)
+            .all()
+        )
         result = []
         for note in notes:
-            author = session.query(models.User).filter(models.User.user_id == note.author_id).first()
-            result.append(schema.Note(
-                note_id=note.note_id,
-                document_id=note.document_id,
-                author_id=note.author_id,
-                group_id=note.group_id,
-                content=note.content,
-                datetime_created=note.datetime_created,
-                author=schema.User(
-                    user_id=author.user_id,
-                    username=author.username,
-                    name=author.name,
-                    datetime_registered=author.datetime_registered,
-                    status=author.status,
-                    profile_image=author.profile_image,
-                    role=author.role,
-                ) if author else None
-            ))
+            author = (
+                session.query(models.User)
+                .filter(models.User.user_id == note.author_id)
+                .first()
+            )
+            result.append(
+                schema.Note(
+                    note_id=note.note_id,
+                    document_id=note.document_id,
+                    author_id=note.author_id,
+                    group_id=note.group_id,
+                    content=note.content,
+                    datetime_created=note.datetime_created,
+                    author=schema.User(
+                        user_id=author.user_id,
+                        username=author.username,
+                        name=author.name,
+                        datetime_registered=author.datetime_registered,
+                        status=author.status,
+                        profile_image=author.profile_image,
+                        role=author.role,
+                    )
+                    if author
+                    else None,
+                )
+            )
         return result
+
 
 @router.get("/notes/{note_id}")
 def get_note(
-    note_id: str,
-    current_user: models.User = Depends(get_current_user)
+    note_id: str, current_user: models.User = Depends(get_current_user)
 ) -> schema.Note:
     """Get a single Note by ID."""
     with compair.Session() as session:
         note = session.query(models.Note).filter(models.Note.note_id == note_id).first()
         if not note:
             raise HTTPException(status_code=404, detail="Note not found")
-        author = session.query(models.User).filter(models.User.user_id == note.author_id).first()
+        author = (
+            session.query(models.User)
+            .filter(models.User.user_id == note.author_id)
+            .first()
+        )
         return schema.Note(
             note_id=note.note_id,
             document_id=note.document_id,
@@ -5952,8 +6727,11 @@ def get_note(
                 status=author.status,
                 profile_image=author.profile_image,
                 role=author.role,
-            ) if author else None
+            )
+            if author
+            else None,
         )
+
 
 @router.get("/documents/{document_id}/file-url")
 def get_document_file_url(
@@ -5963,11 +6741,18 @@ def get_document_file_url(
 ):
     """Return the file URL for a Document."""
     with compair.Session() as session:
-        doc = session.query(models.Document).filter(models.Document.document_id == document_id).first()
+        doc = (
+            session.query(models.Document)
+            .filter(models.Document.document_id == document_id)
+            .first()
+        )
         if not doc or not doc.file_key:
-            raise HTTPException(status_code=404, detail="File not found for this document.")
+            raise HTTPException(
+                status_code=404, detail="File not found for this document."
+            )
         file_url = storage.build_url(doc.file_key)
         return {"file_url": file_url}
+
 
 @router.get("/documents/{document_id}/image-url")
 def get_document_image_url(
@@ -5977,28 +6762,39 @@ def get_document_image_url(
 ):
     """Return the preview image URL for a Document."""
     with compair.Session() as session:
-        doc = session.query(models.Document).filter(models.Document.document_id == document_id).first()
+        doc = (
+            session.query(models.Document)
+            .filter(models.Document.document_id == document_id)
+            .first()
+        )
         if not doc or not doc.image_key:
-            raise HTTPException(status_code=404, detail="Image not found for this document.")
+            raise HTTPException(
+                status_code=404, detail="Image not found for this document."
+            )
         image_url = storage.build_url(doc.image_key)
         return {"image_url": image_url}
 
 
 def sanitize_filename(filename: str) -> str:
     # Replace non-ASCII characters with underscore
-    return re.sub(r'[^\x00-\x7F]+', '_', filename)
+    return re.sub(r"[^\x00-\x7F]+", "_", filename)
 
 
 @router.post("/documents/{document_id}/generate-download-token")
 def generate_download_token(
-    document_id: str,
-    current_user: models.User = Depends(get_current_user)
+    document_id: str, current_user: models.User = Depends(get_current_user)
 ):
     # Check permissions as in your download endpoint
     with compair.Session() as session:
-        doc = session.query(models.Document).filter(models.Document.document_id == document_id).first()
+        doc = (
+            session.query(models.Document)
+            .filter(models.Document.document_id == document_id)
+            .first()
+        )
         if not doc or not doc.file_key:
-            raise HTTPException(status_code=404, detail="File not found for this document.")
+            raise HTTPException(
+                status_code=404, detail="File not found for this document."
+            )
 
         # Authorization check (same as download endpoint)
         if current_user.user_id == doc.author_id:
@@ -6007,12 +6803,19 @@ def generate_download_token(
             doc_group_ids = {g.group_id for g in doc.groups}
             user_group_ids = {g.group_id for g in current_user.groups}
             if not doc_group_ids & user_group_ids:
-                raise HTTPException(status_code=403, detail="Not authorized to download this file.")
+                raise HTTPException(
+                    status_code=403, detail="Not authorized to download this file."
+                )
         else:
-            raise HTTPException(status_code=403, detail="Not authorized to download this file.")
+            raise HTTPException(
+                status_code=403, detail="Not authorized to download this file."
+            )
 
     if not HAS_REDIS:
-        raise HTTPException(status_code=501, detail="Secure download links require Redis, which is unavailable in the core edition.")
+        raise HTTPException(
+            status_code=501,
+            detail="Secure download links require Redis, which is unavailable in the core edition.",
+        )
 
     token = secrets.token_urlsafe(32)
     key = f"download_token:{token}"
@@ -6026,31 +6829,42 @@ def download_document_with_token(
     storage: StorageProvider = Depends(get_storage),
 ):
     if not HAS_REDIS:
-        raise HTTPException(status_code=501, detail="Secure download links require Redis, which is unavailable in the core edition.")
+        raise HTTPException(
+            status_code=501,
+            detail="Secure download links require Redis, which is unavailable in the core edition.",
+        )
 
     key = f"download_token:{token}"
     value = redis_client.get(key) if redis_client else None
-    document_id = value.decode('utf-8') if value else None
+    document_id = value.decode("utf-8") if value else None
     if not document_id:
         raise HTTPException(status_code=403, detail="Invalid or expired token")
     redis_client.delete(key)
     with compair.Session() as session:
-        doc = session.query(models.Document).filter(models.Document.document_id == document_id).first()
+        doc = (
+            session.query(models.Document)
+            .filter(models.Document.document_id == document_id)
+            .first()
+        )
         if not doc or not doc.file_key:
-            raise HTTPException(status_code=404, detail="File not found for this document.")
+            raise HTTPException(
+                status_code=404, detail="File not found for this document."
+            )
 
-        safe_title = sanitize_filename(doc.title or 'file')
+        safe_title = sanitize_filename(doc.title or "file")
         try:
             file_obj, content_type = storage.get_file(doc.file_key)
         except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail="Stored file could not be located.") from exc
+            raise HTTPException(
+                status_code=404, detail="Stored file could not be located."
+            ) from exc
 
         return StreamingResponse(
             file_obj,
             media_type=content_type,
             headers={
                 "Content-Disposition": f"attachment; filename={safe_title or 'file'}"
-            }
+            },
         )
 
 
@@ -6061,12 +6875,18 @@ def download_document_file(
     storage: StorageProvider = Depends(get_storage),
 ):
     with compair.Session() as session:
-        doc = session.query(models.Document).filter(models.Document.document_id == document_id).first()
+        doc = (
+            session.query(models.Document)
+            .filter(models.Document.document_id == document_id)
+            .first()
+        )
 
-        safe_title = sanitize_filename(doc.title or 'file')
+        safe_title = sanitize_filename(doc.title or "file")
 
         if not doc or not doc.file_key:
-            raise HTTPException(status_code=404, detail="File not found for this document.")
+            raise HTTPException(
+                status_code=404, detail="File not found for this document."
+            )
 
         # Authorization check
         if current_user.user_id == doc.author_id:
@@ -6076,20 +6896,24 @@ def download_document_file(
             doc_group_ids = {g.group_id for g in doc.groups}
             user_group_ids = {g.group_id for g in current_user.groups}
             if not doc_group_ids & user_group_ids:
-                raise HTTPException(status_code=403, detail="Not authorized to download this file.")
+                raise HTTPException(
+                    status_code=403, detail="Not authorized to download this file."
+                )
 
         # Fetch file from R2 and stream to user
         try:
             file_obj, content_type = storage.get_file(doc.file_key)
         except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail="Stored file could not be located.") from exc
+            raise HTTPException(
+                status_code=404, detail="Stored file could not be located."
+            ) from exc
 
         return StreamingResponse(
             file_obj,
             media_type=content_type,
             headers={
                 "Content-Disposition": f"attachment; filename={safe_title or 'file'}"
-            }
+            },
         )
 
 
@@ -6104,7 +6928,10 @@ def submit_marketing_contact(
     company: Optional[str] = Form(None),
 ):
     if not IS_CLOUD:
-        raise HTTPException(status_code=501, detail="Marketing endpoints require the Compair Cloud edition.")
+        raise HTTPException(
+            status_code=501,
+            detail="Marketing endpoints require the Compair Cloud edition.",
+        )
     if company:
         return {"message": "ok"}
     email_clean = _clean_email(email)
@@ -6138,7 +6965,10 @@ def submit_roadmap_poll(
     company: Optional[str] = Form(None),
 ):
     if not IS_CLOUD:
-        raise HTTPException(status_code=501, detail="Marketing endpoints require the Compair Cloud edition.")
+        raise HTTPException(
+            status_code=501,
+            detail="Marketing endpoints require the Compair Cloud edition.",
+        )
     if company:
         return {"message": "ok"}
     integration_clean = _clean_text(integration, 64)
@@ -6169,7 +6999,10 @@ def submit_waitlist_signup(
     company: Optional[str] = Form(None),
 ):
     if not IS_CLOUD:
-        raise HTTPException(status_code=501, detail="Marketing endpoints require the Compair Cloud edition.")
+        raise HTTPException(
+            status_code=501,
+            detail="Marketing endpoints require the Compair Cloud edition.",
+        )
     if company:
         return {"message": "ok"}
     email_clean = _clean_email(email)
@@ -6197,51 +7030,62 @@ def submit_waitlist_signup(
 
 @router.post("/help-request")
 def submit_help_request(
-    content: str = Form(...),
-    current_user: models.User = Depends(get_current_user)
+    content: str = Form(...), current_user: models.User = Depends(get_current_user)
 ):
     with compair.Session() as session:
         help_request = models.HelpRequest(
             user_id=current_user.user_id,
             content=content,
-            datetime_created=datetime.now(timezone.utc)
+            datetime_created=datetime.now(timezone.utc),
         )
         session.add(help_request)
         session.commit()
         if not IS_CLOUD:
-            raise HTTPException(status_code=501, detail="Help request emails require the Compair Cloud edition.")
+            raise HTTPException(
+                status_code=501,
+                detail="Help request emails require the Compair Cloud edition.",
+            )
         send_help_request_email.delay(help_request.request_id)
-        return {"message": "Your request has been submitted. Our team will get back to you soon."}
+        return {
+            "message": "Your request has been submitted. Our team will get back to you soon."
+        }
 
 
 @router.post("/deactivate-account")
 def submit_deactivate_request(
-    notice: str = Form(...),
-    current_user: models.User = Depends(get_current_user)
+    notice: str = Form(...), current_user: models.User = Depends(get_current_user)
 ):
     with compair.Session() as session:
         deactivate_request = models.DeactivateRequest(
             user_id=current_user.user_id,
             notice=notice,
-            datetime_created=datetime.now(timezone.utc)
+            datetime_created=datetime.now(timezone.utc),
         )
         session.add(deactivate_request)
         session.commit()
         if not IS_CLOUD:
-            raise HTTPException(status_code=501, detail="Deactivate request emails require the Compair Cloud edition.")
+            raise HTTPException(
+                status_code=501,
+                detail="Deactivate request emails require the Compair Cloud edition.",
+            )
         send_deactivate_request_email.delay(deactivate_request.request_id)
-        return {"message": f"We've received your request and will delete your account and data shortly. If you change your mind, reach out within 24 hours at {EMAIL_USER}."}
+        return {
+            "message": f"We've received your request and will delete your account and data shortly. If you change your mind, reach out within 24 hours at {EMAIL_USER}."
+        }
 
 
 # ===== Notification Endpoints =====
+
 
 @router.get("/notifications")
 @core_router.get("/notifications")
 def get_notifications(
     page: int = 1,
     page_size: int = 20,
-    filter_type: Optional[str] = None,  # all|unread|conflicts|updates|overlaps|validation
-    current_user: models.User = Depends(get_current_user)
+    filter_type: Optional[
+        str
+    ] = None,  # all|unread|conflicts|updates|overlaps|validation
+    current_user: models.User = Depends(get_current_user),
 ):
     """Fetch user's notifications with pagination and filtering."""
     with compair.Session() as session:
@@ -6304,12 +7148,16 @@ def get_notifications(
 def get_unread_count(current_user: models.User = Depends(get_current_user)):
     """Get count of unread notifications for badge display."""
     with compair.Session() as session:
-        count = session.query(models.NotificationEvent).filter(
-            models.NotificationEvent.user_id == current_user.user_id,
-            models.NotificationEvent.acknowledged_at.is_(None),
-            models.NotificationEvent.dismissed_at.is_(None),
-            models.NotificationEvent.delivery_action != "drop"
-        ).count()
+        count = (
+            session.query(models.NotificationEvent)
+            .filter(
+                models.NotificationEvent.user_id == current_user.user_id,
+                models.NotificationEvent.acknowledged_at.is_(None),
+                models.NotificationEvent.dismissed_at.is_(None),
+                models.NotificationEvent.delivery_action != "drop",
+            )
+            .count()
+        )
 
         return {"count": count}
 
@@ -6317,15 +7165,18 @@ def get_unread_count(current_user: models.User = Depends(get_current_user)):
 @router.post("/notifications/{event_id}/acknowledge")
 @core_router.post("/notifications/{event_id}/acknowledge")
 def acknowledge_notification(
-    event_id: str,
-    current_user: models.User = Depends(get_current_user)
+    event_id: str, current_user: models.User = Depends(get_current_user)
 ):
     """Mark a notification as read/acknowledged."""
     with compair.Session() as session:
-        notification = session.query(models.NotificationEvent).filter(
-            models.NotificationEvent.event_id == event_id,
-            models.NotificationEvent.user_id == current_user.user_id
-        ).first()
+        notification = (
+            session.query(models.NotificationEvent)
+            .filter(
+                models.NotificationEvent.event_id == event_id,
+                models.NotificationEvent.user_id == current_user.user_id,
+            )
+            .first()
+        )
 
         if not notification:
             raise HTTPException(status_code=404, detail="Notification not found.")
@@ -6339,15 +7190,18 @@ def acknowledge_notification(
 @router.post("/notifications/{event_id}/dismiss")
 @core_router.post("/notifications/{event_id}/dismiss")
 def dismiss_notification(
-    event_id: str,
-    current_user: models.User = Depends(get_current_user)
+    event_id: str, current_user: models.User = Depends(get_current_user)
 ):
     """Dismiss a notification (won't show in UI anymore)."""
     with compair.Session() as session:
-        notification = session.query(models.NotificationEvent).filter(
-            models.NotificationEvent.event_id == event_id,
-            models.NotificationEvent.user_id == current_user.user_id
-        ).first()
+        notification = (
+            session.query(models.NotificationEvent)
+            .filter(
+                models.NotificationEvent.event_id == event_id,
+                models.NotificationEvent.user_id == current_user.user_id,
+            )
+            .first()
+        )
 
         if not notification:
             raise HTTPException(status_code=404, detail="Notification not found.")
@@ -6364,11 +7218,15 @@ def mark_all_notifications_read(current_user: models.User = Depends(get_current_
     """Mark all unread notifications as acknowledged."""
     with compair.Session() as session:
         now = datetime.now(timezone.utc)
-        updated_count = session.query(models.NotificationEvent).filter(
-            models.NotificationEvent.user_id == current_user.user_id,
-            models.NotificationEvent.acknowledged_at.is_(None),
-            models.NotificationEvent.dismissed_at.is_(None)
-        ).update({"acknowledged_at": now})
+        updated_count = (
+            session.query(models.NotificationEvent)
+            .filter(
+                models.NotificationEvent.user_id == current_user.user_id,
+                models.NotificationEvent.acknowledged_at.is_(None),
+                models.NotificationEvent.dismissed_at.is_(None),
+            )
+            .update({"acknowledged_at": now})
+        )
 
         session.commit()
 
@@ -6411,9 +7269,11 @@ def unsubscribe_notification_delivery(
         )
 
     with compair.Session() as session:
-        prefs = session.query(models.NotificationPreferences).filter(
-            models.NotificationPreferences.user_id == user_id
-        ).first()
+        prefs = (
+            session.query(models.NotificationPreferences)
+            .filter(models.NotificationPreferences.user_id == user_id)
+            .first()
+        )
         if not prefs:
             prefs = models.NotificationPreferences(
                 user_id=user_id,
@@ -6476,18 +7336,28 @@ def verify_notification_delivery_email(
         )
 
     with compair.Session() as session:
-        prefs = session.query(models.NotificationPreferences).filter(
-            models.NotificationPreferences.user_id == user_id
-        ).first()
+        prefs = (
+            session.query(models.NotificationPreferences)
+            .filter(models.NotificationPreferences.user_id == user_id)
+            .first()
+        )
         if not prefs:
             return _notification_unsubscribe_response(
                 "Link Invalid",
                 "No notification preferences were found for this account. Please request a fresh verification email from your notification settings.",
             )
 
-        verified_email = _normalize_notification_delivery_email(prefs.notification_delivery_email)
-        pending_email = _normalize_notification_delivery_email(prefs.notification_delivery_email_pending)
-        if verified_email == email and prefs.notification_delivery_email_verified_at and not pending_email:
+        verified_email = _normalize_notification_delivery_email(
+            prefs.notification_delivery_email
+        )
+        pending_email = _normalize_notification_delivery_email(
+            prefs.notification_delivery_email_pending
+        )
+        if (
+            verified_email == email
+            and prefs.notification_delivery_email_verified_at
+            and not pending_email
+        ):
             return _notification_unsubscribe_response(
                 "Already Verified",
                 f"Compair is already using {email} for notification email delivery.",
@@ -6531,20 +7401,33 @@ def update_notification_preferences(
     quiet_hours_start: Optional[str] = None,
     quiet_hours_end: Optional[str] = None,
     max_daily_push_emails: Optional[int] = None,
-    current_user: models.User = Depends(get_current_user)
+    current_user: models.User = Depends(get_current_user),
 ):
     """Update user's notification preferences."""
     with compair.Session() as session:
-        email_digest_enabled = _notification_pref_payload_value(payload, "email_digest_enabled", email_digest_enabled)
-        email_digest_frequency = _notification_pref_payload_value(payload, "email_digest_frequency", email_digest_frequency)
-        push_notifications_enabled = _notification_pref_payload_value(payload, "push_notifications_enabled", push_notifications_enabled)
-        digest_buckets_enabled = _notification_pref_payload_value(payload, "digest_buckets_enabled", digest_buckets_enabled)
-        quiet_hours_start = _notification_pref_payload_value(payload, "quiet_hours_start", quiet_hours_start)
-        quiet_hours_end = _notification_pref_payload_value(payload, "quiet_hours_end", quiet_hours_end)
-        max_daily_push_emails = _notification_pref_payload_value(payload, "max_daily_push_emails", max_daily_push_emails)
-        frequency_explicit = (
-            email_digest_frequency is not None
-            or (isinstance(payload, dict) and "email_digest_frequency" in payload)
+        email_digest_enabled = _notification_pref_payload_value(
+            payload, "email_digest_enabled", email_digest_enabled
+        )
+        email_digest_frequency = _notification_pref_payload_value(
+            payload, "email_digest_frequency", email_digest_frequency
+        )
+        push_notifications_enabled = _notification_pref_payload_value(
+            payload, "push_notifications_enabled", push_notifications_enabled
+        )
+        digest_buckets_enabled = _notification_pref_payload_value(
+            payload, "digest_buckets_enabled", digest_buckets_enabled
+        )
+        quiet_hours_start = _notification_pref_payload_value(
+            payload, "quiet_hours_start", quiet_hours_start
+        )
+        quiet_hours_end = _notification_pref_payload_value(
+            payload, "quiet_hours_end", quiet_hours_end
+        )
+        max_daily_push_emails = _notification_pref_payload_value(
+            payload, "max_daily_push_emails", max_daily_push_emails
+        )
+        frequency_explicit = email_digest_frequency is not None or (
+            isinstance(payload, dict) and "email_digest_frequency" in payload
         )
 
         prefs = _get_or_create_notification_preferences(session, current_user)
@@ -6554,7 +7437,10 @@ def update_notification_preferences(
             prefs.email_digest_enabled = email_digest_enabled
         if email_digest_frequency is not None:
             if email_digest_frequency not in ["daily", "weekly", "never"]:
-                raise HTTPException(status_code=400, detail="Invalid frequency. Must be daily, weekly, or never.")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid frequency. Must be daily, weekly, or never.",
+                )
             prefs.email_digest_frequency = email_digest_frequency
         if push_notifications_enabled is not None:
             prefs.push_notifications_enabled = push_notifications_enabled
@@ -6566,7 +7452,9 @@ def update_notification_preferences(
             prefs.quiet_hours_end = quiet_hours_end
         if max_daily_push_emails is not None:
             if max_daily_push_emails < 0 or max_daily_push_emails > 10:
-                raise HTTPException(status_code=400, detail="Max daily emails must be between 0 and 10.")
+                raise HTTPException(
+                    status_code=400, detail="Max daily emails must be between 0 and 10."
+                )
             prefs.max_daily_push_emails = max_daily_push_emails
         if prefs.email_digest_enabled and not frequency_explicit:
             current_frequency = (prefs.email_digest_frequency or "").strip().lower()
@@ -6620,7 +7508,9 @@ def request_notification_delivery_email(
         "exp": int((datetime.now(timezone.utc) + timedelta(days=7)).timestamp()),
     }
     token = sign_compact_payload(payload, secret)
-    verify_link = f"{_public_web_base_url()}/notifications/verify-delivery-email?token={token}"
+    verify_link = (
+        f"{_public_web_base_url()}/notifications/verify-delivery-email?token={token}"
+    )
 
     try:
         emailer.connect()
@@ -6637,14 +7527,24 @@ def request_notification_delivery_email(
         )
     except Exception as exc:
         with compair.Session() as session:
-            prefs = session.query(models.NotificationPreferences).filter(
-                models.NotificationPreferences.user_id == current_user.user_id
-            ).first()
-            if prefs and _normalize_notification_delivery_email(prefs.notification_delivery_email_pending) == email:
+            prefs = (
+                session.query(models.NotificationPreferences)
+                .filter(models.NotificationPreferences.user_id == current_user.user_id)
+                .first()
+            )
+            if (
+                prefs
+                and _normalize_notification_delivery_email(
+                    prefs.notification_delivery_email_pending
+                )
+                == email
+            ):
                 prefs.notification_delivery_email_pending = None
                 prefs.updated_at = datetime.now(timezone.utc)
                 session.commit()
-        raise HTTPException(status_code=503, detail=f"Failed to send verification email: {exc}")
+        raise HTTPException(
+            status_code=503, detail=f"Failed to send verification email: {exc}"
+        )
     return {
         "message": f"Verification email sent to {email}. Delivery will switch after you confirm it.",
         "pending_email": email,

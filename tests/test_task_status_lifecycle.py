@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from compair_core import api
 from compair_core.compair import tasks
+from compair_core.compair.retrieval import validate_processing_run_key
 
 
 def test_process_doc_propagates_query_and_traces_only_provenance(monkeypatch):
@@ -62,6 +63,9 @@ def test_process_doc_propagates_query_and_traces_only_provenance(monkeypatch):
     )
 
     assert dispatched["retrieval_query"] == query
+    assert dispatched["retrieval_engine"] == "legacy"
+    assert validate_processing_run_key(dispatched["processing_run_key"])
+    assert query not in dispatched["processing_run_key"]
     received = next(values for name, values in events if name == "process_doc_request_received")
     assert received["retrieval_query_sha256"]
     assert received["retrieval_query_length"] == len(query)

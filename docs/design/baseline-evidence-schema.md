@@ -1,6 +1,7 @@
 # Frozen immutable baseline-evidence schema
 
-Status: implemented by Phase 2B2F.1 as schema and migration only. No bridge
+Status: implemented by Phase 2B2F.1 and corrected by Phase 2B2F.2 as schema
+and migrations only. No bridge
 writer, reader, serializer, retrieval change, generation adapter, API change,
 or baseline finding enablement is included.
 
@@ -12,8 +13,10 @@ names differ.
 
 The forward registry contains, in order:
 
-1. `0000_core_schema_baseline`, the existing-schema recognition marker; and
-2. `0001_baseline_evidence_bridge_v1`, the additive bridge migration.
+1. `0000_core_schema_baseline`, the existing-schema recognition marker;
+2. `0001_baseline_evidence_bridge_v1`, the additive bridge migration; and
+3. `0002_baseline_evidence_retention_v1`, the source-lifecycle retention
+   correction.
 
 The durable contract constants are:
 
@@ -24,7 +27,9 @@ The durable contract constants are:
 The migration creates missing objects, validates the final schema, and records
 its checksum and `applied` state in the same transaction. A failure rolls back
 the whole pending batch, records a sanitized `failed` state separately, and
-fails startup. No destructive or automatic rebuild occurs.
+fails startup. Migration `0002` uses a reviewed SQLite copy-and-swap solely for
+the four FK/nullability corrections; it is transactional, preserves all rows
+and explicit schema objects, and must pass `foreign_key_check` before commit.
 
 ## Tables
 
@@ -52,8 +57,9 @@ lengths, positive embedding dimension, and valid generation states. The
 caller-provided key must be nonempty and cannot equal the query hash; query hash
 alone is never the idempotency identity.
 
-Delete rules are `group -> run CASCADE`, `source_chunk -> run CASCADE`, and
-`source_document -> run CASCADE`.
+Delete rules are `group -> run CASCADE`, while source chunk and source document
+provenance use nullable `ON DELETE SET NULL`. Removing normal source objects
+does not erase an auditable run.
 
 ### `baseline_evidence_artifact`
 
@@ -82,10 +88,11 @@ bind both its run and artifact to the same `group_id`. It stores:
 
 `(run_id, ordinal)`, `(run_id, artifact_id)`, and
 `(run_id, selected_content_hash)` are unique. Ordinal is constrained to 1..4.
-Run deletion cascades selections. The artifact relationship is
-`ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED`: an artifact cannot be
-deleted while selected, while one transaction may delete the owning group and
-let the run cascade remove the selection before the deferred check.
+Selection has its own `group_id -> group CASCADE`. Its relationships to run and
+artifact are `ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED`: neither a run
+nor artifact can be used as an undeclared historical purge while selected.
+One transaction may delete the owning group; the direct group cascade removes
+the selection and satisfies both deferred restrictions before commit.
 
 Durable order is always `ORDER BY ordinal`; insertion, UUID, and relationship
 iteration order have no semantic meaning.
@@ -112,8 +119,16 @@ Reference persistence continues using the legacy branch.
 
 `feedback.baseline_retrieval_run_id` and
 `feedback.baseline_finding_ordinal` are nullable as a pair. When populated, the
-ordinal is positive and the pair is unique per run. Run deletion cascades that
-future baseline Feedback. Existing Feedback remains unchanged.
+pair references the selected evidence `(run_id, ordinal)` with `ON DELETE
+CASCADE`; the ordinal is positive and the pair is unique per run. This makes an
+explicit selected-evidence retention purge remove its Feedback without making
+ordinary run deletion a purge mechanism. Existing Feedback remains unchanged.
+
+`reference.source_chunk_id` and `feedback.source_chunk_id` are nullable and use
+`ON DELETE SET NULL`. A before-delete trigger on `chunk` first deletes only
+legacy rows (baseline target fields are null); baseline References and Feedback
+survive with their source pointers cleared. Core's explicit document/note bulk
+deletion helpers apply the same legacy-only predicate before deleting chunks.
 
 PostgreSQL uses named `NOT VALID` constraints followed by explicit validation
 for the new nullable foreign keys and Feedback pair. The Reference target check
@@ -128,15 +143,36 @@ all bridge triggers.
 
 | Operation | Run | Selection | Baseline Reference | Baseline Feedback | Artifact |
 | --- | --- | --- | --- | --- | --- |
-| Delete run | deleted | cascade | cascade | cascade | retained |
+| Delete run while selected | restricted | retained | retained | retained | retained |
 | Delete selected artifact directly | retained | retained | retained | retained | restricted |
-| Delete source document/chunk | cascade run | cascade | cascade | cascade | artifact retained; source document becomes null when independently applicable |
+| Delete source document/chunk | retained; pointers null | retained | retained; source chunk null | retained; source chunk null | retained; source document null |
 | Re-ingest/delete corpus or index | retained | retained | retained | retained | retained |
 | Delete group | cascade | cascade | cascade | cascade | cascade |
 
 No normal corpus lifecycle operation deletes bridge rows. Product retention,
 privacy purge, and unselected-artifact garbage collection require explicit
-future services and authorization checks.
+future services and authorization checks. Legacy References and Feedback remain
+source-chunk-owned and are deleted when their source chunk is deleted.
+
+### Explicit retention purge
+
+An explicit retention purge is the sole non-group path allowed to destroy
+historical baseline evidence. No purge endpoint or writer exists in this
+phase. A future service must require an authenticated, group-authorized data
+retention/privacy administrator; enforce any legal hold and minimum-retention
+policy; require a reason and external approval/ticket; and emit a durable audit
+event outside the rows being erased containing actor, group, reason, approval,
+timestamp, affected run/artifact/reference/feedback counts, and a hash of the
+purge manifest. The operation must be one transaction in this order:
+
+1. lock and delete selected evidence in the approved run set (cascading only
+   its baseline References and Feedback);
+2. delete now-unselected runs;
+3. delete only approved, now-unselected artifacts; and
+4. verify the audited counts before commit.
+
+Direct run/artifact deletion while selected is restricted, so it cannot
+silently impersonate this workflow.
 
 ## Manual downgrade and failure recovery
 

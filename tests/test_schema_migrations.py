@@ -95,16 +95,19 @@ def test_existing_startup_schema_gets_transactional_baseline_marker(
         assert first.applied == (
             "0000_core_schema_baseline",
             "0001_baseline_evidence_bridge_v1",
+            "0002_baseline_evidence_retention_v1",
         )
         assert first.already_applied == ()
         assert second.applied == ()
         assert second.already_applied == (
             "0000_core_schema_baseline",
             "0001_baseline_evidence_bridge_v1",
+            "0002_baseline_evidence_retention_v1",
         )
         assert [(row.migration_id, row.state) for row in state] == [
             ("0000_core_schema_baseline", "applied"),
             ("0001_baseline_evidence_bridge_v1", "applied"),
+            ("0002_baseline_evidence_retention_v1", "applied"),
         ]
         assert [row.checksum for row in state] == [
             migration.checksum for migration in CORE_SCHEMA_MIGRATIONS

@@ -278,6 +278,88 @@ def _selected_values(
     }
 
 
+def _add_mutable_corpus_lifecycle(connection, suffix: str) -> None:
+    digest = "9" * 64
+    connection.execute(
+        text(
+            "INSERT INTO retrieval_corpus "
+            "(corpus_id, scope_key, changed_repository_id, source_document_id, "
+            "active_generation_id, created_at, updated_at) VALUES "
+            "(:corpus, :scope, :changed, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        ),
+        {
+            "corpus": f"corpus-{suffix}",
+            "scope": f"scope-{suffix}",
+            "changed": f"changed-{suffix}",
+        },
+    )
+    connection.execute(
+        text(
+            "INSERT INTO retrieval_corpus_generation "
+            "(generation_id, corpus_id, generation_version, expected_repository_count, "
+            "expected_file_count, status, manifest_hash, created_at, validated_at, activated_at) "
+            "VALUES (:generation, :corpus, 'generation-v1', 1, 1, 'active', :hash, "
+            "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        ),
+        {
+            "generation": f"generation-{suffix}",
+            "corpus": f"corpus-{suffix}",
+            "hash": digest,
+        },
+    )
+    connection.execute(
+        text(
+            "INSERT INTO retrieval_corpus_file "
+            "(file_id, generation_id, repository_id, repository_name, relative_path, "
+            "file_state, content_hash, byte_size, content) VALUES "
+            "(:file, :generation, :repository, :name, :path, 'supported', :hash, 5, 'first')"
+        ),
+        {
+            "file": f"file-{suffix}",
+            "generation": f"generation-{suffix}",
+            "repository": f"repository-{suffix}",
+            "name": f"repo-{suffix}",
+            "path": f"src/{suffix}.py",
+            "hash": digest,
+        },
+    )
+    connection.execute(
+        text(
+            "INSERT INTO retrieval_baseline_index_build "
+            "(index_id, generation_id, index_version, index_schema_version, "
+            "document_format_version, corpus_manifest_hash, tokenizer_version, "
+            "embedding_provider, embedding_model, embedding_revision, embedding_dimension, "
+            "embedding_fingerprint, engine_config_fingerprint, expected_document_count, "
+            "status, indexed_document_count, total_token_count, document_manifest_hash, "
+            "lexical_manifest_hash, dense_manifest_hash, created_at, validated_at, published_at) "
+            "VALUES (:index, :generation, 'baseline-index-v1', 'baseline-index-schema.v1', "
+            "'whole-file-v1', :hash, 'baseline-tokenizer-v1', 'baseline_http', "
+            "'BAAI/bge-small-en-v1.5', 'immutable-revision', 384, :hash, :hash, 1, "
+            "'compatible', 1, 1, :hash, :hash, :hash, CURRENT_TIMESTAMP, "
+            "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        ),
+        {
+            "index": f"index-{suffix}",
+            "generation": f"generation-{suffix}",
+            "hash": digest,
+        },
+    )
+    connection.execute(
+        text(
+            "INSERT INTO retrieval_baseline_index_publication (corpus_id, index_id, published_at) "
+            "VALUES (:corpus, :index, CURRENT_TIMESTAMP)"
+        ),
+        {"corpus": f"corpus-{suffix}", "index": f"index-{suffix}"},
+    )
+    connection.execute(
+        text(
+            "UPDATE retrieval_corpus SET active_generation_id=:generation "
+            "WHERE corpus_id=:corpus"
+        ),
+        {"generation": f"generation-{suffix}", "corpus": f"corpus-{suffix}"},
+    )
+
+
 def test_sqlite_copied_legacy_database_upgrade_preserves_reference_order_and_bytes(
     tmp_path: Path,
 ) -> None:
@@ -302,6 +384,7 @@ def test_sqlite_copied_legacy_database_upgrade_preserves_reference_order_and_byt
         assert report.applied == (
             "0000_core_schema_baseline",
             "0001_baseline_evidence_bridge_v1",
+            "0002_baseline_evidence_retention_v1",
         )
         with engine.connect() as connection:
             after = connection.execute(
@@ -328,6 +411,7 @@ def test_sqlite_copied_legacy_database_upgrade_preserves_reference_order_and_byt
         assert [row.migration_id for row in read_schema_migration_state(engine)] == [
             "0000_core_schema_baseline",
             "0001_baseline_evidence_bridge_v1",
+            "0002_baseline_evidence_retention_v1",
         ]
 
         forbidden = {"retrieval_query", "query_text", "raw_query", "document_id"}
@@ -343,6 +427,7 @@ def test_sqlite_copied_legacy_database_upgrade_preserves_reference_order_and_byt
         assert restarted.already_applied == (
             "0000_core_schema_baseline",
             "0001_baseline_evidence_bridge_v1",
+            "0002_baseline_evidence_retention_v1",
         )
         with engine.connect() as connection:
             assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
@@ -512,6 +597,7 @@ def test_sqlite_reference_feedback_and_lifecycle_constraints(tmp_path: Path) -> 
                     group_id=group_id,
                     artifact_key="7" * 64,
                     content="auditable evidence",
+                    source_document_id=document_id,
                 ),
             )
             connection.execute(
@@ -589,46 +675,81 @@ def test_sqlite_reference_feedback_and_lifecycle_constraints(tmp_path: Path) -> 
             "retrieval_baseline_index_publication",
         } & artifact_foreign_tables
 
-        with engine.begin() as connection:
+        # A run with selected evidence cannot become a hidden non-group purge.
+        with pytest.raises(IntegrityError), engine.begin() as connection:
             connection.execute(
                 baseline_retrieval_run.delete().where(
                     baseline_retrieval_run.c.run_id == "run-life"
                 )
             )
+
+        # Normal source deletion preserves immutable evidence, Reference, and
+        # Feedback, clearing only source provenance pointers.
+        with engine.begin() as connection:
+            connection.execute(
+                text("DELETE FROM document WHERE document_id = :document_id"),
+                {"document_id": document_id},
+            )
         with engine.connect() as connection:
             assert connection.execute(
                 text("SELECT count(*) FROM baseline_selected_evidence")
-            ).scalar_one() == 0
+            ).scalar_one() == 1
             assert connection.execute(
                 text("SELECT count(*) FROM reference WHERE reference_id='baseline-reference'")
-            ).scalar_one() == 0
+            ).scalar_one() == 1
             assert connection.execute(
                 text("SELECT count(*) FROM feedback WHERE feedback_id='baseline-feedback'")
-            ).scalar_one() == 0
+            ).scalar_one() == 1
             assert connection.execute(
                 text("SELECT count(*) FROM baseline_evidence_artifact")
             ).scalar_one() == 1
+            assert connection.execute(
+                text(
+                    "SELECT source_chunk_id, source_document_id "
+                    "FROM baseline_retrieval_run WHERE run_id='run-life'"
+                )
+            ).one() == (None, None)
+            assert connection.execute(
+                text(
+                    "SELECT source_document_id FROM baseline_evidence_artifact "
+                    "WHERE artifact_id='artifact-life'"
+                )
+            ).scalar_one() is None
+            assert connection.execute(
+                text(
+                    "SELECT source_chunk_id FROM reference "
+                    "WHERE reference_id='baseline-reference'"
+                )
+            ).scalar_one() is None
+            assert connection.execute(
+                text(
+                    "SELECT source_chunk_id FROM feedback "
+                    "WHERE feedback_id='baseline-feedback'"
+                )
+            ).scalar_one() is None
 
-        # Recreate a run/selection, then one group deletion removes the scope.
+        # Restart persistence does not depend on the removed source objects.
+        engine.dispose()
+        engine = _engine(tmp_path / "lifecycle.db")
+        assert run_schema_migrations(engine).applied == ()
+        with engine.connect() as connection:
+            assert connection.execute(
+                text("SELECT renderer_output FROM baseline_selected_evidence")
+            ).scalar_one().endswith("auditable evidence")
+
+        # Legacy source-owned rows retain their historical cascade behavior.
         with engine.begin() as connection:
-            connection.execute(
-                baseline_retrieval_run.insert(),
-                _run_values(
-                    "life-2",
-                    group_id=group_id,
-                    document_id=document_id,
-                    chunk_id=chunk_id,
-                ),
-            )
-            selected = _selected_values(
-                "life-2",
-                group_id=group_id,
-                run_id="run-life-2",
-                artifact_id="artifact-life",
-                ordinal=1,
-                content="auditable evidence",
-            )
-            connection.execute(baseline_selected_evidence.insert(), selected)
+            connection.execute(text("DELETE FROM chunk WHERE chunk_id='chunk-source'"))
+        with engine.connect() as connection:
+            assert connection.execute(
+                text("SELECT count(*) FROM reference WHERE reference_id LIKE 'legacy-%'")
+            ).scalar_one() == 0
+            assert connection.execute(
+                text("SELECT count(*) FROM feedback WHERE feedback_id='legacy-feedback'")
+            ).scalar_one() == 0
+
+        # Group deletion is the privacy boundary and removes the entire scope.
+        with engine.begin() as connection:
             connection.execute(
                 text('DELETE FROM "group" WHERE group_id = :group_id'),
                 {"group_id": group_id},
@@ -642,37 +763,385 @@ def test_sqlite_reference_feedback_and_lifecycle_constraints(tmp_path: Path) -> 
                 assert connection.execute(
                     text(f"SELECT count(*) FROM {table_name}")
                 ).scalar_one() == 0
+            assert connection.execute(
+                text(
+                    "SELECT count(*) FROM reference "
+                    "WHERE reference_id='baseline-reference'"
+                )
+            ).scalar_one() == 0
+            assert connection.execute(
+                text(
+                    "SELECT count(*) FROM feedback "
+                    "WHERE feedback_id='baseline-feedback'"
+                )
+            ).scalar_one() == 0
 
-        # Artifact audit content survives an independently deleted source
-        # document, but its optional Core pointer is cleared.
+        # A direct Chunk delete (without deleting its Document) clears only
+        # chunk provenance and leaves document provenance intact.
         with engine.begin() as connection:
-            group_id, document_id, _chunk_id = _add_scope(connection, "source-delete")
+            group_id, document_id, chunk_id = _add_scope(connection, "chunk-only")
             connection.execute(
-                baseline_evidence_artifact.insert(),
-                _artifact_values(
-                    "source-delete",
+                baseline_retrieval_run.insert(),
+                _run_values(
+                    "chunk-only",
                     group_id=group_id,
-                    artifact_key="4" * 64,
-                    content="retained source snapshot",
-                    source_document_id=document_id,
+                    document_id=document_id,
+                    chunk_id=chunk_id,
                 ),
             )
             connection.execute(
-                text("DELETE FROM document WHERE document_id = :document_id"),
-                {"document_id": document_id},
+                baseline_evidence_artifact.insert(),
+                _artifact_values(
+                    "chunk-only",
+                    group_id=group_id,
+                    artifact_key="5" * 64,
+                    content="chunk retained evidence",
+                ),
+            )
+            connection.execute(
+                baseline_selected_evidence.insert(),
+                _selected_values(
+                    "chunk-only",
+                    group_id=group_id,
+                    run_id="run-chunk-only",
+                    artifact_id="artifact-chunk-only",
+                    ordinal=1,
+                    content="chunk retained evidence",
+                ),
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO reference "
+                    "(reference_id, source_chunk_id, reference_type, "
+                    "baseline_selected_evidence_id) VALUES "
+                    "('chunk-only-reference', :source, 'baseline_file', "
+                    "'selected-chunk-only')"
+                ),
+                {"source": chunk_id},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO feedback "
+                    "(feedback_id, source_chunk_id, feedback, model, is_hidden, "
+                    "baseline_retrieval_run_id, baseline_finding_ordinal) VALUES "
+                    "('chunk-only-feedback', :source, 'retained', 'model', 0, "
+                    "'run-chunk-only', 1)"
+                ),
+                {"source": chunk_id},
+            )
+            connection.execute(
+                text("DELETE FROM chunk WHERE chunk_id=:chunk_id"),
+                {"chunk_id": chunk_id},
             )
         with engine.connect() as connection:
             assert connection.execute(
                 text(
-                    "SELECT source_document_id FROM baseline_evidence_artifact "
-                    "WHERE artifact_id = 'artifact-source-delete'"
+                    "SELECT source_chunk_id, source_document_id "
+                    "FROM baseline_retrieval_run WHERE run_id='run-chunk-only'"
+                )
+            ).one() == (None, document_id)
+            assert connection.execute(
+                text(
+                    "SELECT source_chunk_id FROM reference "
+                    "WHERE reference_id='chunk-only-reference'"
+                )
+            ).scalar_one() is None
+            assert connection.execute(
+                text(
+                    "SELECT source_chunk_id FROM feedback "
+                    "WHERE feedback_id='chunk-only-feedback'"
                 )
             ).scalar_one() is None
         with engine.begin() as connection:
             connection.execute(
-                text('DELETE FROM "group" WHERE group_id = :group_id'),
+                text('DELETE FROM "group" WHERE group_id=:group_id'),
                 {"group_id": group_id},
             )
+    finally:
+        engine.dispose()
+
+
+def test_sqlite_corpus_index_rename_and_explicit_retention_purge(tmp_path: Path) -> None:
+    engine = _migrated_legacy_engine(tmp_path / "mutable-provenance.db")
+    try:
+        with engine.begin() as connection:
+            group_id, document_id, chunk_id = _add_scope(connection, "mutable")
+            _add_mutable_corpus_lifecycle(connection, "mutable")
+            connection.execute(
+                baseline_retrieval_run.insert(),
+                _run_values(
+                    "mutable",
+                    group_id=group_id,
+                    document_id=document_id,
+                    chunk_id=chunk_id,
+                ),
+            )
+            connection.execute(
+                baseline_evidence_artifact.insert(),
+                _artifact_values(
+                    "mutable",
+                    group_id=group_id,
+                    artifact_key="4" * 64,
+                    content="immutable retained bytes",
+                ),
+            )
+            connection.execute(
+                baseline_selected_evidence.insert(),
+                _selected_values(
+                    "mutable",
+                    group_id=group_id,
+                    run_id="run-mutable",
+                    artifact_id="artifact-mutable",
+                    ordinal=1,
+                    content="immutable retained bytes",
+                ),
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO reference "
+                    "(reference_id, source_chunk_id, reference_type, "
+                    "baseline_selected_evidence_id) VALUES "
+                    "('mutable-reference', :source, 'baseline_file', 'selected-mutable')"
+                ),
+                {"source": chunk_id},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO feedback "
+                    "(feedback_id, source_chunk_id, feedback, model, is_hidden, "
+                    "baseline_retrieval_run_id, baseline_finding_ordinal) VALUES "
+                    "('mutable-feedback', :source, 'retained', 'model', 0, "
+                    "'run-mutable', 1)"
+                ),
+                {"source": chunk_id},
+            )
+
+        with engine.connect() as connection:
+            before = connection.execute(
+                text(
+                    "SELECT repository_id, repository_name, relative_path, complete_content, "
+                    "corpus_generation_id, index_id FROM baseline_evidence_artifact "
+                    "WHERE artifact_id='artifact-mutable'"
+                )
+            ).one()
+
+        # A later immutable generation can rename the repository/path. Deleting
+        # the former publication and generation cannot reach copied evidence.
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO retrieval_corpus_generation "
+                    "(generation_id, corpus_id, generation_version, expected_repository_count, "
+                    "expected_file_count, status, manifest_hash, created_at, validated_at, activated_at) "
+                    "VALUES ('generation-mutable-v2', 'corpus-mutable', 'generation-v2', "
+                    "1, 1, 'active', :hash, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                ),
+                {"hash": "8" * 64},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO retrieval_corpus_file "
+                    "(file_id, generation_id, repository_id, repository_name, relative_path, "
+                    "file_state, content_hash, byte_size, content) VALUES "
+                    "('file-mutable-v2', 'generation-mutable-v2', 'repository-mutable', "
+                    "'renamed-repo', 'renamed/location.py', 'supported', :hash, 6, 'second')"
+                ),
+                {"hash": "8" * 64},
+            )
+            connection.execute(
+                text(
+                    "UPDATE retrieval_corpus SET active_generation_id='generation-mutable-v2' "
+                    "WHERE corpus_id='corpus-mutable'"
+                )
+            )
+            connection.execute(
+                text(
+                    "DELETE FROM retrieval_baseline_index_publication "
+                    "WHERE corpus_id='corpus-mutable'"
+                )
+            )
+            connection.execute(
+                text(
+                    "DELETE FROM retrieval_corpus_generation "
+                    "WHERE generation_id='generation-mutable'"
+                )
+            )
+        with engine.connect() as connection:
+            after = connection.execute(
+                text(
+                    "SELECT repository_id, repository_name, relative_path, complete_content, "
+                    "corpus_generation_id, index_id FROM baseline_evidence_artifact "
+                    "WHERE artifact_id='artifact-mutable'"
+                )
+            ).one()
+            assert after == before
+            assert connection.execute(
+                text("SELECT count(*) FROM reference WHERE reference_id='mutable-reference'")
+            ).scalar_one() == 1
+            assert connection.execute(
+                text("SELECT count(*) FROM feedback WHERE feedback_id='mutable-feedback'")
+            ).scalar_one() == 1
+
+        # This is the schema-level ordering an authorized audited retention
+        # purge must use. No ordinary lifecycle delete can substitute for it.
+        with engine.begin() as connection:
+            connection.execute(
+                baseline_selected_evidence.delete().where(
+                    baseline_selected_evidence.c.selected_evidence_id
+                    == "selected-mutable"
+                )
+            )
+            connection.execute(
+                baseline_retrieval_run.delete().where(
+                    baseline_retrieval_run.c.run_id == "run-mutable"
+                )
+            )
+            connection.execute(
+                baseline_evidence_artifact.delete().where(
+                    baseline_evidence_artifact.c.artifact_id == "artifact-mutable"
+                )
+            )
+        with engine.connect() as connection:
+            for table_name in (
+                "baseline_retrieval_run",
+                "baseline_evidence_artifact",
+                "baseline_selected_evidence",
+            ):
+                assert connection.execute(
+                    text(f"SELECT count(*) FROM {table_name}")
+                ).scalar_one() == 0
+            assert connection.execute(
+                text("SELECT count(*) FROM reference WHERE reference_id='mutable-reference'")
+            ).scalar_one() == 0
+            assert connection.execute(
+                text("SELECT count(*) FROM feedback WHERE feedback_id='mutable-feedback'")
+            ).scalar_one() == 0
+    finally:
+        engine.dispose()
+
+
+def test_core_bulk_document_delete_builds_legacy_only_predicates(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from compair_core.api import _delete_document_records
+
+    class FakeColumn:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def in_(self, values):
+            return (self.name, tuple(values))
+
+    class FakeQuery:
+        def __init__(self, session, entity) -> None:
+            self.session = session
+            self.entity = entity
+            self.filters = ()
+
+        def filter(self, *filters):
+            self.filters = filters
+            return self
+
+        def all(self):
+            if getattr(self.entity, "name", None) == "chunk_id":
+                return [("chunk-bulk",)]
+            return []
+
+        def delete(self, *, synchronize_session):
+            assert synchronize_session is False
+            self.session.deletions.append((self.entity, self.filters))
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.deletions = []
+
+        def query(self, entity):
+            return FakeQuery(self, entity)
+
+        def execute(self, _statement):
+            raise AssertionError("no association table is configured")
+
+    document_model = SimpleNamespace(document_id=FakeColumn("document_id"))
+    note_model = SimpleNamespace(
+        note_id=FakeColumn("note_id"), document_id=FakeColumn("note_document_id")
+    )
+    chunk_model = SimpleNamespace(
+        chunk_id=FakeColumn("chunk_id"), document_id=FakeColumn("chunk_document_id")
+    )
+    feedback_model = SimpleNamespace(source_chunk_id=FakeColumn("feedback_source"))
+    reference_model = SimpleNamespace(
+        source_chunk_id=FakeColumn("reference_source"),
+        reference_document_id=FakeColumn("reference_document_id"),
+    )
+    fake_models = SimpleNamespace(
+        Document=document_model,
+        Note=note_model,
+        Chunk=chunk_model,
+        Feedback=feedback_model,
+        Reference=reference_model,
+    )
+    monkeypatch.setattr("compair_core.api.models", fake_models)
+    session = FakeSession()
+
+    _delete_document_records(session, ["doc-bulk"])
+
+    feedback_delete = next(row for row in session.deletions if row[0] is feedback_model)
+    source_reference_delete = next(
+        row
+        for row in session.deletions
+        if row[0] is reference_model
+        and any(str(value) == "baseline_selected_evidence_id IS NULL" for value in row[1])
+    )
+    assert any(
+        str(value) == "baseline_retrieval_run_id IS NULL"
+        for value in feedback_delete[1]
+    )
+    assert any(
+        str(value) == "baseline_selected_evidence_id IS NULL"
+        for value in source_reference_delete[1]
+    )
+
+
+def test_sqlite_failed_retention_copy_swap_rolls_back_and_recovers(tmp_path: Path) -> None:
+    database_path = tmp_path / "failed-retention.db"
+    _create_legacy_database(database_path)
+    engine = _engine(database_path)
+    run_schema_migrations(engine, CORE_SCHEMA_MIGRATIONS[:2])
+    production = CORE_SCHEMA_MIGRATIONS[2]
+
+    def fail_after_real_upgrade(connection) -> None:
+        production.upgrade(connection)
+        raise RuntimeError("injected retention migration failure")
+
+    failing = replace(production, upgrade=fail_after_real_upgrade)
+    try:
+        with pytest.raises(SchemaMigrationError) as error:
+            run_schema_migrations(engine, (*CORE_SCHEMA_MIGRATIONS[:2], failing))
+        assert error.value.migration_id == "0002_baseline_evidence_retention_v1"
+        assert error.value.code == "upgrade_failed"
+        assert {
+            column["name"]: column["nullable"]
+            for column in inspect(engine).get_columns("reference")
+        }["source_chunk_id"] is False
+        assert [(row.migration_id, row.state) for row in read_schema_migration_state(engine)] == [
+            ("0000_core_schema_baseline", "applied"),
+            ("0001_baseline_evidence_bridge_v1", "applied"),
+            ("0002_baseline_evidence_retention_v1", "failed"),
+        ]
+        with engine.begin() as connection:
+            connection.execute(
+                schema_migration_table.delete().where(
+                    schema_migration_table.c.migration_id
+                    == "0002_baseline_evidence_retention_v1"
+                )
+            )
+        assert run_schema_migrations(engine).applied == (
+            "0002_baseline_evidence_retention_v1",
+        )
+        assert {
+            column["name"]: column["nullable"]
+            for column in inspect(engine).get_columns("reference")
+        }["source_chunk_id"] is True
     finally:
         engine.dispose()
 
@@ -716,6 +1185,7 @@ def test_sqlite_failed_bridge_migration_requires_reviewed_recovery(
         assert recovered.applied == (
             "0000_core_schema_baseline",
             "0001_baseline_evidence_bridge_v1",
+            "0002_baseline_evidence_retention_v1",
         )
     finally:
         engine.dispose()

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -234,6 +235,8 @@ _REFERENCE_INSERT_TRIGGER = "trg_reference_baseline_target_insert"
 _REFERENCE_UPDATE_TRIGGER = "trg_reference_baseline_target_update"
 _FEEDBACK_INSERT_TRIGGER = "trg_feedback_baseline_pair_insert"
 _FEEDBACK_UPDATE_TRIGGER = "trg_feedback_baseline_pair_update"
+_CHUNK_RETENTION_TRIGGER = "trg_chunk_baseline_retention_before_delete"
+_CHUNK_RETENTION_FUNCTION = "core_chunk_baseline_retention_v1"
 
 
 def _column_names(connection: Connection, table_name: str) -> set[str]:
@@ -484,12 +487,6 @@ def _validate_baseline_evidence_bridge(connection: Connection) -> None:
     selected_fks = _foreign_key_targets(connection, BASELINE_SELECTED_EVIDENCE_TABLE)
     required_selected_fks = {
         (
-            ("run_id", "group_id"),
-            BASELINE_RETRIEVAL_RUN_TABLE,
-            ("run_id", "group_id"),
-            "CASCADE",
-        ),
-        (
             ("artifact_id", "group_id"),
             "baseline_evidence_artifact",
             ("artifact_id", "group_id"),
@@ -498,15 +495,37 @@ def _validate_baseline_evidence_bridge(connection: Connection) -> None:
     }
     if not required_selected_fks <= selected_fks:
         raise SchemaInvariantError("selected_scope_foreign_key_invalid")
+    if not any(
+        candidate in selected_fks
+        for candidate in (
+            (
+                ("run_id", "group_id"),
+                BASELINE_RETRIEVAL_RUN_TABLE,
+                ("run_id", "group_id"),
+                "CASCADE",
+            ),
+            (
+                ("run_id", "group_id"),
+                BASELINE_RETRIEVAL_RUN_TABLE,
+                ("run_id", "group_id"),
+                "NO ACTION",
+            ),
+        )
+    ):
+        raise SchemaInvariantError("selected_run_foreign_key_invalid")
 
     run_fks = _foreign_key_targets(connection, BASELINE_RETRIEVAL_RUN_TABLE)
-    required_run_fks = {
-        (("group_id",), "group", ("group_id",), "CASCADE"),
-        (("source_chunk_id",), "chunk", ("chunk_id",), "CASCADE"),
-        (("source_document_id",), "document", ("document_id",), "CASCADE"),
-    }
-    if not required_run_fks <= run_fks:
+    if (("group_id",), "group", ("group_id",), "CASCADE") not in run_fks:
         raise SchemaInvariantError("run_lifecycle_foreign_key_invalid")
+    for constrained, target, referred in (
+        (("source_chunk_id",), "chunk", ("chunk_id",)),
+        (("source_document_id",), "document", ("document_id",)),
+    ):
+        if not any(
+            (constrained, target, referred, action) in run_fks
+            for action in ("CASCADE", "SET NULL")
+        ):
+            raise SchemaInvariantError("run_lifecycle_foreign_key_invalid")
 
     artifact_fks = _foreign_key_targets(connection, "baseline_evidence_artifact")
     required_artifact_fks = {
@@ -525,12 +544,23 @@ def _validate_baseline_evidence_bridge(connection: Connection) -> None:
     ) not in reference_fks:
         raise SchemaInvariantError("reference_baseline_foreign_key_invalid")
     feedback_fks = _foreign_key_targets(connection, "feedback")
-    if (
-        ("baseline_retrieval_run_id",),
-        BASELINE_RETRIEVAL_RUN_TABLE,
-        ("run_id",),
-        "CASCADE",
-    ) not in feedback_fks:
+    if not any(
+        candidate in feedback_fks
+        for candidate in (
+            (
+                ("baseline_retrieval_run_id",),
+                BASELINE_RETRIEVAL_RUN_TABLE,
+                ("run_id",),
+                "CASCADE",
+            ),
+            (
+                ("baseline_retrieval_run_id", "baseline_finding_ordinal"),
+                BASELINE_SELECTED_EVIDENCE_TABLE,
+                ("run_id", "ordinal"),
+                "CASCADE",
+            ),
+        )
+    ):
         raise SchemaInvariantError("feedback_baseline_foreign_key_invalid")
 
     required_indexes = {
@@ -577,7 +607,13 @@ def _validate_baseline_evidence_bridge(connection: Connection) -> None:
             raise SchemaInvariantError(f"missing_check_constraint:{table.name}")
 
     if connection.dialect.name == "sqlite":
-        if connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() != 1:
+        foreign_keys_enabled = connection.exec_driver_sql(
+            "PRAGMA foreign_keys"
+        ).scalar_one()
+        suspended_by_runner = bool(
+            connection.info.get("core_migration_foreign_keys_suspended")
+        )
+        if foreign_keys_enabled != 1 and not suspended_by_runner:
             raise SchemaInvariantError("sqlite_foreign_keys_disabled")
         trigger_names = {
             str(row[0])
@@ -602,6 +638,445 @@ def _validate_baseline_evidence_bridge(connection: Connection) -> None:
             connection, "feedback", "check"
         ):
             raise SchemaInvariantError("feedback_pair_check_missing")
+
+
+def _sqlite_create_sql(connection: Connection, table_name: str) -> str:
+    sql = connection.execute(
+        text(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = :table_name"
+        ),
+        {"table_name": table_name},
+    ).scalar_one_or_none()
+    if not sql:
+        raise SchemaInvariantError(f"sqlite_create_sql_missing:{table_name}")
+    return str(sql)
+
+
+def _sqlite_rewrite_once(
+    sql: str,
+    pattern: str,
+    replacement: str,
+    error_code: str,
+) -> str:
+    rewritten, count = re.subn(pattern, replacement, sql, count=1, flags=re.IGNORECASE)
+    if count != 1:
+        raise SchemaInvariantError(error_code)
+    return rewritten
+
+
+def _sqlite_nullable_source_chunk(sql: str, table_name: str) -> str:
+    return _sqlite_rewrite_once(
+        sql,
+        r"(\bsource_chunk_id\s+[A-Z]+(?:\s*\(\s*\d+\s*\))?)\s+NOT\s+NULL",
+        r"\1",
+        f"sqlite_source_chunk_nullability_rewrite_failed:{table_name}",
+    )
+
+
+def _sqlite_retarget_table(sql: str, table_name: str, temporary_name: str) -> str:
+    return _sqlite_rewrite_once(
+        sql,
+        rf"^(CREATE\s+TABLE\s+)(?:\"{re.escape(table_name)}\"|{re.escape(table_name)})",
+        rf'\1"{temporary_name}"',
+        f"sqlite_table_rewrite_failed:{table_name}",
+    )
+
+
+def _sqlite_append_constraint(sql: str, definition: str, table_name: str) -> str:
+    closing = sql.rfind(")")
+    if closing < 0:
+        raise SchemaInvariantError(f"sqlite_constraint_append_failed:{table_name}")
+    return f"{sql[:closing]}, {definition}{sql[closing:]}"
+
+
+def _sqlite_retention_table_sql(
+    connection: Connection,
+    table_name: str,
+    temporary_name: str,
+) -> str:
+    sql = _sqlite_retarget_table(
+        _sqlite_create_sql(connection, table_name), table_name, temporary_name
+    )
+    chunk_fk = (
+        r"((?:CONSTRAINT\s+[^\s,]+\s+)?FOREIGN\s+KEY\s*\(\s*source_chunk_id\s*\)"
+        r"\s+REFERENCES\s+(?:\"?chunk\"?)\s*\(\s*chunk_id\s*\)\s+ON\s+DELETE\s+)CASCADE"
+    )
+    if table_name == BASELINE_RETRIEVAL_RUN_TABLE:
+        sql = _sqlite_nullable_source_chunk(sql, table_name)
+        sql = _sqlite_rewrite_once(
+            sql,
+            chunk_fk,
+            r"\1SET NULL",
+            "sqlite_run_chunk_fk_rewrite_failed",
+        )
+        sql = _sqlite_rewrite_once(
+            sql,
+            r"((?:CONSTRAINT\s+[^\s,]+\s+)?FOREIGN\s+KEY\s*\(\s*source_document_id\s*\)"
+            r"\s+REFERENCES\s+(?:\"?document\"?)\s*\(\s*document_id\s*\)\s+ON\s+DELETE\s+)CASCADE",
+            r"\1SET NULL",
+            "sqlite_run_document_fk_rewrite_failed",
+        )
+    elif table_name == BASELINE_SELECTED_EVIDENCE_TABLE:
+        sql = _sqlite_rewrite_once(
+            sql,
+            r"((?:CONSTRAINT\s+[^\s,]+\s+)?FOREIGN\s+KEY\s*\(\s*run_id\s*,\s*group_id\s*\)"
+            r"\s+REFERENCES\s+(?:\"?baseline_retrieval_run\"?)"
+            r"\s*\(\s*run_id\s*,\s*group_id\s*\)\s+ON\s+DELETE\s+)CASCADE",
+            r"\1NO ACTION DEFERRABLE INITIALLY DEFERRED",
+            "sqlite_selected_run_fk_rewrite_failed",
+        )
+        sql = _sqlite_append_constraint(
+            sql,
+            'CONSTRAINT fk_bl_selected_group_retention FOREIGN KEY(group_id) '
+            'REFERENCES "group"(group_id) ON DELETE CASCADE',
+            table_name,
+        )
+    elif table_name == "reference":
+        sql = _sqlite_nullable_source_chunk(sql, table_name)
+        sql = _sqlite_rewrite_once(
+            sql,
+            chunk_fk,
+            r"\1SET NULL",
+            "sqlite_reference_chunk_fk_rewrite_failed",
+        )
+    elif table_name == "feedback":
+        sql = _sqlite_nullable_source_chunk(sql, table_name)
+        sql = _sqlite_rewrite_once(
+            sql,
+            chunk_fk,
+            r"\1SET NULL",
+            "sqlite_feedback_chunk_fk_rewrite_failed",
+        )
+        sql = _sqlite_rewrite_once(
+            sql,
+            r"(baseline_retrieval_run_id\s+[A-Z]+(?:\s*\(\s*\d+\s*\))?)"
+            r"\s+REFERENCES\s+(?:\"?baseline_retrieval_run\"?)"
+            r"\s*\(\s*run_id\s*\)\s+ON\s+DELETE\s+CASCADE",
+            r"\1",
+            "sqlite_feedback_run_fk_rewrite_failed",
+        )
+        sql = _sqlite_append_constraint(
+            sql,
+            "CONSTRAINT fk_feedback_baseline_selected_evidence "
+            "FOREIGN KEY(baseline_retrieval_run_id, baseline_finding_ordinal) "
+            "REFERENCES baseline_selected_evidence(run_id, ordinal) "
+            "ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED",
+            table_name,
+        )
+    else:  # pragma: no cover - private caller contract
+        raise ValueError(table_name)
+    return sql
+
+
+def _sqlite_schema_objects(
+    connection: Connection, table_names: tuple[str, ...]
+) -> tuple[str, ...]:
+    rows = connection.execute(
+        text(
+            "SELECT sql FROM sqlite_master "
+            "WHERE tbl_name IN (:run, :selected, :reference, :feedback) "
+            "AND type IN ('index', 'trigger') AND sql IS NOT NULL "
+            "ORDER BY type, name"
+        ),
+        {
+            "run": table_names[0],
+            "selected": table_names[1],
+            "reference": table_names[2],
+            "feedback": table_names[3],
+        },
+    ).scalars()
+    return tuple(str(row) for row in rows)
+
+
+def _sqlite_copy_table(
+    connection: Connection, source_name: str, target_name: str
+) -> None:
+    columns = [
+        str(row[1])
+        for row in connection.exec_driver_sql(
+            f'PRAGMA table_info("{source_name}")'
+        ).all()
+    ]
+    if not columns:
+        raise SchemaInvariantError(f"sqlite_copy_columns_missing:{source_name}")
+    quoted = ", ".join(f'"{column}"' for column in columns)
+    connection.exec_driver_sql(
+        f'INSERT INTO "{target_name}" ({quoted}) '
+        f'SELECT {quoted} FROM "{source_name}"'
+    )
+
+
+def _create_sqlite_chunk_retention_trigger(connection: Connection) -> None:
+    connection.exec_driver_sql(
+        f"CREATE TRIGGER {_CHUNK_RETENTION_TRIGGER} "
+        "BEFORE DELETE ON chunk BEGIN "
+        "DELETE FROM reference WHERE source_chunk_id = OLD.chunk_id "
+        "AND baseline_selected_evidence_id IS NULL; "
+        "DELETE FROM feedback WHERE source_chunk_id = OLD.chunk_id "
+        "AND baseline_retrieval_run_id IS NULL; END"
+    )
+
+
+def _upgrade_sqlite_baseline_evidence_retention(connection: Connection) -> None:
+    table_names = (
+        BASELINE_RETRIEVAL_RUN_TABLE,
+        BASELINE_SELECTED_EVIDENCE_TABLE,
+        "reference",
+        "feedback",
+    )
+    preserved_objects = _sqlite_schema_objects(connection, table_names)
+    temporary_names = {
+        table_name: f"__retention_v2_{table_name}" for table_name in table_names
+    }
+    for table_name in table_names:
+        connection.exec_driver_sql(
+            _sqlite_retention_table_sql(
+                connection, table_name, temporary_names[table_name]
+            )
+        )
+        _sqlite_copy_table(connection, table_name, temporary_names[table_name])
+
+    for table_name in ("reference", "feedback", BASELINE_SELECTED_EVIDENCE_TABLE, BASELINE_RETRIEVAL_RUN_TABLE):
+        connection.exec_driver_sql(f'DROP TABLE "{table_name}"')
+    for table_name in table_names:
+        connection.exec_driver_sql(
+            f'ALTER TABLE "{temporary_names[table_name]}" RENAME TO "{table_name}"'
+        )
+    for ddl in preserved_objects:
+        connection.exec_driver_sql(ddl)
+    connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_bl_selected_group_retention "
+        "ON baseline_selected_evidence(group_id)"
+    )
+    _create_sqlite_chunk_retention_trigger(connection)
+
+
+def _postgres_drop_foreign_key(
+    connection: Connection, table_name: str, constrained_columns: tuple[str, ...]
+) -> None:
+    preparer = connection.dialect.identifier_preparer
+    for row in inspect(connection).get_foreign_keys(table_name):
+        if tuple(row.get("constrained_columns") or ()) != constrained_columns:
+            continue
+        name = row.get("name")
+        if not name:
+            raise SchemaInvariantError(f"postgres_unnamed_fk:{table_name}")
+        connection.exec_driver_sql(
+            f"ALTER TABLE {preparer.quote(table_name)} "
+            f"DROP CONSTRAINT {preparer.quote(str(name))}"
+        )
+        return
+    raise SchemaInvariantError(
+        f"postgres_foreign_key_missing:{table_name}:{','.join(constrained_columns)}"
+    )
+
+
+def _upgrade_postgres_baseline_evidence_retention(connection: Connection) -> None:
+    for column_name in ("source_chunk_id", "source_document_id"):
+        _postgres_drop_foreign_key(
+            connection, BASELINE_RETRIEVAL_RUN_TABLE, (column_name,)
+        )
+    connection.exec_driver_sql(
+        "ALTER TABLE baseline_retrieval_run ALTER COLUMN source_chunk_id DROP NOT NULL"
+    )
+    _postgres_add_constraint(
+        connection,
+        table_name=BASELINE_RETRIEVAL_RUN_TABLE,
+        constraint_name="fk_bl_run_source_chunk_retention",
+        definition="FOREIGN KEY (source_chunk_id) REFERENCES chunk(chunk_id) ON DELETE SET NULL",
+        kind="foreign_key",
+    )
+    _postgres_add_constraint(
+        connection,
+        table_name=BASELINE_RETRIEVAL_RUN_TABLE,
+        constraint_name="fk_bl_run_source_document_retention",
+        definition="FOREIGN KEY (source_document_id) REFERENCES document(document_id) ON DELETE SET NULL",
+        kind="foreign_key",
+    )
+
+    _postgres_drop_foreign_key(
+        connection, BASELINE_SELECTED_EVIDENCE_TABLE, ("run_id", "group_id")
+    )
+    _postgres_add_constraint(
+        connection,
+        table_name=BASELINE_SELECTED_EVIDENCE_TABLE,
+        constraint_name="fk_bl_selected_run_scope_retention",
+        definition=(
+            "FOREIGN KEY (run_id, group_id) "
+            "REFERENCES baseline_retrieval_run(run_id, group_id) "
+            "ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED"
+        ),
+        kind="foreign_key",
+    )
+    _postgres_add_constraint(
+        connection,
+        table_name=BASELINE_SELECTED_EVIDENCE_TABLE,
+        constraint_name="fk_bl_selected_group_retention",
+        definition='FOREIGN KEY (group_id) REFERENCES "group"(group_id) ON DELETE CASCADE',
+        kind="foreign_key",
+    )
+
+    _postgres_drop_foreign_key(connection, "reference", ("source_chunk_id",))
+    connection.exec_driver_sql(
+        "ALTER TABLE reference ALTER COLUMN source_chunk_id DROP NOT NULL"
+    )
+    _postgres_add_constraint(
+        connection,
+        table_name="reference",
+        constraint_name="fk_reference_source_chunk_retention",
+        definition="FOREIGN KEY (source_chunk_id) REFERENCES chunk(chunk_id) ON DELETE SET NULL",
+        kind="foreign_key",
+    )
+
+    _postgres_drop_foreign_key(connection, "feedback", ("source_chunk_id",))
+    _postgres_drop_foreign_key(
+        connection, "feedback", ("baseline_retrieval_run_id",)
+    )
+    connection.exec_driver_sql(
+        "ALTER TABLE feedback ALTER COLUMN source_chunk_id DROP NOT NULL"
+    )
+    _postgres_add_constraint(
+        connection,
+        table_name="feedback",
+        constraint_name="fk_feedback_source_chunk_retention",
+        definition="FOREIGN KEY (source_chunk_id) REFERENCES chunk(chunk_id) ON DELETE SET NULL",
+        kind="foreign_key",
+    )
+    _postgres_add_constraint(
+        connection,
+        table_name="feedback",
+        constraint_name="fk_feedback_baseline_selected_evidence",
+        definition=(
+            "FOREIGN KEY (baseline_retrieval_run_id, baseline_finding_ordinal) "
+            "REFERENCES baseline_selected_evidence(run_id, ordinal) "
+            "ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED"
+        ),
+        kind="foreign_key",
+    )
+    connection.exec_driver_sql(
+        f"CREATE OR REPLACE FUNCTION {_CHUNK_RETENTION_FUNCTION}() "
+        "RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+        "DELETE FROM reference WHERE source_chunk_id = OLD.chunk_id "
+        "AND baseline_selected_evidence_id IS NULL; "
+        "DELETE FROM feedback WHERE source_chunk_id = OLD.chunk_id "
+        "AND baseline_retrieval_run_id IS NULL; RETURN OLD; END $$"
+    )
+    connection.exec_driver_sql(
+        f"DROP TRIGGER IF EXISTS {_CHUNK_RETENTION_TRIGGER} ON chunk"
+    )
+    connection.exec_driver_sql(
+        f"CREATE TRIGGER {_CHUNK_RETENTION_TRIGGER} BEFORE DELETE ON chunk "
+        f"FOR EACH ROW EXECUTE FUNCTION {_CHUNK_RETENTION_FUNCTION}()"
+    )
+
+
+def _upgrade_baseline_evidence_retention(connection: Connection) -> None:
+    if connection.dialect.name == "sqlite":
+        _upgrade_sqlite_baseline_evidence_retention(connection)
+    else:
+        _upgrade_postgres_baseline_evidence_retention(connection)
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_bl_selected_group_retention "
+            "ON baseline_selected_evidence(group_id)"
+        )
+
+
+def _column_nullable(connection: Connection, table_name: str, column_name: str) -> bool:
+    for column in inspect(connection).get_columns(table_name):
+        if column["name"] == column_name:
+            return bool(column["nullable"])
+    raise SchemaInvariantError(f"missing_column:{table_name}:{column_name}")
+
+
+def _validate_baseline_evidence_retention(connection: Connection) -> None:
+    expected_fks = {
+        BASELINE_RETRIEVAL_RUN_TABLE: {
+            (("group_id",), "group", ("group_id",), "CASCADE"),
+            (("source_chunk_id",), "chunk", ("chunk_id",), "SET NULL"),
+            (("source_document_id",), "document", ("document_id",), "SET NULL"),
+        },
+        BASELINE_SELECTED_EVIDENCE_TABLE: {
+            (("group_id",), "group", ("group_id",), "CASCADE"),
+            (
+                ("run_id", "group_id"),
+                BASELINE_RETRIEVAL_RUN_TABLE,
+                ("run_id", "group_id"),
+                "NO ACTION",
+            ),
+            (
+                ("artifact_id", "group_id"),
+                "baseline_evidence_artifact",
+                ("artifact_id", "group_id"),
+                "NO ACTION",
+            ),
+        },
+        "reference": {
+            (("source_chunk_id",), "chunk", ("chunk_id",), "SET NULL"),
+            (
+                ("baseline_selected_evidence_id",),
+                BASELINE_SELECTED_EVIDENCE_TABLE,
+                ("selected_evidence_id",),
+                "CASCADE",
+            ),
+        },
+        "feedback": {
+            (("source_chunk_id",), "chunk", ("chunk_id",), "SET NULL"),
+            (
+                ("baseline_retrieval_run_id", "baseline_finding_ordinal"),
+                BASELINE_SELECTED_EVIDENCE_TABLE,
+                ("run_id", "ordinal"),
+                "CASCADE",
+            ),
+        },
+    }
+    for table_name, required in expected_fks.items():
+        if not required <= _foreign_key_targets(connection, table_name):
+            raise SchemaInvariantError(f"retention_foreign_key_invalid:{table_name}")
+    for table_name in (BASELINE_RETRIEVAL_RUN_TABLE, "reference", "feedback"):
+        if not _column_nullable(connection, table_name, "source_chunk_id"):
+            raise SchemaInvariantError(f"retention_source_not_nullable:{table_name}")
+    if not _column_nullable(
+        connection, BASELINE_RETRIEVAL_RUN_TABLE, "source_document_id"
+    ):
+        raise SchemaInvariantError("retention_source_not_nullable:baseline_retrieval_run")
+    if "ix_bl_selected_group_retention" not in _index_names(
+        connection, BASELINE_SELECTED_EVIDENCE_TABLE
+    ):
+        raise SchemaInvariantError("retention_group_index_missing")
+
+    if connection.dialect.name == "sqlite":
+        trigger_names = {
+            str(row[0])
+            for row in connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            ).all()
+        }
+    else:
+        trigger_names = {
+            str(row[0])
+            for row in connection.execute(
+                text(
+                    "SELECT tgname FROM pg_trigger "
+                    "WHERE NOT tgisinternal AND tgrelid = 'chunk'::regclass"
+                )
+            ).all()
+        }
+    if _CHUNK_RETENTION_TRIGGER not in trigger_names:
+        raise SchemaInvariantError("chunk_retention_trigger_missing")
+
+    # Audit provenance is copied by value. It must never acquire a retention
+    # foreign key to mutable corpus/index lifecycle tables.
+    forbidden_targets = {
+        "retrieval_corpus",
+        "retrieval_corpus_generation",
+        "retrieval_baseline_index_build",
+        "retrieval_baseline_index_publication",
+    }
+    for table_name in (BASELINE_RETRIEVAL_RUN_TABLE, "baseline_evidence_artifact"):
+        targets = {target for _, target, _, _ in _foreign_key_targets(connection, table_name)}
+        if forbidden_targets & targets:
+            raise SchemaInvariantError(f"retention_mutable_provenance_fk:{table_name}")
 
 
 CORE_SCHEMA_MIGRATIONS: tuple[SchemaMigration, ...] = (
@@ -629,6 +1104,21 @@ CORE_SCHEMA_MIGRATIONS: tuple[SchemaMigration, ...] = (
         ),
         upgrade=_upgrade_baseline_evidence_bridge,
         validate=_validate_baseline_evidence_bridge,
+    ),
+    SchemaMigration(
+        migration_id="0002_baseline_evidence_retention_v1",
+        description="Preserve immutable baseline evidence across source lifecycle deletion",
+        checksum_material=(
+            "baseline-evidence-retention.v1; source chunk/document provenance uses "
+            "nullable SET NULL; legacy chunk-owned Reference and Feedback deletion "
+            "preserved by scoped trigger; selected evidence directly group-cascades; "
+            "selected-to-run and selected-to-artifact restrict historical deletion; "
+            "baseline Feedback targets selected run ordinal; mutable corpus/index "
+            "provenance remains value-only; SQLite transactional copy/swap with "
+            "foreign_key_check; PostgreSQL ALTER constraints; ddl-v1"
+        ),
+        upgrade=_upgrade_baseline_evidence_retention,
+        validate=_validate_baseline_evidence_retention,
     ),
 )
 
@@ -679,13 +1169,31 @@ def _locked_migration_connection(engine: Engine, dialect: str) -> Iterator[Conne
     connection = engine.connect()
     try:
         if dialect == "sqlite":
+            # SQLite cannot alter FK actions or column nullability in place.
+            # Suspend enforcement only for the locked migration transaction;
+            # a full foreign_key_check gates commit and the connection is
+            # restored before it returns to the pool.
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            if connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() != 0:
+                raise SchemaMigrationError(None, "sqlite_foreign_key_suspend_failed")
+            connection.info["core_migration_foreign_keys_suspended"] = True
             connection.exec_driver_sql("BEGIN IMMEDIATE")
             try:
                 yield connection
+                violations = connection.exec_driver_sql(
+                    "PRAGMA foreign_key_check"
+                ).first()
+                if violations is not None:
+                    raise SchemaInvariantError("sqlite_foreign_key_check_failed")
                 connection.commit()
             except BaseException:
                 connection.rollback()
                 raise
+            finally:
+                connection.info.pop("core_migration_foreign_keys_suspended", None)
+                connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+                if connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() != 1:
+                    raise SchemaMigrationError(None, "sqlite_foreign_key_restore_failed")
             return
 
         transaction = connection.begin()

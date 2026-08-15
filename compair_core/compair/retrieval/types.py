@@ -116,6 +116,7 @@ class RetrievalRequest:
     corpus_complete: bool = True
     corpus_scope_key: str | None = None
     changed_repository_id: str | None = None
+    group_id: str | None = None
     schema_version: str = REQUEST_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -123,6 +124,21 @@ class RetrievalRequest:
             self.retrieval_query,
             self.retrieval_query_origin,
         )
+        if self.group_id is not None:
+            if (
+                not self.group_id
+                or self.group_id != self.group_id.strip()
+                or len(self.group_id) > 36
+                or any(
+                    ord(character) < 33 or ord(character) > 126
+                    for character in self.group_id
+                )
+            ):
+                raise ValueError("group_id must be a canonical authorization scope")
+            if self.corpus_scope_key != f"group:{self.group_id}":
+                raise ValueError(
+                    "group_id and corpus_scope_key must identify the same scope"
+                )
 
     @property
     def query_provenance(self) -> RetrievalQueryProvenance:

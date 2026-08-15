@@ -15,6 +15,11 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm.attributes import get_history
 from sqlalchemy.orm import Session as SASession, load_only
 
+try:
+    from sqlalchemy import text as sql_text
+except ImportError:  # Isolated legacy snapshot tests provide a minimal stub.
+    sql_text = None
+
 from . import feedback as feedback_module
 from .embeddings import create_embedding, create_embeddings, Embedder
 from .focus_manifest import (
@@ -38,12 +43,28 @@ from .models import (
     VECTOR_BACKEND,
     cosine_similarity,
 )
-from .reference_reranker import load_model as load_reference_reranker_model, score_trace_row as score_reference_trace_row
+from .reference_reranker import (
+    load_model as load_reference_reranker_model,
+    score_trace_row as score_reference_trace_row,
+)
 from .retrieval import (
+    BASELINE_RETRIEVAL_ENGINE,
+    DEFAULT_RETRIEVAL_ENGINE,
+    BaselineProcessingOutcome,
+    BaselineProcessingStatus,
+    ProcessingRunIdentityError,
     RetrievalQueryOrigin,
     RetrievalRequest,
+    RetrievalResult,
+    RetrievalStatus,
+    baseline_document_processing_outcome,
+    derive_baseline_persistence_idempotency_key,
+    processing_run_trace_id,
     retrieval_query_provenance,
     retrieve_reference_evidence,
+    validate_baseline_group_id,
+    validate_processing_run_key,
+    validate_retrieval_engine_name,
 )
 from .topic_tags import extract_topic_tags
 from .utils import (
@@ -107,7 +128,9 @@ _LICENSE_METADATA_BASENAMES = {
     "notice.txt",
 }
 _REFERENCE_RERANKER_DEFAULT_MODEL_PATH = "/opt/compair/reference_reranker.json"
-_REFERENCE_RERANKER_DEFAULT_LATEST_PATH = "/opt/compair/reranker/reference_reranker_latest.json"
+_REFERENCE_RERANKER_DEFAULT_LATEST_PATH = (
+    "/opt/compair/reranker/reference_reranker_latest.json"
+)
 _REFERENCE_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
 _REFERENCE_SUBTOKEN_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+")
 _HTTP_METHOD_PATH_RE = re.compile(
@@ -231,14 +254,22 @@ _REFERENCE_TOKEN_STOPWORDS = {
 
 logger = logging.getLogger(__name__)
 try:
-    from compair_cloud.reference_profile_defaults import apply_reference_profile_defaults as _apply_reference_profile_defaults
+    from compair_cloud.reference_profile_defaults import (
+        apply_reference_profile_defaults as _apply_reference_profile_defaults,
+    )
 except (ImportError, ModuleNotFoundError):
-    _REFERENCE_PROFILE_DEFAULTS = {"profile_id": None, "artifact_path": None, "applied": {}}
+    _REFERENCE_PROFILE_DEFAULTS = {
+        "profile_id": None,
+        "artifact_path": None,
+        "applied": {},
+    }
 else:
     _reference_profile_env = os.environ
     if not os.environ.get("COMPAIR_EDITION"):
         _reference_profile_env = {**os.environ, "COMPAIR_EDITION": "core"}
-    _REFERENCE_PROFILE_DEFAULTS = _apply_reference_profile_defaults(_reference_profile_env)
+    _REFERENCE_PROFILE_DEFAULTS = _apply_reference_profile_defaults(
+        _reference_profile_env
+    )
     if _reference_profile_env is not os.environ:
         for _key, _value in (_REFERENCE_PROFILE_DEFAULTS.get("applied") or {}).items():
             os.environ.setdefault(str(_key), str(_value))
@@ -276,7 +307,11 @@ class ReferenceAnchorProfile:
 def is_code_review_document(doc: Document, chunk_mode: Optional[str]) -> bool:
     doc_type = (getattr(doc, "doc_type", "") or "").strip().lower()
     mode = (chunk_mode or "").strip().lower()
-    return doc_type == _CODE_REPO_DOC_TYPE or mode in {"client", "preserve", "prechunked"}
+    return doc_type == _CODE_REPO_DOC_TYPE or mode in {
+        "client",
+        "preserve",
+        "prechunked",
+    }
 
 
 def _extract_snapshot_file_path(chunk: str) -> str:
@@ -309,7 +344,9 @@ def _is_header_only_snapshot_chunk(chunk: str) -> bool:
     return len(body_lines) == 1 and len(body_lines[0]) <= 24
 
 
-def _chunk_priority_key(chunk: str, idx: int, code_focus: bool) -> tuple[int, int, int, int, int]:
+def _chunk_priority_key(
+    chunk: str, idx: int, code_focus: bool
+) -> tuple[int, int, int, int, int]:
     if not code_focus:
         return (0, 0, 0, -len(chunk), idx)
 
@@ -329,7 +366,9 @@ def _chunk_priority_key(chunk: str, idx: int, code_focus: bool) -> tuple[int, in
 
     path_rank = 2
     if path:
-        if any(hint in path for hint in _HIGH_SIGNAL_PATH_HINTS) or _is_high_signal_metadata_path(path):
+        if any(
+            hint in path for hint in _HIGH_SIGNAL_PATH_HINTS
+        ) or _is_high_signal_metadata_path(path):
             path_rank = 0
         else:
             path_rank = 1
@@ -340,10 +379,14 @@ def _chunk_priority_key(chunk: str, idx: int, code_focus: bool) -> tuple[int, in
 
 def _is_snapshot_metadata_chunk(chunk: str) -> bool:
     stripped = (chunk or "").lstrip()
-    return stripped.startswith("# Compair baseline snapshot") or stripped.startswith("## Snapshot limits")
+    return stripped.startswith("# Compair baseline snapshot") or stripped.startswith(
+        "## Snapshot limits"
+    )
 
 
-def _should_reanalyze_existing_chunks(*, reanalyze_existing: bool, meaningful_new_chunk_count: int) -> bool:
+def _should_reanalyze_existing_chunks(
+    *, reanalyze_existing: bool, meaningful_new_chunk_count: int
+) -> bool:
     return bool(reanalyze_existing)
 
 
@@ -369,7 +412,13 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _float_env(name: str, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
+def _float_env(
+    name: str,
+    default: float,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
     raw = os.getenv(name)
     if raw is None:
         value = default
@@ -461,155 +510,267 @@ def _reference_adjudicator_top_k() -> int:
 
 
 def _reference_hybrid_vector_rank_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HYBRID_VECTOR_RANK_WEIGHT", 22.0, minimum=0.0, maximum=100.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HYBRID_VECTOR_RANK_WEIGHT", 22.0, minimum=0.0, maximum=100.0
+    )
 
 
 def _reference_hybrid_lexical_rank_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HYBRID_LEXICAL_RANK_WEIGHT", 30.0, minimum=0.0, maximum=100.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HYBRID_LEXICAL_RANK_WEIGHT", 30.0, minimum=0.0, maximum=100.0
+    )
 
 
 def _reference_hybrid_anchor_rank_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HYBRID_ANCHOR_RANK_WEIGHT", 36.0, minimum=0.0, maximum=100.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HYBRID_ANCHOR_RANK_WEIGHT", 36.0, minimum=0.0, maximum=100.0
+    )
 
 
 def _reference_hybrid_counterpart_rank_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HYBRID_COUNTERPART_RANK_WEIGHT", 28.0, minimum=0.0, maximum=100.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HYBRID_COUNTERPART_RANK_WEIGHT",
+        28.0,
+        minimum=0.0,
+        maximum=100.0,
+    )
 
 
 def _reference_hybrid_fts_rank_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HYBRID_FTS_RANK_WEIGHT", 34.0, minimum=0.0, maximum=100.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HYBRID_FTS_RANK_WEIGHT", 34.0, minimum=0.0, maximum=100.0
+    )
 
 
 def _reference_hybrid_lexical_signal_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HYBRID_LEXICAL_SIGNAL_WEIGHT", 0.12, minimum=0.0, maximum=5.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HYBRID_LEXICAL_SIGNAL_WEIGHT", 0.12, minimum=0.0, maximum=5.0
+    )
 
 
 def _reference_hybrid_path_theme_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HYBRID_PATH_THEME_WEIGHT", 0.10, minimum=0.0, maximum=5.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HYBRID_PATH_THEME_WEIGHT", 0.10, minimum=0.0, maximum=5.0
+    )
 
 
 def _reference_hybrid_path_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HYBRID_PATH_WEIGHT", 0.08, minimum=0.0, maximum=5.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HYBRID_PATH_WEIGHT", 0.08, minimum=0.0, maximum=5.0
+    )
 
 
 def _reference_hybrid_artifact_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HYBRID_ARTIFACT_WEIGHT", 0.18, minimum=0.0, maximum=5.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HYBRID_ARTIFACT_WEIGHT", 0.18, minimum=0.0, maximum=5.0
+    )
 
 
 def _reference_hybrid_anchor_overlap_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HYBRID_ANCHOR_OVERLAP_WEIGHT", 0.34, minimum=0.0, maximum=5.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HYBRID_ANCHOR_OVERLAP_WEIGHT", 0.34, minimum=0.0, maximum=5.0
+    )
 
 
 def _reference_hybrid_anchor_conflict_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HYBRID_ANCHOR_CONFLICT_WEIGHT", 0.42, minimum=0.0, maximum=6.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HYBRID_ANCHOR_CONFLICT_WEIGHT",
+        0.42,
+        minimum=0.0,
+        maximum=6.0,
+    )
 
 
 def _reference_hybrid_combined_signal_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HYBRID_COMBINED_SIGNAL_WEIGHT", 0.05, minimum=0.0, maximum=5.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HYBRID_COMBINED_SIGNAL_WEIGHT",
+        0.05,
+        minimum=0.0,
+        maximum=5.0,
+    )
 
 
 def _reference_hybrid_counterpart_signal_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HYBRID_COUNTERPART_SIGNAL_WEIGHT", 0.28, minimum=0.0, maximum=6.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HYBRID_COUNTERPART_SIGNAL_WEIGHT",
+        0.28,
+        minimum=0.0,
+        maximum=6.0,
+    )
 
 
 def _reference_hybrid_reranker_blend() -> float:
-    return _float_env("COMPAIR_REFERENCE_HYBRID_RERANKER_BLEND", 0.45, minimum=0.0, maximum=3.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HYBRID_RERANKER_BLEND", 0.45, minimum=0.0, maximum=3.0
+    )
 
 
 def _reference_reranker_score_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_RERANKER_SCORE_WEIGHT", 1.0, minimum=0.0, maximum=3.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_RERANKER_SCORE_WEIGHT", 1.0, minimum=0.0, maximum=3.0
+    )
 
 
 def _reference_hybrid_heuristic_blend() -> float:
-    return _float_env("COMPAIR_REFERENCE_HYBRID_HEURISTIC_BLEND", 0.4, minimum=0.0, maximum=3.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HYBRID_HEURISTIC_BLEND", 0.4, minimum=0.0, maximum=3.0
+    )
 
 
 def _reference_heuristic_base_rank_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HEURISTIC_BASE_RANK_WEIGHT", 3.0, minimum=0.0, maximum=8.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HEURISTIC_BASE_RANK_WEIGHT", 3.0, minimum=0.0, maximum=8.0
+    )
 
 
 def _reference_heuristic_lexical_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HEURISTIC_LEXICAL_WEIGHT", 4.0, minimum=0.0, maximum=8.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HEURISTIC_LEXICAL_WEIGHT", 4.0, minimum=0.0, maximum=8.0
+    )
 
 
 def _reference_heuristic_path_theme_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HEURISTIC_PATH_THEME_WEIGHT", 2.0, minimum=0.0, maximum=8.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HEURISTIC_PATH_THEME_WEIGHT", 2.0, minimum=0.0, maximum=8.0
+    )
 
 
 def _reference_heuristic_artifact_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HEURISTIC_ARTIFACT_WEIGHT", 1.0, minimum=0.0, maximum=8.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HEURISTIC_ARTIFACT_WEIGHT", 1.0, minimum=0.0, maximum=8.0
+    )
 
 
 def _reference_heuristic_anchor_overlap_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HEURISTIC_ANCHOR_OVERLAP_WEIGHT", 3.5, minimum=0.0, maximum=8.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HEURISTIC_ANCHOR_OVERLAP_WEIGHT",
+        3.5,
+        minimum=0.0,
+        maximum=8.0,
+    )
 
 
 def _reference_heuristic_anchor_conflict_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HEURISTIC_ANCHOR_CONFLICT_WEIGHT", 4.0, minimum=0.0, maximum=8.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HEURISTIC_ANCHOR_CONFLICT_WEIGHT",
+        4.0,
+        minimum=0.0,
+        maximum=8.0,
+    )
 
 
 def _reference_heuristic_path_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HEURISTIC_PATH_WEIGHT", 1.0, minimum=0.0, maximum=8.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HEURISTIC_PATH_WEIGHT", 1.0, minimum=0.0, maximum=8.0
+    )
 
 
 def _reference_heuristic_code_bonus() -> float:
-    return _float_env("COMPAIR_REFERENCE_HEURISTIC_CODE_BONUS", 0.4, minimum=0.0, maximum=4.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HEURISTIC_CODE_BONUS", 0.4, minimum=0.0, maximum=4.0
+    )
 
 
 def _reference_heuristic_docdoc_bonus() -> float:
-    return _float_env("COMPAIR_REFERENCE_HEURISTIC_DOCDOC_BONUS", 0.75, minimum=0.0, maximum=4.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HEURISTIC_DOCDOC_BONUS", 0.75, minimum=0.0, maximum=4.0
+    )
 
 
 def _reference_heuristic_doccode_bonus() -> float:
-    return _float_env("COMPAIR_REFERENCE_HEURISTIC_DOCCODE_BONUS", 0.55, minimum=0.0, maximum=4.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HEURISTIC_DOCCODE_BONUS", 0.55, minimum=0.0, maximum=4.0
+    )
 
 
 def _reference_heuristic_metadata_bonus() -> float:
-    return _float_env("COMPAIR_REFERENCE_HEURISTIC_METADATA_BONUS", 0.85, minimum=0.0, maximum=4.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HEURISTIC_METADATA_BONUS", 0.85, minimum=0.0, maximum=4.0
+    )
 
 
 def _reference_heuristic_counterpart_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_HEURISTIC_COUNTERPART_WEIGHT", 1.6, minimum=0.0, maximum=6.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HEURISTIC_COUNTERPART_WEIGHT", 1.6, minimum=0.0, maximum=6.0
+    )
 
 
 def _reference_adjudicator_preselection_boost() -> float:
-    return _float_env("COMPAIR_REFERENCE_ADJUDICATOR_PRESELECTION_BOOST", 1.2, minimum=0.0, maximum=4.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_ADJUDICATOR_PRESELECTION_BOOST",
+        1.2,
+        minimum=0.0,
+        maximum=4.0,
+    )
 
 
 def _reference_adjudicator_mismatch_preselection_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_ADJUDICATOR_MISMATCH_PRESELECTION_WEIGHT", 0.15, minimum=0.0, maximum=4.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_ADJUDICATOR_MISMATCH_PRESELECTION_WEIGHT",
+        0.15,
+        minimum=0.0,
+        maximum=4.0,
+    )
 
 
 def _reference_adjudicator_mismatch_score_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_ADJUDICATOR_MISMATCH_SCORE_WEIGHT", 2.8, minimum=0.0, maximum=6.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_ADJUDICATOR_MISMATCH_SCORE_WEIGHT",
+        2.8,
+        minimum=0.0,
+        maximum=6.0,
+    )
 
 
 def _reference_adjudicator_docdoc_preselection_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_ADJUDICATOR_DOCDOC_PRESELECTION_WEIGHT", 0.3, minimum=0.0, maximum=4.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_ADJUDICATOR_DOCDOC_PRESELECTION_WEIGHT",
+        0.3,
+        minimum=0.0,
+        maximum=4.0,
+    )
 
 
 def _reference_adjudicator_docdoc_score_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_ADJUDICATOR_DOCDOC_SCORE_WEIGHT", 0.1, minimum=0.0, maximum=4.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_ADJUDICATOR_DOCDOC_SCORE_WEIGHT",
+        0.1,
+        minimum=0.0,
+        maximum=4.0,
+    )
 
 
 def _reference_adjudicator_default_score_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_ADJUDICATOR_DEFAULT_SCORE_WEIGHT", 0.1, minimum=0.0, maximum=4.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_ADJUDICATOR_DEFAULT_SCORE_WEIGHT",
+        0.1,
+        minimum=0.0,
+        maximum=4.0,
+    )
 
 
 def _reference_reranker_diversity_penalty() -> float:
-    return _float_env("COMPAIR_REFERENCE_RERANKER_DIVERSITY_PENALTY", 1.35, minimum=0.0, maximum=6.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_RERANKER_DIVERSITY_PENALTY", 1.35, minimum=0.0, maximum=6.0
+    )
 
 
 def _reference_heuristic_diversity_penalty() -> float:
-    return _float_env("COMPAIR_REFERENCE_HEURISTIC_DIVERSITY_PENALTY", 2.2, minimum=0.0, maximum=6.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_HEURISTIC_DIVERSITY_PENALTY", 2.2, minimum=0.0, maximum=6.0
+    )
 
 
 def _reference_source_penalty_weight() -> float:
-    return _float_env("COMPAIR_REFERENCE_SOURCE_PENALTY_WEIGHT", 0.75, minimum=0.0, maximum=6.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_SOURCE_PENALTY_WEIGHT", 0.75, minimum=0.0, maximum=6.0
+    )
 
 
 def _reference_path_diversity_penalty() -> float:
-    return _float_env("COMPAIR_REFERENCE_PATH_DIVERSITY_PENALTY", 0.0, minimum=0.0, maximum=8.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_PATH_DIVERSITY_PENALTY", 0.0, minimum=0.0, maximum=8.0
+    )
 
 
 def _reference_max_per_path() -> int:
@@ -640,23 +801,36 @@ def _reference_reranker_rescue_count() -> int:
 
 
 def _reference_reranker_rescue_min_score() -> float:
-    return _float_env("COMPAIR_REFERENCE_RERANKER_RESCUE_MIN_SCORE", 0.35, minimum=0.0, maximum=4.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_RERANKER_RESCUE_MIN_SCORE", 0.35, minimum=0.0, maximum=4.0
+    )
 
 
 def _reference_reranker_rescue_counterpart_min() -> float:
-    return _float_env("COMPAIR_REFERENCE_RERANKER_RESCUE_COUNTERPART_MIN", 0.55, minimum=0.0, maximum=6.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_RERANKER_RESCUE_COUNTERPART_MIN",
+        0.55,
+        minimum=0.0,
+        maximum=6.0,
+    )
 
 
 def _source_significance_threshold() -> float:
-    return _float_env("COMPAIR_CODE_REPO_SOURCE_SIGNIFICANCE_THRESHOLD", 0.5, minimum=0.0, maximum=1.0)
+    return _float_env(
+        "COMPAIR_CODE_REPO_SOURCE_SIGNIFICANCE_THRESHOLD", 0.5, minimum=0.0, maximum=1.0
+    )
 
 
 def _source_redundancy_penalty() -> float:
-    return _float_env("COMPAIR_CODE_REPO_SOURCE_REDUNDANCY_PENALTY", 2.6, minimum=0.0, maximum=8.0)
+    return _float_env(
+        "COMPAIR_CODE_REPO_SOURCE_REDUNDANCY_PENALTY", 2.6, minimum=0.0, maximum=8.0
+    )
 
 
 def _source_min_selection_score() -> float:
-    return _float_env("COMPAIR_CODE_REPO_SOURCE_MIN_SELECTION_SCORE", 1.8, minimum=0.0, maximum=8.0)
+    return _float_env(
+        "COMPAIR_CODE_REPO_SOURCE_MIN_SELECTION_SCORE", 1.8, minimum=0.0, maximum=8.0
+    )
 
 
 def _reference_merge_limit(code_focus: bool, candidate_limit: int) -> int:
@@ -675,7 +849,9 @@ def _reference_merge_limit(code_focus: bool, candidate_limit: int) -> int:
     return max(candidate_limit, value)
 
 
-def _reference_trim_limit(code_focus: bool, candidate_limit: int, merge_limit: int) -> int:
+def _reference_trim_limit(
+    code_focus: bool, candidate_limit: int, merge_limit: int
+) -> int:
     if code_focus:
         raw = os.getenv("COMPAIR_CODE_REPO_REFERENCE_TRIM_LIMIT")
         default = max(candidate_limit, min(merge_limit, candidate_limit * 2))
@@ -691,7 +867,9 @@ def _reference_trim_limit(code_focus: bool, candidate_limit: int, merge_limit: i
     return max(candidate_limit, min(merge_limit, value))
 
 
-def _reference_vector_fetch_limit(code_focus: bool, candidate_limit: int, merge_limit: int) -> int:
+def _reference_vector_fetch_limit(
+    code_focus: bool, candidate_limit: int, merge_limit: int
+) -> int:
     if code_focus:
         raw = os.getenv("COMPAIR_CODE_REPO_REFERENCE_VECTOR_FETCH_LIMIT")
         default = max(candidate_limit * 6, merge_limit)
@@ -724,15 +902,24 @@ def _reference_adaptive_fetch_enabled() -> bool:
 
 
 def _reference_behavioral_doc_fetch_multiplier() -> float:
-    return _float_env("COMPAIR_REFERENCE_BEHAVIORAL_DOC_FETCH_MULTIPLIER", 1.75, minimum=1.0, maximum=4.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_BEHAVIORAL_DOC_FETCH_MULTIPLIER",
+        1.75,
+        minimum=1.0,
+        maximum=4.0,
+    )
 
 
 def _reference_metadata_fetch_multiplier() -> float:
-    return _float_env("COMPAIR_REFERENCE_METADATA_FETCH_MULTIPLIER", 2.0, minimum=1.0, maximum=4.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_METADATA_FETCH_MULTIPLIER", 2.0, minimum=1.0, maximum=4.0
+    )
 
 
 def _reference_structured_fetch_multiplier() -> float:
-    return _float_env("COMPAIR_REFERENCE_STRUCTURED_FETCH_MULTIPLIER", 1.5, minimum=1.0, maximum=4.0)
+    return _float_env(
+        "COMPAIR_REFERENCE_STRUCTURED_FETCH_MULTIPLIER", 1.5, minimum=1.0, maximum=4.0
+    )
 
 
 def _reference_fts_enabled() -> bool:
@@ -740,7 +927,11 @@ def _reference_fts_enabled() -> bool:
 
 
 def _reference_fts_candidate_limit(code_focus: bool, candidate_limit: int) -> int:
-    raw = os.getenv("COMPAIR_CODE_REPO_REFERENCE_FTS_LIMIT" if code_focus else "COMPAIR_REFERENCE_FTS_LIMIT")
+    raw = os.getenv(
+        "COMPAIR_CODE_REPO_REFERENCE_FTS_LIMIT"
+        if code_focus
+        else "COMPAIR_REFERENCE_FTS_LIMIT"
+    )
     default = max(candidate_limit * 2, 20 if code_focus else candidate_limit)
     if raw is None or not raw.strip():
         return default
@@ -768,8 +959,19 @@ def _reference_reranker_state() -> tuple[dict[str, Any] | None, str | None]:
     if not _reference_reranker_enabled():
         return None, None
     raw_path = (os.getenv("COMPAIR_REFERENCE_RERANKER_MODEL_PATH") or "").strip()
-    candidate_paths = [path for path in (raw_path, _REFERENCE_RERANKER_DEFAULT_MODEL_PATH, _REFERENCE_RERANKER_DEFAULT_LATEST_PATH) if path]
-    model_path = next((path for path in candidate_paths if os.path.exists(path)), raw_path or _REFERENCE_RERANKER_DEFAULT_MODEL_PATH)
+    candidate_paths = [
+        path
+        for path in (
+            raw_path,
+            _REFERENCE_RERANKER_DEFAULT_MODEL_PATH,
+            _REFERENCE_RERANKER_DEFAULT_LATEST_PATH,
+        )
+        if path
+    ]
+    model_path = next(
+        (path for path in candidate_paths if os.path.exists(path)),
+        raw_path or _REFERENCE_RERANKER_DEFAULT_MODEL_PATH,
+    )
     if not os.path.exists(model_path):
         logger.warning(
             "Reference reranker enabled but model artifact is missing at %s; falling back to heuristic ranking.",
@@ -804,7 +1006,9 @@ def _reference_reranker_metadata() -> tuple[bool, str | None, str | None]:
     model, model_path = _reference_reranker_state()
     if not model:
         return False, None, model_path
-    model_version = str(model.get("model_version") or model.get("version") or "").strip() or None
+    model_version = (
+        str(model.get("model_version") or model.get("version") or "").strip() or None
+    )
     return True, model_version, model_path
 
 
@@ -837,7 +1041,9 @@ def _path_token_set(path: str) -> set[str]:
 
 def _reference_subtokens(value: str) -> set[str]:
     tokens: set[str] = set()
-    for raw in _REFERENCE_SUBTOKEN_RE.findall((value or "").replace("_", " ").replace("-", " ")):
+    for raw in _REFERENCE_SUBTOKEN_RE.findall(
+        (value or "").replace("_", " ").replace("-", " ")
+    ):
         token = raw.lower()
         if len(token) < 3 or token in _REFERENCE_TOKEN_STOPWORDS:
             continue
@@ -870,11 +1076,17 @@ def _token_overlap_ratio(left: set[str], right: set[str]) -> float:
 
 
 def _is_manifest_metadata_path(path: str) -> bool:
-    return os.path.basename((path or "").strip().lower().replace("\\", "/")) in _MANIFEST_METADATA_BASENAMES
+    return (
+        os.path.basename((path or "").strip().lower().replace("\\", "/"))
+        in _MANIFEST_METADATA_BASENAMES
+    )
 
 
 def _is_license_metadata_path(path: str) -> bool:
-    return os.path.basename((path or "").strip().lower().replace("\\", "/")) in _LICENSE_METADATA_BASENAMES
+    return (
+        os.path.basename((path or "").strip().lower().replace("\\", "/"))
+        in _LICENSE_METADATA_BASENAMES
+    )
 
 
 def _doc_body_lines(text: str) -> list[str]:
@@ -912,7 +1124,10 @@ def _behavioral_doc_signal_score(text: str) -> float:
         for line in body_lines
     ):
         score += 0.45
-    if any("`" in line and ("/" in line or "=" in line or "." in line) for line in body_lines):
+    if any(
+        "`" in line and ("/" in line or "=" in line or "." in line)
+        for line in body_lines
+    ):
         score += 0.4
     if _BEHAVIORAL_CLAIM_VERB_RE.search(body):
         score += 0.7
@@ -977,14 +1192,19 @@ def _structured_source_signal_score(text: str, *, code_focus: bool) -> float:
 
     if _is_high_signal_metadata_path(path):
         score += 1.0
-        if profile.license_terms or "license" in artifacts.key_names or os.path.basename(path).lower() in {
-            "license",
-            "license.txt",
-            "copying",
-            "copying.txt",
-            "notice",
-            "notice.txt",
-        }:
+        if (
+            profile.license_terms
+            or "license" in artifacts.key_names
+            or os.path.basename(path).lower()
+            in {
+                "license",
+                "license.txt",
+                "copying",
+                "copying.txt",
+                "notice",
+                "notice.txt",
+            }
+        ):
             score += 1.25
 
     # Structured docs such as API guides and config references are often the
@@ -1077,7 +1297,13 @@ def _extract_env_vars(text: str) -> frozenset[str]:
     out: set[str] = set()
     for raw in _ENV_VAR_RE.findall(text or ""):
         candidate = raw.strip().upper()
-        if candidate in _ENV_VAR_EXCLUDE or candidate in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+        if candidate in _ENV_VAR_EXCLUDE or candidate in {
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+        }:
             continue
         out.add(candidate)
     return frozenset(out)
@@ -1137,7 +1363,11 @@ def _reference_counterpart_terms(text: str, path: str) -> frozenset[str]:
     for raw in profile.license_terms:
         tokens.update(_reference_subtokens(raw))
 
-    return frozenset(token for token in tokens if len(token) >= 3 and token not in _REFERENCE_TOKEN_STOPWORDS)
+    return frozenset(
+        token
+        for token in tokens
+        if len(token) >= 3 and token not in _REFERENCE_TOKEN_STOPWORDS
+    )
 
 
 def _reference_fts_source_roles(text: str, path: str) -> frozenset[str]:
@@ -1166,9 +1396,21 @@ def _reference_fts_source_roles(text: str, path: str) -> frozenset[str]:
         roles.add("route_surface")
     if profile.license_terms or "license" in profile.key_names:
         roles.add("legal_surface")
-    if artifacts.assignments or ("```" in (text or "")) or any(
-        token in _identifier_tokens(text or "", limit=96)
-        for token in {"function", "return", "class", "router", "service", "provider", "backend"}
+    if (
+        artifacts.assignments
+        or ("```" in (text or ""))
+        or any(
+            token in _identifier_tokens(text or "", limit=96)
+            for token in {
+                "function",
+                "return",
+                "class",
+                "router",
+                "service",
+                "provider",
+                "backend",
+            }
+        )
     ):
         roles.add("implementation")
     return frozenset(roles)
@@ -1242,7 +1484,11 @@ def _reference_fts_signal_text(text: str, path: str) -> str:
     for raw in _identifier_tokens(text or "", limit=128):
         add(raw)
 
-    parts = [part for part in (normalized_path, basename, " ".join(tokens), text or "") if part]
+    parts = [
+        part
+        for part in (normalized_path, basename, " ".join(tokens), text or "")
+        if part
+    ]
     return "\n".join(parts)
 
 
@@ -1289,20 +1535,99 @@ def _reference_fts_queries(text: str, *, code_focus: bool) -> list[str]:
 
     if "manifest" in roles or "legal_surface" in roles:
         structural_terms = [
-            *[token for token in structural_terms if token in {"license", "notice", "copying", "copyright", "mit", "apache", "gpl", "bsd", "mpl", "isc", "proprietary"}],
-            *[token for token in concept_terms if token in {"license", "notice", "copying", "copyright"}],
+            *[
+                token
+                for token in structural_terms
+                if token
+                in {
+                    "license",
+                    "notice",
+                    "copying",
+                    "copyright",
+                    "mit",
+                    "apache",
+                    "gpl",
+                    "bsd",
+                    "mpl",
+                    "isc",
+                    "proprietary",
+                }
+            ],
+            *[
+                token
+                for token in concept_terms
+                if token in {"license", "notice", "copying", "copyright"}
+            ],
             *structural_terms,
         ]
     elif "behavioral_doc" in roles or "env_config" in roles:
         structural_terms = [
-            *[token for token in structural_terms if token in {"email", "mailer", "delivery", "backend", "provider", "service", "adapter", "stdout", "smtp", "send", "verification"}],
-            *[token for token in concept_terms if token in {"email", "mailer", "delivery", "backend", "provider", "service", "adapter", "verification"}],
+            *[
+                token
+                for token in structural_terms
+                if token
+                in {
+                    "email",
+                    "mailer",
+                    "delivery",
+                    "backend",
+                    "provider",
+                    "service",
+                    "adapter",
+                    "stdout",
+                    "smtp",
+                    "send",
+                    "verification",
+                }
+            ],
+            *[
+                token
+                for token in concept_terms
+                if token
+                in {
+                    "email",
+                    "mailer",
+                    "delivery",
+                    "backend",
+                    "provider",
+                    "service",
+                    "adapter",
+                    "verification",
+                }
+            ],
             *structural_terms,
         ]
     elif "ui" in roles or "api" in roles or "route_surface" in roles:
         structural_terms = [
-            *[token for token in structural_terms if token in {"api", "route", "endpoint", "handler", "service", "notification", "event", "preferences"}],
-            *[token for token in concept_terms if token in {"api", "route", "endpoint", "handler", "notification", "event", "preferences"}],
+            *[
+                token
+                for token in structural_terms
+                if token
+                in {
+                    "api",
+                    "route",
+                    "endpoint",
+                    "handler",
+                    "service",
+                    "notification",
+                    "event",
+                    "preferences",
+                }
+            ],
+            *[
+                token
+                for token in concept_terms
+                if token
+                in {
+                    "api",
+                    "route",
+                    "endpoint",
+                    "handler",
+                    "notification",
+                    "event",
+                    "preferences",
+                }
+            ],
             *structural_terms,
         ]
 
@@ -1358,15 +1683,33 @@ def _reference_fts_candidate_noise_penalty(
 ) -> float:
     target_path = _extract_snapshot_file_path(target_text)
     target_roles = _reference_fts_source_roles(target_text, target_path)
-    normalized_candidate_path = (candidate_path or "").strip().lower().replace("\\", "/")
-    candidate_roles = _reference_fts_source_roles(candidate_text, normalized_candidate_path)
+    normalized_candidate_path = (
+        (candidate_path or "").strip().lower().replace("\\", "/")
+    )
+    candidate_roles = _reference_fts_source_roles(
+        candidate_text, normalized_candidate_path
+    )
 
     penalty = 0.0
-    if any(marker in normalized_candidate_path for marker in ("/tests/", "/test/", "test_", "_test.", "spec.")):
-        penalty += 1.6 if {"manifest", "metadata", "behavioral_doc"} & set(target_roles) else 0.8
-    if any(marker in normalized_candidate_path for marker in ("/.github/workflows/", "/workflows/", "docker-publish", "ci/")):
+    if any(
+        marker in normalized_candidate_path
+        for marker in ("/tests/", "/test/", "test_", "_test.", "spec.")
+    ):
+        penalty += (
+            1.6
+            if {"manifest", "metadata", "behavioral_doc"} & set(target_roles)
+            else 0.8
+        )
+    if any(
+        marker in normalized_candidate_path
+        for marker in ("/.github/workflows/", "/workflows/", "docker-publish", "ci/")
+    ):
         penalty += 1.8 if {"manifest", "metadata"} & set(target_roles) else 0.9
-    if "doc" in target_roles and "doc" in candidate_roles and _reference_counterpart_signal(target_text, candidate_text) < 0.8:
+    if (
+        "doc" in target_roles
+        and "doc" in candidate_roles
+        and _reference_counterpart_signal(target_text, candidate_text) < 0.8
+    ):
         penalty += 0.9
     if {"manifest", "metadata"} & set(target_roles) and not (
         {"manifest", "license", "metadata", "legal_surface"} & set(candidate_roles)
@@ -1375,11 +1718,15 @@ def _reference_fts_candidate_noise_penalty(
     return penalty
 
 
-def _reference_effective_fts_candidate_limit(target_text: str, *, code_focus: bool, candidate_limit: int) -> int:
+def _reference_effective_fts_candidate_limit(
+    target_text: str, *, code_focus: bool, candidate_limit: int
+) -> int:
     base_limit = _reference_fts_candidate_limit(code_focus, candidate_limit)
     if not code_focus:
         return base_limit
-    roles = _reference_fts_source_roles(target_text, _extract_snapshot_file_path(target_text))
+    roles = _reference_fts_source_roles(
+        target_text, _extract_snapshot_file_path(target_text)
+    )
     multiplier = 1.0
     if {"manifest", "metadata", "legal_surface"} & set(roles):
         multiplier = max(multiplier, 2.0)
@@ -1409,9 +1756,16 @@ def _assignment_contrast_score(left_text: str, right_text: str) -> float:
             score += 1.6
             if assignment.paths or peer.paths:
                 score += 0.7
-            if assignment.value_tokens and peer.value_tokens and not (assignment.value_tokens & peer.value_tokens):
+            if (
+                assignment.value_tokens
+                and peer.value_tokens
+                and not (assignment.value_tokens & peer.value_tokens)
+            ):
                 score += 0.9
-            if assignment.normalized_value in {"true", "false"} or peer.normalized_value in {"true", "false"}:
+            if assignment.normalized_value in {
+                "true",
+                "false",
+            } or peer.normalized_value in {"true", "false"}:
                 score += 0.4
     return min(score, 4.5)
 
@@ -1456,22 +1810,28 @@ def _reference_anchor_conflict_score(left_text: str, right_text: str) -> float:
     shared_endpoint_paths = left.endpoint_paths & right.endpoint_paths
     if shared_endpoint_paths:
         same_method_pairs = left.endpoint_pairs & right.endpoint_pairs
-        if not same_method_pairs and left.methods and right.methods and left.methods != right.methods:
+        if (
+            not same_method_pairs
+            and left.methods
+            and right.methods
+            and left.methods != right.methods
+        ):
             score += 3.2 + min(0.8, 0.2 * float(len(shared_endpoint_paths)))
 
-    if left.license_terms and right.license_terms and left.license_terms != right.license_terms:
+    if (
+        left.license_terms
+        and right.license_terms
+        and left.license_terms != right.license_terms
+    ):
         score += 2.8
-    elif (
-        ("license" in left.key_names and right.license_terms)
-        or ("license" in right.key_names and left.license_terms)
+    elif ("license" in left.key_names and right.license_terms) or (
+        "license" in right.key_names and left.license_terms
     ):
         score += 1.8
 
     if left.env_vars and right.env_vars and left.env_vars != right.env_vars:
         shared_prefixes = {
-            env.split("_", 1)[0]
-            for env in left.env_vars | right.env_vars
-            if "_" in env
+            env.split("_", 1)[0] for env in left.env_vars | right.env_vars if "_" in env
         }
         if shared_prefixes and not (left.env_vars & right.env_vars):
             score += 0.8
@@ -1484,7 +1844,14 @@ def _is_ui_surface_path(path: str) -> bool:
         return False
     return any(
         marker in normalized
-        for marker in ("/pages/", "/components/", "/ui/", "/frontend/", "/client/", "/views/")
+        for marker in (
+            "/pages/",
+            "/components/",
+            "/ui/",
+            "/frontend/",
+            "/client/",
+            "/views/",
+        )
     )
 
 
@@ -1495,8 +1862,22 @@ def _is_api_surface_path(path: str) -> bool:
     basename = os.path.basename(normalized)
     return any(
         marker in normalized
-        for marker in ("/api", "/service/", "/services/", "/routes/", "/router", "/server/")
-    ) or basename in {"api.py", "api.ts", "api.js", "service.py", "service.ts", "service.js"}
+        for marker in (
+            "/api",
+            "/service/",
+            "/services/",
+            "/routes/",
+            "/router",
+            "/server/",
+        )
+    ) or basename in {
+        "api.py",
+        "api.ts",
+        "api.js",
+        "service.py",
+        "service.ts",
+        "service.js",
+    }
 
 
 @lru_cache(maxsize=4096)
@@ -1516,8 +1897,12 @@ def _reference_counterpart_signal(left_text: str, right_text: str) -> float:
     left_is_license = _is_license_metadata_path(left_path)
     right_is_license = _is_license_metadata_path(right_path)
 
-    shared_endpoint_pairs = len(left_profile.endpoint_pairs & right_profile.endpoint_pairs)
-    shared_endpoint_paths = len(left_profile.endpoint_paths & right_profile.endpoint_paths)
+    shared_endpoint_pairs = len(
+        left_profile.endpoint_pairs & right_profile.endpoint_pairs
+    )
+    shared_endpoint_paths = len(
+        left_profile.endpoint_paths & right_profile.endpoint_paths
+    )
     shared_env_vars = len(left_profile.env_vars & right_profile.env_vars)
     shared_keys = len(left_profile.key_names & right_profile.key_names)
     shared_quotes = len(left_profile.quoted_norm & right_profile.quoted_norm)
@@ -1534,56 +1919,86 @@ def _reference_counterpart_signal(left_text: str, right_text: str) -> float:
     score = 0.0
 
     if left_is_doc_like != right_is_doc_like:
-        score += min(1.6, 0.85 * float(shared_endpoint_pairs) + 0.45 * float(shared_endpoint_paths))
+        score += min(
+            1.6,
+            0.85 * float(shared_endpoint_pairs) + 0.45 * float(shared_endpoint_paths),
+        )
         score += min(1.2, 0.5 * float(shared_env_vars) + 0.18 * float(shared_keys))
         score += min(1.0, 0.2 * float(shared_quotes) + 0.08 * float(shared_tokens))
-        score += min(1.4, 0.18 * float(shared_counterpart_terms) + 0.3 * float(shared_basename_terms))
+        score += min(
+            1.4,
+            0.18 * float(shared_counterpart_terms) + 0.3 * float(shared_basename_terms),
+        )
         if left_profile.basename and left_profile.basename in right_artifacts.tokens:
             score += 0.45
         if right_profile.basename and right_profile.basename in left_artifacts.tokens:
             score += 0.45
 
     metadata_license_counterpart = (
-        (
-            left_is_metadata
-            and (
-                "license" in left_profile.key_names
-                or bool(left_profile.license_terms)
-                or any(term in left_profile.quoted_norm for term in {"mit", "apache-2.0", "gpl-3.0", "bsd-3-clause"})
-            )
-            and (
-                bool(right_profile.license_terms)
-                or right_profile.basename in {"license", "license.txt", "copying", "copying.txt", "notice", "notice.txt"}
+        left_is_metadata
+        and (
+            "license" in left_profile.key_names
+            or bool(left_profile.license_terms)
+            or any(
+                term in left_profile.quoted_norm
+                for term in {"mit", "apache-2.0", "gpl-3.0", "bsd-3-clause"}
             )
         )
-        or (
-            right_is_metadata
-            and (
-                "license" in right_profile.key_names
-                or bool(right_profile.license_terms)
-                or any(term in right_profile.quoted_norm for term in {"mit", "apache-2.0", "gpl-3.0", "bsd-3-clause"})
+        and (
+            bool(right_profile.license_terms)
+            or right_profile.basename
+            in {
+                "license",
+                "license.txt",
+                "copying",
+                "copying.txt",
+                "notice",
+                "notice.txt",
+            }
+        )
+    ) or (
+        right_is_metadata
+        and (
+            "license" in right_profile.key_names
+            or bool(right_profile.license_terms)
+            or any(
+                term in right_profile.quoted_norm
+                for term in {"mit", "apache-2.0", "gpl-3.0", "bsd-3-clause"}
             )
-            and (
-                bool(left_profile.license_terms)
-                or left_profile.basename in {"license", "license.txt", "copying", "copying.txt", "notice", "notice.txt"}
-            )
+        )
+        and (
+            bool(left_profile.license_terms)
+            or left_profile.basename
+            in {
+                "license",
+                "license.txt",
+                "copying",
+                "copying.txt",
+                "notice",
+                "notice.txt",
+            }
         )
     )
     if metadata_license_counterpart:
         score += 2.6
-    elif (left_is_manifest and right_is_license) or (right_is_manifest and left_is_license):
+    elif (left_is_manifest and right_is_license) or (
+        right_is_manifest and left_is_license
+    ):
         score += 2.1
 
     ui_api_counterpart = (
-        (_is_ui_surface_path(left_path) and _is_api_surface_path(right_path))
-        or (_is_ui_surface_path(right_path) and _is_api_surface_path(left_path))
-    )
+        _is_ui_surface_path(left_path) and _is_api_surface_path(right_path)
+    ) or (_is_ui_surface_path(right_path) and _is_api_surface_path(left_path))
     if ui_api_counterpart:
-        score += min(1.8, 0.15 * float(shared_tokens) + 0.35 * float(shared_path_tokens))
+        score += min(
+            1.8, 0.15 * float(shared_tokens) + 0.35 * float(shared_path_tokens)
+        )
         score += min(1.4, 0.7 * float(shared_endpoint_paths))
 
     if not left_is_doc_like and not right_is_doc_like:
-        score += min(0.9, 0.08 * float(shared_tokens) + 0.12 * float(shared_path_tokens))
+        score += min(
+            0.9, 0.08 * float(shared_tokens) + 0.12 * float(shared_path_tokens)
+        )
     if shared_counterpart_terms and (
         (left_is_doc_like != right_is_doc_like)
         or (left_is_manifest and right_is_license)
@@ -1644,7 +2059,11 @@ def _chunk_relevance_score(
     code_focus: bool,
     novelty_score: float,
 ) -> float:
-    return float(_chunk_relevance_features(chunk, idx, code_focus, novelty_score)["relevance_score"])
+    return float(
+        _chunk_relevance_features(chunk, idx, code_focus, novelty_score)[
+            "relevance_score"
+        ]
+    )
 
 
 def _chunk_relevance_features(
@@ -1676,7 +2095,9 @@ def _chunk_relevance_features(
     behavioral_doc_signal = _behavioral_doc_signal_score(chunk)
     metadata_bonus = 0.65 if _is_high_signal_metadata_path(path) else 0.0
     code_bonus = 0.4 if "```" in chunk else 0.0
-    diff_bonus = 0.45 if "diff --git" in chunk or "@@" in chunk or "+++ b/" in chunk else 0.0
+    diff_bonus = (
+        0.45 if "diff --git" in chunk or "@@" in chunk or "+++ b/" in chunk else 0.0
+    )
     category_bonus = max(0.0, 1.2 - (0.4 * float(category)))
     path_bonus = max(0.0, 0.7 - (0.35 * float(path_rank)))
     doc_penalty = 0.0
@@ -1685,7 +2106,9 @@ def _chunk_relevance_features(
         if structured_signal > 0.0:
             doc_penalty = max(0.15, doc_penalty - min(0.65, structured_signal * 0.35))
         if behavioral_doc_signal > 0.0:
-            doc_penalty = max(0.05, doc_penalty - min(0.45, behavioral_doc_signal * 0.18))
+            doc_penalty = max(
+                0.05, doc_penalty - min(0.45, behavioral_doc_signal * 0.18)
+            )
     relevance += token_score
     relevance += structured_signal
     relevance += category_bonus
@@ -1713,7 +2136,9 @@ def _chunk_relevance_features(
     return features
 
 
-def _new_chunk_novelty_scores(prev_chunks: list[str], new_chunks: list[str]) -> dict[int, float]:
+def _new_chunk_novelty_scores(
+    prev_chunks: list[str], new_chunks: list[str]
+) -> dict[int, float]:
     if not new_chunks:
         return {}
     if not prev_chunks:
@@ -1722,7 +2147,10 @@ def _new_chunk_novelty_scores(prev_chunks: list[str], new_chunks: list[str]) -> 
     for idx, new_chunk in enumerate(new_chunks):
         if new_chunk in prev_chunks:
             continue
-        best_match = max((Levenshtein.ratio(new_chunk, prev_chunk) for prev_chunk in prev_chunks), default=0.0)
+        best_match = max(
+            (Levenshtein.ratio(new_chunk, prev_chunk) for prev_chunk in prev_chunks),
+            default=0.0,
+        )
         novelty_scores[idx] = max(0.0, 1.0 - best_match)
     return novelty_scores
 
@@ -1750,8 +2178,12 @@ def _source_trace_entries(
     for idx, chunk in enumerate(new_chunks):
         token_count = token_lens[idx] if idx < len(token_lens) else count_tokens(chunk)
         metadata_chunk = code_focus and _is_snapshot_metadata_chunk(chunk)
-        token_eligible = token_count >= feedback_min_tokens if feedback_min_tokens > 0 else True
-        fallback_eligible = token_count >= feedback_fallback_min if feedback_fallback_min > 0 else True
+        token_eligible = (
+            token_count >= feedback_min_tokens if feedback_min_tokens > 0 else True
+        )
+        fallback_eligible = (
+            token_count >= feedback_fallback_min if feedback_fallback_min > 0 else True
+        )
         entry = {
             "chunk_index": idx,
             "path": _extract_snapshot_file_path(chunk),
@@ -1761,10 +2193,18 @@ def _source_trace_entries(
             "significant_edit": idx in significant_set,
             "prioritized_rank": prioritized_rank.get(idx),
             "selected_rank": selected_rank.get(idx),
-            "selection_status": "selected" if idx in selected_set else "candidate" if idx in prioritized_rank else "filtered",
+            "selection_status": "selected"
+            if idx in selected_set
+            else "candidate"
+            if idx in prioritized_rank
+            else "filtered",
             "skip_reason": None,
         }
-        entry.update(_chunk_relevance_features(chunk, idx, code_focus, novelty_scores.get(idx, 1.0)))
+        entry.update(
+            _chunk_relevance_features(
+                chunk, idx, code_focus, novelty_scores.get(idx, 1.0)
+            )
+        )
         if idx in selected_set:
             pass
         elif metadata_chunk:
@@ -1781,7 +2221,9 @@ def _source_trace_entries(
 
     entries.sort(
         key=lambda item: (
-            {"selected": 0, "candidate": 1, "filtered": 2}.get(str(item.get("selection_status") or ""), 3),
+            {"selected": 0, "candidate": 1, "filtered": 2}.get(
+                str(item.get("selection_status") or ""), 3
+            ),
             int(item.get("selected_rank") or item.get("prioritized_rank") or 10**9),
             -float(item.get("relevance_score") or 0.0),
         )
@@ -1797,7 +2239,10 @@ def _chunk_redundancy_score(left: str, right: str, code_focus: bool) -> float:
     if not code_focus:
         return lexical
     path_score = min(
-        _path_overlap_score(_extract_snapshot_file_path(left), _extract_snapshot_file_path(right)) / 3.0,
+        _path_overlap_score(
+            _extract_snapshot_file_path(left), _extract_snapshot_file_path(right)
+        )
+        / 3.0,
         1.0,
     )
     return lexical + (0.35 * path_score)
@@ -1859,7 +2304,9 @@ def _allow_same_document_feedback(user: User | None) -> bool:
     return bool(getattr(user, "include_own_documents_in_feedback", False))
 
 
-def _clean_reference_document_ids(reference_doc_ids: list[str] | tuple[str, ...] | set[str] | None) -> list[str]:
+def _clean_reference_document_ids(
+    reference_doc_ids: list[str] | tuple[str, ...] | set[str] | None,
+) -> list[str]:
     if not reference_doc_ids:
         return []
     out: list[str] = []
@@ -1887,9 +2334,13 @@ def _reference_scope_allows_same_document(
     return document_id in set(cleaned_reference_doc_ids)
 
 
-def _same_file_self_reference_allowed(source_text: str, candidate_text: str, *, code_focus: bool) -> bool:
+def _same_file_self_reference_allowed(
+    source_text: str, candidate_text: str, *, code_focus: bool
+) -> bool:
     source_path = _extract_snapshot_file_path(source_text).lower().replace("\\", "/")
-    candidate_path = _extract_snapshot_file_path(candidate_text).lower().replace("\\", "/")
+    candidate_path = (
+        _extract_snapshot_file_path(candidate_text).lower().replace("\\", "/")
+    )
     if not source_path or not candidate_path or source_path != candidate_path:
         return True
     if _is_header_only_snapshot_chunk(candidate_text):
@@ -1938,7 +2389,9 @@ def _reference_candidate_decision(
         return False, "same_document_disabled"
     if source_content and candidate_content and source_content == candidate_content:
         return False, "duplicate_content"
-    if not _same_file_self_reference_allowed(source_content, candidate_content, code_focus=code_focus):
+    if not _same_file_self_reference_allowed(
+        source_content, candidate_content, code_focus=code_focus
+    ):
         return False, "same_file"
     return True, None
 
@@ -2005,7 +2458,9 @@ def _merge_reference_candidates(
     return merged
 
 
-def _interleave_reference_candidates(*candidate_sets: list[Chunk], limit: int) -> list[Chunk]:
+def _interleave_reference_candidates(
+    *candidate_sets: list[Chunk], limit: int
+) -> list[Chunk]:
     if limit <= 0:
         return []
     merged: list[Chunk] = []
@@ -2048,14 +2503,18 @@ def _reference_fts_candidates(
         key = _reference_chunk_key(candidate)
         path = _extract_snapshot_file_path(content)
         candidate_by_key[key] = candidate
-        indexed_rows.append((key, path, _reference_fts_signal_text(content, path), content))
+        indexed_rows.append(
+            (key, path, _reference_fts_signal_text(content, path), content)
+        )
     if not indexed_rows:
         return []
 
     queries: list[str] = []
     seen_queries: set[str] = set()
     for _, variant_text in query_variants or [("primary", target_text)]:
-        for query in _reference_fts_queries(variant_text or target_text, code_focus=code_focus):
+        for query in _reference_fts_queries(
+            variant_text or target_text, code_focus=code_focus
+        ):
             if not query or query in seen_queries:
                 continue
             seen_queries.add(query)
@@ -2065,7 +2524,9 @@ def _reference_fts_candidates(
 
     result_sets: list[list[Chunk]] = []
     per_query_limit = max(limit, 10)
-    effective_limit = _reference_effective_fts_candidate_limit(target_text, code_focus=code_focus, candidate_limit=limit)
+    effective_limit = _reference_effective_fts_candidate_limit(
+        target_text, code_focus=code_focus, candidate_limit=limit
+    )
     per_query_limit = max(per_query_limit, effective_limit)
     best_rank_by_key: dict[str, int] = {}
     try:
@@ -2106,7 +2567,9 @@ def _reference_fts_candidates(
     target_path = _extract_snapshot_file_path(target_text)
     target_is_doc_like = _is_doc_like_path(target_path)
     target_is_metadata = _is_high_signal_metadata_path(target_path)
-    combined = _interleave_reference_candidates(*result_sets, limit=max(effective_limit * 2, limit))
+    combined = _interleave_reference_candidates(
+        *result_sets, limit=max(effective_limit * 2, limit)
+    )
     scored: list[tuple[float, int, Chunk]] = []
     for idx, candidate in enumerate(combined):
         key = _reference_chunk_key(candidate)
@@ -2117,8 +2580,12 @@ def _reference_fts_candidates(
         counterpart_signal = _reference_counterpart_signal(target_text, content)
         anchor_overlap = _reference_anchor_overlap_score(target_text, content)
         anchor_conflict = _reference_anchor_conflict_score(target_text, content)
-        path_theme_score = _token_overlap_ratio(_identifier_tokens(target_text, limit=96), _path_token_set(candidate_path))
-        metadata_counterpart = target_is_metadata != candidate_is_metadata and (target_is_metadata or candidate_is_metadata)
+        path_theme_score = _token_overlap_ratio(
+            _identifier_tokens(target_text, limit=96), _path_token_set(candidate_path)
+        )
+        metadata_counterpart = target_is_metadata != candidate_is_metadata and (
+            target_is_metadata or candidate_is_metadata
+        )
         cross_surface = target_is_doc_like != candidate_is_doc_like
         score = _reference_rrf(best_rank_by_key.get(key), k=10) * 20.0
         score += counterpart_signal * 4.2
@@ -2166,13 +2633,19 @@ def _lexical_reference_candidates(
         candidate_tokens = _identifier_tokens(content, limit=96)
         candidate_path = _extract_snapshot_file_path(content)
         lexical_score = _token_overlap_ratio(target_tokens, candidate_tokens)
-        path_theme_score = _token_overlap_ratio(target_tokens, _path_token_set(candidate_path))
+        path_theme_score = _token_overlap_ratio(
+            target_tokens, _path_token_set(candidate_path)
+        )
         path_score = _path_overlap_score(target_path, candidate_path)
         artifact_score = min(_artifact_overlap_score(target_text, content), 4.0)
         anchor_overlap = _reference_anchor_overlap_score(target_text, content)
         anchor_conflict = _reference_anchor_conflict_score(target_text, content)
         code_bonus = 0.35 if "```" in content else 0.0
-        diff_bonus = 0.25 if "diff --git" in content or "@@" in content or "+++ b/" in content else 0.0
+        diff_bonus = (
+            0.25
+            if "diff --git" in content or "@@" in content or "+++ b/" in content
+            else 0.0
+        )
         doc_penalty = 0.0
         doc_bonus = 0.0
         metadata_bonus = 0.0
@@ -2182,7 +2655,9 @@ def _lexical_reference_candidates(
                 doc_bonus = 0.75
             elif not target_is_doc_like and candidate_is_doc_like:
                 doc_penalty = 0.75
-            if _is_high_signal_metadata_path(target_path) and _is_high_signal_metadata_path(candidate_path):
+            if _is_high_signal_metadata_path(
+                target_path
+            ) and _is_high_signal_metadata_path(candidate_path):
                 metadata_bonus = 0.85
             if anchor_overlap > 0.0 and target_is_doc_like != candidate_is_doc_like:
                 doc_bonus += 0.45
@@ -2235,9 +2710,16 @@ def _anchor_reference_candidates(
             continue
         artifact_score = min(_artifact_overlap_score(target_text, content), 4.0)
         path_score = _path_overlap_score(target_path, candidate_path)
-        score = (anchor_overlap * 3.5) + (anchor_conflict * 4.0) + artifact_score + (path_score * 0.8)
+        score = (
+            (anchor_overlap * 3.5)
+            + (anchor_conflict * 4.0)
+            + artifact_score
+            + (path_score * 0.8)
+        )
         if code_focus:
-            if _is_high_signal_metadata_path(target_path) and _is_high_signal_metadata_path(candidate_path):
+            if _is_high_signal_metadata_path(
+                target_path
+            ) and _is_high_signal_metadata_path(candidate_path):
                 score += 1.0
             if target_is_doc_like != candidate_is_doc_like:
                 score += 0.6
@@ -2280,15 +2762,22 @@ def _reference_counterpart_candidates(
         anchor_overlap = _reference_anchor_overlap_score(target_text, content)
         anchor_conflict = _reference_anchor_conflict_score(target_text, content)
         artifact_score = min(_artifact_overlap_score(target_text, content), 4.0)
-        path_theme_score = _token_overlap_ratio(_identifier_tokens(target_text, limit=96), _path_token_set(candidate_path))
-        cross_surface = target_is_doc_like != candidate_is_doc_like
-        metadata_counterpart = target_is_metadata != candidate_is_metadata and (target_is_metadata or candidate_is_metadata)
-        ui_api_counterpart = (
-            (_is_ui_surface_path(target_path) and _is_api_surface_path(candidate_path))
-            or (_is_ui_surface_path(candidate_path) and _is_api_surface_path(target_path))
+        path_theme_score = _token_overlap_ratio(
+            _identifier_tokens(target_text, limit=96), _path_token_set(candidate_path)
         )
+        cross_surface = target_is_doc_like != candidate_is_doc_like
+        metadata_counterpart = target_is_metadata != candidate_is_metadata and (
+            target_is_metadata or candidate_is_metadata
+        )
+        ui_api_counterpart = (
+            _is_ui_surface_path(target_path) and _is_api_surface_path(candidate_path)
+        ) or (_is_ui_surface_path(candidate_path) and _is_api_surface_path(target_path))
 
-        score = (counterpart_signal * 4.0) + (anchor_conflict * 1.1) + (anchor_overlap * 0.7)
+        score = (
+            (counterpart_signal * 4.0)
+            + (anchor_conflict * 1.1)
+            + (anchor_overlap * 0.7)
+        )
         score += min(1.2, path_theme_score * 2.0)
         score += min(1.4, artifact_score * 0.35)
         if cross_surface:
@@ -2323,7 +2812,9 @@ def _rerank_reference_chunks(
     counterpart_candidates: list[Chunk] | None = None,
     debug_stats: dict[str, Any] | None = None,
 ) -> list[Chunk]:
-    candidate_limit, final_limit, max_per_source = _reference_selection_config(code_focus)
+    candidate_limit, final_limit, max_per_source = _reference_selection_config(
+        code_focus
+    )
     if not candidates:
         return []
 
@@ -2355,12 +2846,20 @@ def _rerank_reference_chunks(
         _reference_chunk_key(chunk): idx + 1
         for idx, chunk in enumerate(counterpart_candidates or [])
     }
-    reranker_enabled, reranker_model_version, reranker_model_path = _reference_reranker_metadata()
+    reranker_enabled, reranker_model_version, reranker_model_path = (
+        _reference_reranker_metadata()
+    )
     reranker_enabled = code_focus and reranker_enabled
     hybrid_enabled = code_focus and _reference_hybrid_enabled()
     adjudicator_enabled = code_focus and _reference_adjudicator_enabled()
-    reranker_rescue_enabled = reranker_enabled and adjudicator_enabled and _reference_reranker_rescue_enabled()
-    reranker_score_weight = _reference_reranker_score_weight() if reranker_enabled else 0.0
+    reranker_rescue_enabled = (
+        reranker_enabled
+        and adjudicator_enabled
+        and _reference_reranker_rescue_enabled()
+    )
+    reranker_score_weight = (
+        _reference_reranker_score_weight() if reranker_enabled else 0.0
+    )
     used_indices: set[int] = set()
     source_counts: dict[str, int] = {}
     path_counts: dict[str, int] = {}
@@ -2401,13 +2900,19 @@ def _rerank_reference_chunks(
         )
         preselection_score = float(row.get("heuristic_score") or 0.0)
         if reranker_enabled:
-            weighted_reranker_score = reranker_score_weight * float(row.get("reranker_score") or 0.0)
+            weighted_reranker_score = reranker_score_weight * float(
+                row.get("reranker_score") or 0.0
+            )
             row["weighted_reranker_score"] = round(weighted_reranker_score, 6)
             preselection_score = weighted_reranker_score
             if hybrid_enabled:
-                preselection_score += _reference_hybrid_reranker_blend() * float(row.get("hybrid_score") or 0.0)
+                preselection_score += _reference_hybrid_reranker_blend() * float(
+                    row.get("hybrid_score") or 0.0
+                )
         elif hybrid_enabled:
-            preselection_score += _reference_hybrid_heuristic_blend() * float(row.get("hybrid_score") or 0.0)
+            preselection_score += _reference_hybrid_heuristic_blend() * float(
+                row.get("hybrid_score") or 0.0
+            )
         row["preselection_score"] = round(preselection_score, 6)
         row_cache[idx] = row
 
@@ -2425,10 +2930,14 @@ def _rerank_reference_chunks(
         top_k = _reference_adjudicator_top_k()
         ranked_for_adjudication = ranked_preselection[:top_k]
         if ranked_for_adjudication:
-            initial_adjudication_cutoff = float(ranked_for_adjudication[-1][1].get("preselection_score") or 0.0)
+            initial_adjudication_cutoff = float(
+                ranked_for_adjudication[-1][1].get("preselection_score") or 0.0
+            )
         ranked_indices = {idx for idx, _ in ranked_for_adjudication}
         rescued_indices: set[int] = set()
-        adjudication_reason_by_idx: dict[int, str] = {idx: "top_k" for idx in ranked_indices}
+        adjudication_reason_by_idx: dict[int, str] = {
+            idx: "top_k" for idx in ranked_indices
+        }
         if reranker_rescue_enabled:
             rescue_count = _reference_reranker_rescue_count()
             rescue_min_score = _reference_reranker_rescue_min_score()
@@ -2441,9 +2950,14 @@ def _rerank_reference_chunks(
                 counterpart_signal = float(row.get("counterpart_signal") or 0.0)
                 metadata_counterpart = bool(row.get("metadata_counterpart"))
                 ui_api_counterpart = bool(row.get("ui_api_counterpart"))
-                candidate_is_doc_like = _is_doc_like_path(str(row.get("candidate_path") or ""))
+                candidate_is_doc_like = _is_doc_like_path(
+                    str(row.get("candidate_path") or "")
+                )
                 cross_surface = target_is_doc_like != candidate_is_doc_like
-                if reranker_score < rescue_min_score and counterpart_signal < rescue_counterpart_min:
+                if (
+                    reranker_score < rescue_min_score
+                    and counterpart_signal < rescue_counterpart_min
+                ):
                     continue
                 rescue_score = reranker_score + (0.45 * counterpart_signal)
                 if cross_surface:
@@ -2460,8 +2974,12 @@ def _rerank_reference_chunks(
         positive_count = 0
         for idx, row in row_cache.items():
             row["adjudicated"] = idx in ranked_indices or idx in rescued_indices
-            row["adjudication_reason"] = adjudication_reason_by_idx.get(idx, "below_preselection_cutoff")
-        for adjudication_rank, (idx, row) in enumerate(ranked_for_adjudication, start=1):
+            row["adjudication_reason"] = adjudication_reason_by_idx.get(
+                idx, "below_preselection_cutoff"
+            )
+        for adjudication_rank, (idx, row) in enumerate(
+            ranked_for_adjudication, start=1
+        ):
             row["adjudication_rank"] = adjudication_rank
         for idx, row in ranked_for_adjudication:
             candidate = trimmed[idx]
@@ -2473,7 +2991,8 @@ def _rerank_reference_chunks(
             )
             row.update(payload)
             preselection_score = float(row.get("preselection_score") or 0.0) + (
-                _reference_adjudicator_preselection_boost() * float(payload["adjudicator_score"])
+                _reference_adjudicator_preselection_boost()
+                * float(payload["adjudicator_score"])
             )
             row["preselection_score"] = round(preselection_score, 6)
             if float(payload["adjudicator_score"]) > 0.0:
@@ -2509,9 +3028,16 @@ def _rerank_reference_chunks(
         adjudicator_score = float(row.get("adjudicator_score") or 0.0)
         adjudicator_kind = str(row.get("adjudicator_kind") or "")
         candidate_is_doc_like = _is_doc_like_path(candidate_path)
-        if adjudicator_kind in {"docs-vs-impl mismatch", "route/path mismatch", "value mismatch", "rename", "presence/absence"}:
+        if adjudicator_kind in {
+            "docs-vs-impl mismatch",
+            "route/path mismatch",
+            "value mismatch",
+            "rename",
+            "presence/absence",
+        }:
             round1_score = (
-                _reference_adjudicator_mismatch_preselection_weight() * preselection_score
+                _reference_adjudicator_mismatch_preselection_weight()
+                * preselection_score
                 + _reference_adjudicator_mismatch_score_weight() * adjudicator_score
             )
         elif target_is_doc_like and candidate_is_doc_like:
@@ -2520,7 +3046,9 @@ def _rerank_reference_chunks(
                 + _reference_adjudicator_docdoc_score_weight() * adjudicator_score
             )
         else:
-            round1_score = preselection_score + (_reference_adjudicator_default_score_weight() * adjudicator_score)
+            round1_score = preselection_score + (
+                _reference_adjudicator_default_score_weight() * adjudicator_score
+            )
         row["selector_round1_score"] = round(round1_score, 6)
         round1_scores.append((round1_score, idx))
     round1_scores.sort(key=lambda item: item[0], reverse=True)
@@ -2582,12 +3110,21 @@ def _rerank_reference_chunks(
                 continue
             candidate_path = str(feature_row.get("candidate_path") or "")
             path_key = _reference_path_key(source_key, candidate_path)
-            if max_per_path > 0 and path_key and path_counts.get(path_key, 0) >= max_per_path:
+            if (
+                max_per_path > 0
+                and path_key
+                and path_counts.get(path_key, 0) >= max_per_path
+            ):
                 continue
             diversity_penalty = 0.0
             if selected_tokens:
-                diversity_penalty = max(_token_overlap_ratio(candidate_tokens, prev) for prev in selected_tokens)
-            source_penalty = _reference_source_penalty_weight() * float(source_counts.get(source_key, 0))
+                diversity_penalty = max(
+                    _token_overlap_ratio(candidate_tokens, prev)
+                    for prev in selected_tokens
+                )
+            source_penalty = _reference_source_penalty_weight() * float(
+                source_counts.get(source_key, 0)
+            )
             preselection_score = float(feature_row.get("preselection_score") or 0.0)
             adjudicator_score = float(feature_row.get("adjudicator_score") or 0.0)
             adjudicator_kind = str(feature_row.get("adjudicator_kind") or "")
@@ -2597,20 +3134,38 @@ def _rerank_reference_chunks(
                 if reranker_enabled
                 else _reference_heuristic_diversity_penalty()
             )
-            if adjudicator_kind in {"docs-vs-impl mismatch", "route/path mismatch", "value mismatch", "rename", "presence/absence"}:
+            if adjudicator_kind in {
+                "docs-vs-impl mismatch",
+                "route/path mismatch",
+                "value mismatch",
+                "rename",
+                "presence/absence",
+            }:
                 score = (
-                    _reference_adjudicator_mismatch_preselection_weight() * preselection_score
+                    _reference_adjudicator_mismatch_preselection_weight()
+                    * preselection_score
                     + _reference_adjudicator_mismatch_score_weight() * adjudicator_score
                 )
             elif target_is_doc_like and candidate_is_doc_like:
                 score = (
-                    _reference_adjudicator_docdoc_preselection_weight() * preselection_score
+                    _reference_adjudicator_docdoc_preselection_weight()
+                    * preselection_score
                     + _reference_adjudicator_docdoc_score_weight() * adjudicator_score
                 )
             else:
-                score = preselection_score + (_reference_adjudicator_default_score_weight() * adjudicator_score)
-            path_penalty = path_diversity_penalty_weight * float(path_counts.get(path_key, 0)) if path_key else 0.0
-            score -= (diversity_penalty * diversity_multiplier) + source_penalty + path_penalty
+                score = preselection_score + (
+                    _reference_adjudicator_default_score_weight() * adjudicator_score
+                )
+            path_penalty = (
+                path_diversity_penalty_weight * float(path_counts.get(path_key, 0))
+                if path_key
+                else 0.0
+            )
+            score -= (
+                (diversity_penalty * diversity_multiplier)
+                + source_penalty
+                + path_penalty
+            )
             if score > best_score:
                 best_score = score
                 best_index = idx
@@ -2634,7 +3189,9 @@ def _rerank_reference_chunks(
     return trimmed[:final_limit]
 
 
-def _reference_query_text(text: str, focus_text: str, change_context: str, *, code_focus: bool) -> str:
+def _reference_query_text(
+    text: str, focus_text: str, change_context: str, *, code_focus: bool
+) -> str:
     if not code_focus or _is_snapshot_metadata_chunk(text):
         return text
     focus = (focus_text or "").strip()
@@ -2651,7 +3208,9 @@ def _reference_query_text(text: str, focus_text: str, change_context: str, *, co
 
     # Only switch to the compact changed-window query when it meaningfully narrows
     # the search surface; otherwise reuse the full chunk embedding.
-    if (focus_tokens * 4) > (target_tokens * 3) and (len(query) * 4) > (len(target) * 3):
+    if (focus_tokens * 4) > (target_tokens * 3) and (len(query) * 4) > (
+        len(target) * 3
+    ):
         return text
     return query
 
@@ -2752,8 +3311,12 @@ def _reference_counterpart_query_text(text: str) -> str:
     return counterpart_query[:1200]
 
 
-def _reference_query_variants(text: str, focus_text: str, change_context: str, *, code_focus: bool) -> list[tuple[str, str]]:
-    primary = _reference_query_text(text, focus_text, change_context, code_focus=code_focus)
+def _reference_query_variants(
+    text: str, focus_text: str, change_context: str, *, code_focus: bool
+) -> list[tuple[str, str]]:
+    primary = _reference_query_text(
+        text, focus_text, change_context, code_focus=code_focus
+    )
     variants: list[tuple[str, str]] = []
     seen: set[str] = set()
 
@@ -2853,7 +3416,9 @@ def _reference_heuristic_score(
     candidate_text: str,
 ) -> float:
     candidate_path = str(feature_row.get("candidate_path") or "")
-    base_score = float(total_candidates - candidate_index) / float(max(1, total_candidates))
+    base_score = float(total_candidates - candidate_index) / float(
+        max(1, total_candidates)
+    )
     lexical_score = float(feature_row.get("lexical_score") or 0.0)
     path_theme_score = float(feature_row.get("path_theme_score") or 0.0)
     path_score = float(feature_row.get("path_score") or 0.0)
@@ -2871,7 +3436,9 @@ def _reference_heuristic_score(
         anchor_overlap > 0.0 or anchor_conflict > 0.0 or counterpart_signal >= 0.6
     ):
         doc_bonus = _reference_heuristic_doccode_bonus()
-    if _is_high_signal_metadata_path(target_path) and _is_high_signal_metadata_path(candidate_path):
+    if _is_high_signal_metadata_path(target_path) and _is_high_signal_metadata_path(
+        candidate_path
+    ):
         metadata_bonus = _reference_heuristic_metadata_bonus()
     return (
         (base_score * _reference_heuristic_base_rank_weight())
@@ -2895,7 +3462,9 @@ def _reference_adjudication_payload(
     candidate_path: str,
 ) -> dict[str, object]:
     label = candidate_path or "a related reference"
-    match = best_reference_match(target_text, [ReferenceText(label=label, text=candidate_text)])
+    match = best_reference_match(
+        target_text, [ReferenceText(label=label, text=candidate_text)]
+    )
     relation = getattr(match, "relation", None)
     kind = getattr(relation, "kind", None)
     confidence = int(getattr(relation, "confidence", 0) or 0)
@@ -2903,38 +3472,53 @@ def _reference_adjudication_payload(
     target_path = _extract_snapshot_file_path(target_text)
     target_profile = extract_artifacts(target_text)
     candidate_profile = extract_artifacts(candidate_text)
-    shared_structured = len((target_profile.tokens | target_profile.quoted_norm) & (candidate_profile.tokens | candidate_profile.quoted_norm))
+    shared_structured = len(
+        (target_profile.tokens | target_profile.quoted_norm)
+        & (candidate_profile.tokens | candidate_profile.quoted_norm)
+    )
     target_is_doc_like = _is_doc_like_path(target_path)
     candidate_is_doc_like = _is_doc_like_path(candidate_path)
     counterpart_signal = _reference_counterpart_signal(target_text, candidate_text)
     metadata_counterpart = (
-        (
-            _is_high_signal_metadata_path(target_path)
-            and (
-                "license" in _reference_anchor_profile(target_text).key_names
-                or bool(_reference_anchor_profile(target_text).license_terms)
-            )
-            and (
-                bool(_reference_anchor_profile(candidate_text).license_terms)
-                or os.path.basename(candidate_path).lower() in {"license", "license.txt", "copying", "copying.txt", "notice", "notice.txt"}
-            )
+        _is_high_signal_metadata_path(target_path)
+        and (
+            "license" in _reference_anchor_profile(target_text).key_names
+            or bool(_reference_anchor_profile(target_text).license_terms)
         )
-        or (
-            _is_high_signal_metadata_path(candidate_path)
-            and (
-                "license" in _reference_anchor_profile(candidate_text).key_names
-                or bool(_reference_anchor_profile(candidate_text).license_terms)
-            )
-            and (
-                bool(_reference_anchor_profile(target_text).license_terms)
-                or os.path.basename(target_path).lower() in {"license", "license.txt", "copying", "copying.txt", "notice", "notice.txt"}
-            )
+        and (
+            bool(_reference_anchor_profile(candidate_text).license_terms)
+            or os.path.basename(candidate_path).lower()
+            in {
+                "license",
+                "license.txt",
+                "copying",
+                "copying.txt",
+                "notice",
+                "notice.txt",
+            }
+        )
+    ) or (
+        _is_high_signal_metadata_path(candidate_path)
+        and (
+            "license" in _reference_anchor_profile(candidate_text).key_names
+            or bool(_reference_anchor_profile(candidate_text).license_terms)
+        )
+        and (
+            bool(_reference_anchor_profile(target_text).license_terms)
+            or os.path.basename(target_path).lower()
+            in {
+                "license",
+                "license.txt",
+                "copying",
+                "copying.txt",
+                "notice",
+                "notice.txt",
+            }
         )
     )
     ui_api_counterpart = (
-        (_is_ui_surface_path(target_path) and _is_api_surface_path(candidate_path))
-        or (_is_ui_surface_path(candidate_path) and _is_api_surface_path(target_path))
-    )
+        _is_ui_surface_path(target_path) and _is_api_surface_path(candidate_path)
+    ) or (_is_ui_surface_path(candidate_path) and _is_api_surface_path(target_path))
     candidate_is_license_metadata = _is_license_metadata_path(candidate_path)
     target_is_license_context = _is_license_metadata_path(target_path) or (
         _is_high_signal_metadata_path(target_path)
@@ -2945,23 +3529,48 @@ def _reference_adjudication_payload(
     )
     looks_implementation = (not candidate_is_doc_like) and (
         "```" in candidate_text
-        or re.search(r"\b(?:def|class|return|await|fetch|router|mapped_column|function)\b", candidate_text)
+        or re.search(
+            r"\b(?:def|class|return|await|fetch|router|mapped_column|function)\b",
+            candidate_text,
+        )
         or bool(candidate_profile.assignments)
     )
-    if target_is_doc_like and looks_implementation and kind in {None, "generic divergence", "rename", "presence/absence"} and shared_structured >= 2:
+    if (
+        target_is_doc_like
+        and looks_implementation
+        and kind in {None, "generic divergence", "rename", "presence/absence"}
+        and shared_structured >= 2
+    ):
         kind = "docs-vs-impl mismatch"
         confidence = max(confidence, 4)
-    elif metadata_counterpart and kind in {None, "generic divergence", "rename", "presence/absence"} and counterpart_signal >= 1.4:
+    elif (
+        metadata_counterpart
+        and kind in {None, "generic divergence", "rename", "presence/absence"}
+        and counterpart_signal >= 1.4
+    ):
         kind = "value mismatch"
         confidence = max(confidence, 4)
-    elif ui_api_counterpart and kind in {None, "generic divergence", "rename", "presence/absence"} and (shared_structured >= 2 or counterpart_signal >= 1.2):
+    elif (
+        ui_api_counterpart
+        and kind in {None, "generic divergence", "rename", "presence/absence"}
+        and (shared_structured >= 2 or counterpart_signal >= 1.2)
+    ):
         kind = "route/path mismatch"
         confidence = max(confidence, 3)
-    if kind == "docs-vs-impl mismatch" and candidate_is_license_metadata and not metadata_counterpart and not target_is_license_context:
+    if (
+        kind == "docs-vs-impl mismatch"
+        and candidate_is_license_metadata
+        and not metadata_counterpart
+        and not target_is_license_context
+    ):
         kind = "generic divergence"
         confidence = min(confidence, 1)
     if kind == "generic divergence":
-        adjudicator_score = 0.0 if target_is_doc_like and candidate_is_doc_like else min(0.45, 0.02 * float(match_score))
+        adjudicator_score = (
+            0.0
+            if target_is_doc_like and candidate_is_doc_like
+            else min(0.45, 0.02 * float(match_score))
+        )
     else:
         kind_bonus = {
             "docs-vs-impl mismatch": 2.2,
@@ -2970,7 +3579,11 @@ def _reference_adjudication_payload(
             "rename": 0.95,
             "presence/absence": 0.8,
         }.get(kind, 0.0)
-        adjudicator_score = kind_bonus + min(1.35, 0.14 * float(confidence)) + min(0.9, 0.04 * float(match_score))
+        adjudicator_score = (
+            kind_bonus
+            + min(1.35, 0.14 * float(confidence))
+            + min(0.9, 0.04 * float(match_score))
+        )
     return {
         "adjudicator_score": round(adjudicator_score, 6),
         "adjudicator_kind": kind,
@@ -2999,7 +3612,9 @@ def _reference_candidate_feature_row(
     target_path = source_path or _extract_snapshot_file_path(query_text)
     source_content = getattr(source_chunk, "content", "") or query_text
     lexical_score = _token_overlap_ratio(query_tokens, _identifier_tokens(content))
-    path_theme_score = _token_overlap_ratio(query_tokens, _path_token_set(candidate_path))
+    path_theme_score = _token_overlap_ratio(
+        query_tokens, _path_token_set(candidate_path)
+    )
     path_score = _path_overlap_score(target_path, candidate_path)
     artifact_score = min(_artifact_overlap_score(query_text, content), 4.0)
     anchor_overlap = _reference_anchor_overlap_score(query_text, content)
@@ -3011,19 +3626,34 @@ def _reference_candidate_feature_row(
         _is_high_signal_metadata_path(target_path)
         and (
             bool(_reference_anchor_profile(content).license_terms)
-            or os.path.basename(candidate_path).lower() in {"license", "license.txt", "copying", "copying.txt", "notice", "notice.txt"}
+            or os.path.basename(candidate_path).lower()
+            in {
+                "license",
+                "license.txt",
+                "copying",
+                "copying.txt",
+                "notice",
+                "notice.txt",
+            }
         )
     ) or (
         _is_high_signal_metadata_path(candidate_path)
         and (
             bool(_reference_anchor_profile(source_content).license_terms)
-            or os.path.basename(target_path).lower() in {"license", "license.txt", "copying", "copying.txt", "notice", "notice.txt"}
+            or os.path.basename(target_path).lower()
+            in {
+                "license",
+                "license.txt",
+                "copying",
+                "copying.txt",
+                "notice",
+                "notice.txt",
+            }
         )
     )
     ui_api_counterpart = (
-        (_is_ui_surface_path(target_path) and _is_api_surface_path(candidate_path))
-        or (_is_ui_surface_path(candidate_path) and _is_api_surface_path(target_path))
-    )
+        _is_ui_surface_path(target_path) and _is_api_surface_path(candidate_path)
+    ) or (_is_ui_surface_path(candidate_path) and _is_api_surface_path(target_path))
     combined_signal = (
         (lexical_score * 4.0)
         + (path_theme_score * 2.0)
@@ -3084,12 +3714,29 @@ def _reference_trace_entries(
 
     source_document_id = getattr(doc, "document_id", None)
     source_path = _extract_snapshot_file_path(query_text)
-    vector_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(raw_vector_candidates)}
-    fts_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(fts_candidates)}
-    lexical_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(lexical_candidates)}
-    anchor_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(anchor_candidates)}
-    counterpart_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(counterpart_candidates)}
-    selected_rank = {_reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(selected_references)}
+    vector_rank = {
+        _reference_chunk_key(chunk): idx + 1
+        for idx, chunk in enumerate(raw_vector_candidates)
+    }
+    fts_rank = {
+        _reference_chunk_key(chunk): idx + 1 for idx, chunk in enumerate(fts_candidates)
+    }
+    lexical_rank = {
+        _reference_chunk_key(chunk): idx + 1
+        for idx, chunk in enumerate(lexical_candidates)
+    }
+    anchor_rank = {
+        _reference_chunk_key(chunk): idx + 1
+        for idx, chunk in enumerate(anchor_candidates)
+    }
+    counterpart_rank = {
+        _reference_chunk_key(chunk): idx + 1
+        for idx, chunk in enumerate(counterpart_candidates)
+    }
+    selected_rank = {
+        _reference_chunk_key(chunk): idx + 1
+        for idx, chunk in enumerate(selected_references)
+    }
 
     def _sort_key(entry: dict[str, object]) -> tuple[int, int, int, float]:
         status = str(entry.get("selection_status") or "")
@@ -3184,7 +3831,69 @@ def process_document(
     reference_doc_ids: list[str] | None = None,
     focus_manifest: FocusManifest = None,
     retrieval_query: str | None = None,
-) -> Mapping[str, int]:
+    retrieval_engine: str = DEFAULT_RETRIEVAL_ENGINE,
+    processing_run_key: str | None = None,
+    group_id: str | None = None,
+) -> Mapping[str, object]:
+    selected_retrieval_engine = validate_retrieval_engine_name(retrieval_engine)
+    validated_group_id: str | None = None
+    if selected_retrieval_engine == BASELINE_RETRIEVAL_ENGINE:
+        validated_processing_run_key = validate_processing_run_key(processing_run_key)
+        try:
+            validated_group_id = validate_baseline_group_id(group_id)
+        except ProcessingRunIdentityError:
+            return {
+                "new": False,
+                "baseline_processing": baseline_document_processing_outcome(
+                    [],
+                    group_id=None,
+                    parent_run_trace_id=processing_run_trace_id(
+                        validated_processing_run_key,
+                        None,
+                    ),
+                    error_code=(
+                        "explicit_group_id_absent"
+                        if group_id is None
+                        else "explicit_group_id_invalid"
+                    ),
+                    query_provenance=retrieval_query_provenance(
+                        retrieval_query,
+                        (
+                            RetrievalQueryOrigin.EXPLICIT
+                            if retrieval_query is not None
+                            else RetrievalQueryOrigin.ABSENT
+                        ),
+                    ),
+                ),
+            }
+        authorization_error = _authorize_baseline_document_scope(
+            session,
+            source_document_id=str(doc.document_id),
+            group_id=validated_group_id,
+            caller_user_id=str(user.user_id),
+        )
+        if authorization_error is not None:
+            return {
+                "new": False,
+                "baseline_processing": baseline_document_processing_outcome(
+                    [],
+                    group_id=validated_group_id,
+                    parent_run_trace_id=processing_run_trace_id(
+                        validated_processing_run_key,
+                        validated_group_id,
+                    ),
+                    error_code=authorization_error,
+                    query_provenance=retrieval_query_provenance(
+                        retrieval_query,
+                        (
+                            RetrievalQueryOrigin.EXPLICIT
+                            if retrieval_query is not None
+                            else RetrievalQueryOrigin.ABSENT
+                        ),
+                    ),
+                ),
+            }
+    baseline_outcomes: list[BaselineProcessingOutcome] = []
     new = False
     doc.content = sanitize_text_for_database(doc.content)
 
@@ -3200,12 +3909,18 @@ def process_document(
         feedback_limit = None
     time_cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
 
-    recent_feedback_count = session.query(Feedback).filter(
-        Feedback.source_chunk_id.in_(
-            session.query(Chunk.chunk_id).filter(Chunk.document_id == doc.document_id)
-        ),
-        Feedback.timestamp >= time_cutoff,
-    ).count()
+    recent_feedback_count = (
+        session.query(Feedback)
+        .filter(
+            Feedback.source_chunk_id.in_(
+                session.query(Chunk.chunk_id).filter(
+                    Chunk.document_id == doc.document_id
+                )
+            ),
+            Feedback.timestamp >= time_cutoff,
+        )
+        .count()
+    )
 
     content = doc.content
     doc.topic_tags = extract_topic_tags(content)
@@ -3243,7 +3958,9 @@ def process_document(
         )
         if code_focus:
             prioritized_chunk_indices = [
-                i for i in prioritized_chunk_indices if not _is_snapshot_metadata_chunk(new_chunks[i])
+                i
+                for i in prioritized_chunk_indices
+                if not _is_snapshot_metadata_chunk(new_chunks[i])
             ]
 
     feedback_min_tokens = int(os.getenv("COMPAIR_FEEDBACK_MIN_TOKENS", "120"))
@@ -3252,10 +3969,20 @@ def process_document(
     eligible_indices = [i for i, t in enumerate(token_lens) if t >= feedback_min_tokens]
     fallback_indices = list(range(len(token_lens)))
     if code_focus:
-        eligible_indices = [i for i in eligible_indices if not _is_snapshot_metadata_chunk(new_chunks[i])]
-        fallback_indices = [i for i in fallback_indices if not _is_snapshot_metadata_chunk(new_chunks[i])]
+        eligible_indices = [
+            i
+            for i in eligible_indices
+            if not _is_snapshot_metadata_chunk(new_chunks[i])
+        ]
+        fallback_indices = [
+            i
+            for i in fallback_indices
+            if not _is_snapshot_metadata_chunk(new_chunks[i])
+        ]
     if generate_feedback and feedback_min_tokens > 0:
-        prioritized_chunk_indices = [i for i in prioritized_chunk_indices if i in eligible_indices]
+        prioritized_chunk_indices = [
+            i for i in prioritized_chunk_indices if i in eligible_indices
+        ]
         if not prioritized_chunk_indices and eligible_indices:
             fallback_idx = max(eligible_indices, key=lambda idx: token_lens[idx])
             prioritized_chunk_indices = [fallback_idx]
@@ -3267,16 +3994,24 @@ def process_document(
     if feedback_limit is None:
         indices_to_generate_feedback = prioritized_chunk_indices
     else:
-        num_chunks_can_generate_feedback = max((feedback_limit - recent_feedback_count), 0)
-        indices_to_generate_feedback = prioritized_chunk_indices[:num_chunks_can_generate_feedback]
+        num_chunks_can_generate_feedback = max(
+            (feedback_limit - recent_feedback_count), 0
+        )
+        indices_to_generate_feedback = prioritized_chunk_indices[
+            :num_chunks_can_generate_feedback
+        ]
 
     feedback_focus_by_new_index: dict[int, str] = {}
     feedback_change_context_by_new_index: dict[int, str] = {}
     for idx in indices_to_generate_feedback:
-        focus_text = _focus_text_for_chunk(new_chunks[idx], prev_chunks, code_focus=code_focus)
+        focus_text = _focus_text_for_chunk(
+            new_chunks[idx], prev_chunks, code_focus=code_focus
+        )
         if focus_text:
             feedback_focus_by_new_index[idx] = focus_text
-        change_context = _change_context_for_chunk(new_chunks[idx], prev_chunks, code_focus=code_focus)
+        change_context = _change_context_for_chunk(
+            new_chunks[idx], prev_chunks, code_focus=code_focus
+        )
         if change_context:
             feedback_change_context_by_new_index[idx] = change_context
     feedback_query_embedding_by_new_index: dict[int, list[float]] = {}
@@ -3290,13 +4025,18 @@ def process_document(
         )
         if query_text.strip() and query_text != new_chunks[idx]:
             query_embedding_requests.append((idx, query_text))
-    if query_embedding_requests:
+    if (
+        selected_retrieval_engine == DEFAULT_RETRIEVAL_ENGINE
+        and query_embedding_requests
+    ):
         query_embeddings = create_embeddings(
             embedder,
             [query_text for _, query_text in query_embedding_requests],
             user=user,
         )
-        for (idx, _), query_embedding in zip(query_embedding_requests, query_embeddings):
+        for (idx, _), query_embedding in zip(
+            query_embedding_requests, query_embeddings
+        ):
             feedback_query_embedding_by_new_index[idx] = query_embedding
 
     existing_indices_to_generate_feedback: list[int] = []
@@ -3320,7 +4060,14 @@ def process_document(
         if feedback_limit is None:
             existing_indices_to_generate_feedback = existing_indices
         else:
-            remaining_slots = max((feedback_limit - recent_feedback_count - len(indices_to_generate_feedback)), 0)
+            remaining_slots = max(
+                (
+                    feedback_limit
+                    - recent_feedback_count
+                    - len(indices_to_generate_feedback)
+                ),
+                0,
+            )
             existing_indices_to_generate_feedback = existing_indices[:remaining_slots]
     elif generate_feedback and code_focus and not indices_to_generate_feedback:
         existing_indices = _existing_feedback_candidate_indices(
@@ -3408,10 +4155,16 @@ def process_document(
                 meaningful_new_chunks=meaningful_new_chunk_count,
             )
 
-    new_chunk_embeddings = create_embeddings(embedder, new_chunks, user=user) if new_chunks else []
+    new_chunk_embeddings: list[list[float] | None]
+    if selected_retrieval_engine == DEFAULT_RETRIEVAL_ENGINE:
+        new_chunk_embeddings = (
+            create_embeddings(embedder, new_chunks, user=user) if new_chunks else []
+        )
+    else:
+        new_chunk_embeddings = [None] * len(new_chunks)
     for i, chunk in enumerate(new_chunks):
         should_generate_feedback = i in indices_to_generate_feedback
-        process_text(
+        processing_outcome = process_text(
             session=session,
             embedder=embedder,
             reviewer=reviewer,
@@ -3424,16 +4177,38 @@ def process_document(
             change_context=feedback_change_context_by_new_index.get(i, ""),
             reference_doc_ids=reference_doc_ids,
             retrieval_query=retrieval_query,
+            retrieval_engine=selected_retrieval_engine,
+            processing_run_key=processing_run_key,
+            **(
+                {
+                    "group_id": validated_group_id,
+                    "caller_user_id": str(user.user_id),
+                }
+                if selected_retrieval_engine == BASELINE_RETRIEVAL_ENGINE
+                else {}
+            ),
         )
+        if processing_outcome is not None:
+            baseline_outcomes.append(processing_outcome)
 
     for idx in existing_indices_to_generate_feedback:
-        focus_text = _focus_text_for_chunk(chunks[idx], prev_chunks, code_focus=code_focus)
-        change_context = _change_context_for_chunk(chunks[idx], prev_chunks, code_focus=code_focus)
+        focus_text = _focus_text_for_chunk(
+            chunks[idx], prev_chunks, code_focus=code_focus
+        )
+        change_context = _change_context_for_chunk(
+            chunks[idx], prev_chunks, code_focus=code_focus
+        )
         query_embedding = None
-        query_text = _reference_query_text(chunks[idx], focus_text, change_context, code_focus=code_focus)
-        if query_text.strip() and query_text != chunks[idx]:
+        query_text = _reference_query_text(
+            chunks[idx], focus_text, change_context, code_focus=code_focus
+        )
+        if (
+            selected_retrieval_engine == DEFAULT_RETRIEVAL_ENGINE
+            and query_text.strip()
+            and query_text != chunks[idx]
+        ):
             query_embedding = create_embedding(embedder, query_text, user=user)
-        process_text(
+        processing_outcome = process_text(
             session=session,
             embedder=embedder,
             reviewer=reviewer,
@@ -3445,17 +4220,35 @@ def process_document(
             change_context=change_context,
             reference_doc_ids=reference_doc_ids,
             retrieval_query=retrieval_query,
+            retrieval_engine=selected_retrieval_engine,
+            processing_run_key=processing_run_key,
+            **(
+                {
+                    "group_id": validated_group_id,
+                    "caller_user_id": str(user.user_id),
+                }
+                if selected_retrieval_engine == BASELINE_RETRIEVAL_ENGINE
+                else {}
+            ),
         )
+        if processing_outcome is not None:
+            baseline_outcomes.append(processing_outcome)
 
     removed = [c for c in prev_chunks if c not in set(chunks)]
     for chunk in removed:
         remove_text(session=session, text=chunk, document_id=doc.document_id)
 
-    if doc.groups:
+    if selected_retrieval_engine == BASELINE_RETRIEVAL_ENGINE and validated_group_id:
+        activity_group_id = validated_group_id
+    elif doc.groups:
+        activity_group_id = doc.groups[0].group_id
+    else:
+        activity_group_id = None
+    if activity_group_id:
         log_activity(
             session=session,
             user_id=doc.author_id,
-            group_id=doc.groups[0].group_id,
+            group_id=activity_group_id,
             action="update",
             object_id=doc.document_id,
             object_name=doc.title,
@@ -3463,7 +4256,27 @@ def process_document(
         )
 
     session.commit()
-    return {"new": new}
+    result: dict[str, object] = {"new": new}
+    if selected_retrieval_engine == BASELINE_RETRIEVAL_ENGINE:
+        assert validated_group_id is not None
+        assert processing_run_key is not None
+        result["baseline_processing"] = baseline_document_processing_outcome(
+            baseline_outcomes,
+            group_id=validated_group_id,
+            parent_run_trace_id=processing_run_trace_id(
+                processing_run_key,
+                validated_group_id,
+            ),
+            query_provenance=retrieval_query_provenance(
+                retrieval_query,
+                (
+                    RetrievalQueryOrigin.EXPLICIT
+                    if retrieval_query is not None
+                    else RetrievalQueryOrigin.ABSENT
+                ),
+            ),
+        )
+    return result
 
 
 def detect_significant_edits(
@@ -3485,9 +4298,7 @@ def detect_significant_edits(
             focus_manifest=focus_manifest,
         )
     candidate_indices = [
-        idx
-        for idx, novelty in novelty_scores.items()
-        if (1.0 - novelty) < threshold
+        idx for idx, novelty in novelty_scores.items() if (1.0 - novelty) < threshold
     ]
     return prioritize_chunks(
         candidate_indices,
@@ -3520,7 +4331,9 @@ def prioritize_chunks(
         if focus_manifest_enabled(focus_manifest):
             indices.sort(
                 key=lambda i: (
-                    -focus_score_for_path(_extract_snapshot_file_path(chunks[i]), focus_manifest),
+                    -focus_score_for_path(
+                        _extract_snapshot_file_path(chunks[i]), focus_manifest
+                    ),
                     _chunk_priority_key(chunks[i], i, code_focus),
                 )
             )
@@ -3542,15 +4355,21 @@ def prioritize_chunks(
         best_idx = -1
         best_score = float("-inf")
         for idx in remaining:
-            relevance = _chunk_relevance_score(chunks[idx], idx, code_focus, novelty_scores.get(idx, 1.0))
+            relevance = _chunk_relevance_score(
+                chunks[idx], idx, code_focus, novelty_scores.get(idx, 1.0)
+            )
             redundancy = 0.0
             if selected:
                 redundancy = max(
                     _chunk_redundancy_score(chunks[idx], chunks[chosen_idx], code_focus)
                     for chosen_idx in selected
                 )
-            focus_boost = focus_score_for_path(_extract_snapshot_file_path(chunks[idx]), focus_manifest)
-            score = relevance + focus_boost - (_source_redundancy_penalty() * redundancy)
+            focus_boost = focus_score_for_path(
+                _extract_snapshot_file_path(chunks[idx]), focus_manifest
+            )
+            score = (
+                relevance + focus_boost - (_source_redundancy_penalty() * redundancy)
+            )
             if best_idx < 0 or score > best_score:
                 best_idx = idx
                 best_score = score
@@ -3586,10 +4405,14 @@ def _existing_feedback_candidate_indices(
 
     chunk_set = set(chunks)
     content_to_chunk_id: dict[str, str] = {}
-    existing_rows = session.query(Chunk.chunk_id, Chunk.content).filter(
-        Chunk.document_id == doc.document_id,
-        Chunk.chunk_type == "document",
-    ).all()
+    existing_rows = (
+        session.query(Chunk.chunk_id, Chunk.content)
+        .filter(
+            Chunk.document_id == doc.document_id,
+            Chunk.chunk_type == "document",
+        )
+        .all()
+    )
     for chunk_id, content in existing_rows:
         if content in chunk_set and content not in content_to_chunk_id:
             content_to_chunk_id[content] = chunk_id
@@ -3598,24 +4421,32 @@ def _existing_feedback_candidate_indices(
 
     feedback_chunk_ids = {
         source_chunk_id
-        for (source_chunk_id,) in session.query(Feedback.source_chunk_id).filter(
-            Feedback.source_chunk_id.in_(list(content_to_chunk_id.values()))
-        ).distinct().all()
+        for (source_chunk_id,) in session.query(Feedback.source_chunk_id)
+        .filter(Feedback.source_chunk_id.in_(list(content_to_chunk_id.values())))
+        .distinct()
+        .all()
     }
 
     candidate_indices = [
         idx
         for idx, chunk in enumerate(chunks)
-        if content_to_chunk_id.get(chunk) and content_to_chunk_id[chunk] not in feedback_chunk_ids
+        if content_to_chunk_id.get(chunk)
+        and content_to_chunk_id[chunk] not in feedback_chunk_ids
     ]
     if code_focus:
-        candidate_indices = [idx for idx in candidate_indices if not _is_snapshot_metadata_chunk(chunks[idx])]
+        candidate_indices = [
+            idx
+            for idx in candidate_indices
+            if not _is_snapshot_metadata_chunk(chunks[idx])
+        ]
     if not candidate_indices:
         return []
 
     token_lens = {idx: count_tokens(chunks[idx]) for idx in candidate_indices}
     if feedback_min_tokens > 0:
-        eligible = [idx for idx in candidate_indices if token_lens[idx] >= feedback_min_tokens]
+        eligible = [
+            idx for idx in candidate_indices if token_lens[idx] >= feedback_min_tokens
+        ]
         if eligible:
             candidate_indices = eligible
         else:
@@ -3644,7 +4475,11 @@ def _best_previous_chunk_for_focus(
     target_path = _extract_snapshot_file_path(chunk)
     candidates = prev_chunks
     if code_focus and target_path:
-        same_path = [prev for prev in prev_chunks if _extract_snapshot_file_path(prev) == target_path]
+        same_path = [
+            prev
+            for prev in prev_chunks
+            if _extract_snapshot_file_path(prev) == target_path
+        ]
         if same_path:
             candidates = same_path
     best_chunk = ""
@@ -3769,13 +4604,21 @@ def _compact_change_context(
     return "\n".join(out).strip()
 
 
-def _focus_text_for_chunk(chunk: str, prev_chunks: list[str], *, code_focus: bool) -> str:
-    previous_chunk = _best_previous_chunk_for_focus(chunk, prev_chunks, code_focus=code_focus)
+def _focus_text_for_chunk(
+    chunk: str, prev_chunks: list[str], *, code_focus: bool
+) -> str:
+    previous_chunk = _best_previous_chunk_for_focus(
+        chunk, prev_chunks, code_focus=code_focus
+    )
     return _compact_changed_focus_window(chunk, previous_chunk)
 
 
-def _change_context_for_chunk(chunk: str, prev_chunks: list[str], *, code_focus: bool) -> str:
-    previous_chunk = _best_previous_chunk_for_focus(chunk, prev_chunks, code_focus=code_focus)
+def _change_context_for_chunk(
+    chunk: str, prev_chunks: list[str], *, code_focus: bool
+) -> str:
+    previous_chunk = _best_previous_chunk_for_focus(
+        chunk, prev_chunks, code_focus=code_focus
+    )
     return _compact_change_context(chunk, previous_chunk)
 
 
@@ -3803,7 +4646,9 @@ def _select_legacy_reference_chunks(
         allow_same_document=_allow_same_document_feedback(user),
         reference_doc_ids=scoped_reference_doc_ids,
     )
-    query_variants = _reference_query_variants(text, focus_text, change_context, code_focus=code_focus)
+    query_variants = _reference_query_variants(
+        text, focus_text, change_context, code_focus=code_focus
+    )
     query_text = query_variants[0][1] if query_variants else text
     source_retrieval_text = getattr(existing_chunk, "content", "") or text or query_text
     query_vectors: list[tuple[str, list[float]]] = []
@@ -3857,11 +4702,16 @@ def _select_legacy_reference_chunks(
         else:
             published_filter = Document.is_published.is_(True)
             if allow_same_document:
-                published_filter = or_(Document.is_published.is_(True), Document.document_id == doc.document_id)
+                published_filter = or_(
+                    Document.is_published.is_(True),
+                    Document.document_id == doc.document_id,
+                )
             else:
                 base_query = base_query.filter(Document.document_id != doc.document_id)
             if scoped_reference_doc_ids:
-                base_query = base_query.filter(Document.document_id.in_(scoped_reference_doc_ids))
+                base_query = base_query.filter(
+                    Document.document_id.in_(scoped_reference_doc_ids)
+                )
             base_query = base_query.filter(
                 published_filter,
                 Chunk.chunk_type == "document",
@@ -3873,15 +4723,16 @@ def _select_legacy_reference_chunks(
             vector_candidate_sets: list[list[Chunk]] = []
             for _, query_vector in query_vectors:
                 vector_candidate_sets.append(
-                    base_query.order_by(
-                        Chunk.embedding.cosine_distance(query_vector)
-                    )
+                    base_query.order_by(Chunk.embedding.cosine_distance(query_vector))
                     .limit(vector_fetch_limit)
                     .all()
                 )
             raw_vector_candidates = _interleave_reference_candidates(
                 *vector_candidate_sets,
-                limit=max(vector_fetch_limit * max(1, len(vector_candidate_sets)), vector_fetch_limit),
+                limit=max(
+                    vector_fetch_limit * max(1, len(vector_candidate_sets)),
+                    vector_fetch_limit,
+                ),
             )
             candidates = list(raw_vector_candidates)
             raw_candidate_count = len(raw_vector_candidates)
@@ -3905,7 +4756,9 @@ def _select_legacy_reference_chunks(
                 if best_score is not None:
                     scored.append((best_score, candidate))
             scored.sort(key=lambda item: item[0], reverse=True)
-            vector_limit = max(vector_fetch_limit, vector_fetch_limit * max(1, len(query_vectors)))
+            vector_limit = max(
+                vector_fetch_limit, vector_fetch_limit * max(1, len(query_vectors))
+            )
             candidates = [chunk for _, chunk in scored[:vector_limit]]
             raw_vector_candidates = list(candidates)
         if not raw_all_candidates:
@@ -3927,7 +4780,9 @@ def _select_legacy_reference_chunks(
         )
         for reason, count in candidate_filtered_counts.items():
             filtered_counts[reason] = max(filtered_counts.get(reason, 0), count)
-        candidate_count = len(all_candidates) if all_candidates is not None else len(candidates)
+        candidate_count = (
+            len(all_candidates) if all_candidates is not None else len(candidates)
+        )
         if code_focus:
             fts_candidates = _reference_fts_candidates(
                 source_retrieval_text,
@@ -4011,9 +4866,15 @@ def _select_legacy_reference_chunks(
                 reranker_model_version=rerank_debug.get("reranker_model_version"),
                 reranker_model_path=rerank_debug.get("reranker_model_path"),
                 adjudicator_enabled=bool(rerank_debug.get("adjudicator_enabled")),
-                adjudicated_candidate_count=int(rerank_debug.get("adjudicated_candidate_count") or 0),
-                positive_adjudication_count=int(rerank_debug.get("positive_adjudication_count") or 0),
-                rescued_adjudication_count=int(rerank_debug.get("rescued_adjudication_count") or 0),
+                adjudicated_candidate_count=int(
+                    rerank_debug.get("adjudicated_candidate_count") or 0
+                ),
+                positive_adjudication_count=int(
+                    rerank_debug.get("positive_adjudication_count") or 0
+                ),
+                rescued_adjudication_count=int(
+                    rerank_debug.get("rescued_adjudication_count") or 0
+                ),
                 candidates=_reference_trace_entries(
                     query_text=query_text,
                     source_chunk=existing_chunk,
@@ -4052,9 +4913,15 @@ def _select_legacy_reference_chunks(
                 reranker_model_version=rerank_debug.get("reranker_model_version"),
                 reranker_model_path=rerank_debug.get("reranker_model_path"),
                 adjudicator_enabled=bool(rerank_debug.get("adjudicator_enabled")),
-                adjudicated_candidate_count=int(rerank_debug.get("adjudicated_candidate_count") or 0),
-                positive_adjudication_count=int(rerank_debug.get("positive_adjudication_count") or 0),
-                rescued_adjudication_count=int(rerank_debug.get("rescued_adjudication_count") or 0),
+                adjudicated_candidate_count=int(
+                    rerank_debug.get("adjudicated_candidate_count") or 0
+                ),
+                positive_adjudication_count=int(
+                    rerank_debug.get("positive_adjudication_count") or 0
+                ),
+                rescued_adjudication_count=int(
+                    rerank_debug.get("rescued_adjudication_count") or 0
+                ),
                 filtered_header_only=filtered_counts.get("header_only", 0),
                 filtered_same_file=filtered_counts.get("same_file", 0),
                 filtered_same_document=filtered_counts.get("same_document_disabled", 0),
@@ -4082,15 +4949,367 @@ def _select_legacy_reference_chunks(
                 reranker_model_version=rerank_debug.get("reranker_model_version"),
                 reranker_model_path=rerank_debug.get("reranker_model_path"),
                 adjudicator_enabled=bool(rerank_debug.get("adjudicator_enabled")),
-                adjudicated_candidate_count=int(rerank_debug.get("adjudicated_candidate_count") or 0),
-                positive_adjudication_count=int(rerank_debug.get("positive_adjudication_count") or 0),
-                rescued_adjudication_count=int(rerank_debug.get("rescued_adjudication_count") or 0),
+                adjudicated_candidate_count=int(
+                    rerank_debug.get("adjudicated_candidate_count") or 0
+                ),
+                positive_adjudication_count=int(
+                    rerank_debug.get("positive_adjudication_count") or 0
+                ),
+                rescued_adjudication_count=int(
+                    rerank_debug.get("rescued_adjudication_count") or 0
+                ),
                 filtered_header_only=filtered_counts.get("header_only", 0),
                 filtered_same_file=filtered_counts.get("same_file", 0),
                 filtered_same_document=filtered_counts.get("same_document_disabled", 0),
                 filtered_same_chunk=filtered_counts.get("same_chunk", 0),
             )
     return references
+
+
+@dataclass(frozen=True, slots=True)
+class _BaselineSourceScope:
+    group_id: str
+    source_chunk_id: str
+    source_document_id: str
+
+
+def _authorize_baseline_document_scope(
+    session: SASession,
+    *,
+    source_document_id: str,
+    group_id: str,
+    caller_user_id: str,
+) -> str | None:
+    """Authorize the selected group before baseline processing mutates state."""
+
+    if sql_text is None:  # pragma: no cover - only possible in isolated stubs
+        raise RuntimeError("baseline processing requires SQLAlchemy text queries")
+
+    group_exists = session.execute(
+        sql_text('SELECT group_id FROM "group" WHERE group_id = :group_id'),
+        {"group_id": group_id},
+    ).one_or_none()
+    if group_exists is None:
+        return "selected_group_absent"
+
+    document_scope = session.execute(
+        sql_text(
+            "SELECT dtg.document_id FROM document_to_group dtg JOIN document d "
+            "ON d.document_id = dtg.document_id "
+            "WHERE dtg.document_id = :source_document_id "
+            "AND dtg.group_id = :group_id"
+        ),
+        {"source_document_id": source_document_id, "group_id": group_id},
+    ).one_or_none()
+    if document_scope is None:
+        return "source_group_unauthorized"
+
+    membership = session.execute(
+        sql_text(
+            'SELECT utg.user_id FROM user_to_group utg JOIN "user" u '
+            "ON u.user_id = utg.user_id "
+            "WHERE utg.user_id = :caller_user_id "
+            "AND utg.group_id = :group_id"
+        ),
+        {"caller_user_id": caller_user_id, "group_id": group_id},
+    ).one_or_none()
+    if membership is None:
+        return "caller_group_unauthorized"
+    return None
+
+
+def _resolve_baseline_source_scope(
+    session: SASession,
+    source_chunk_id: str,
+    group_id: str,
+    caller_user_id: str | None,
+) -> tuple[_BaselineSourceScope | None, str | None]:
+    """Authorize the caller-selected scope using durable database state only."""
+
+    if sql_text is None:  # pragma: no cover - only possible in isolated stubs
+        raise RuntimeError("baseline processing requires SQLAlchemy text queries")
+
+    selected_group = (
+        session.execute(
+            sql_text(
+                'SELECT group_id FROM "group" WHERE group_id = :group_id'
+            ),
+            {"group_id": group_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if selected_group is None:
+        return None, "selected_group_absent"
+
+    row = (
+        session.execute(
+            sql_text(
+                "SELECT c.chunk_id, c.document_id, dtg.group_id FROM chunk c "
+                "JOIN document d ON d.document_id = c.document_id "
+                "JOIN document_to_group dtg ON dtg.document_id = d.document_id "
+                'JOIN "group" g ON g.group_id = dtg.group_id '
+                "WHERE c.chunk_id = :source_chunk_id "
+                "AND dtg.group_id = :group_id"
+            ),
+            {"source_chunk_id": source_chunk_id, "group_id": group_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        return None, "source_group_unauthorized"
+
+    if caller_user_id is not None:
+        caller_membership = (
+            session.execute(
+                sql_text(
+                    'SELECT utg.user_id FROM user_to_group utg JOIN "user" u '
+                    "ON u.user_id = utg.user_id "
+                    "WHERE utg.user_id = :caller_user_id "
+                    "AND utg.group_id = :group_id"
+                ),
+                {"caller_user_id": caller_user_id, "group_id": group_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if caller_membership is None:
+            return None, "caller_group_unauthorized"
+
+    return (
+        _BaselineSourceScope(
+            group_id=str(row["group_id"]),
+            source_chunk_id=str(row["chunk_id"]),
+            source_document_id=str(row["document_id"]),
+        ),
+        None,
+    )
+
+
+def _baseline_request_corpus_fields(
+    session: SASession,
+    group_id: str,
+) -> tuple[str, str | None, bool]:
+    if sql_text is None:  # pragma: no cover - only possible in isolated stubs
+        raise RuntimeError("baseline processing requires SQLAlchemy text queries")
+
+    row = (
+        session.execute(
+            sql_text(
+                "SELECT c.changed_repository_id, c.active_generation_id, "
+                "g.generation_version, g.status "
+                "FROM retrieval_corpus c LEFT JOIN retrieval_corpus_generation g "
+                "ON g.generation_id = c.active_generation_id "
+                "WHERE c.scope_key = :scope_key"
+            ),
+            {"scope_key": f"group:{group_id}"},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        return "", None, False
+    complete = bool(
+        row["active_generation_id"]
+        and row["generation_version"]
+        and row["status"] == "active"
+    )
+    return (
+        str(row["generation_version"] or ""),
+        str(row["changed_repository_id"] or "") or None,
+        complete,
+    )
+
+
+def _baseline_runtime_components():
+    """Build production baseline-only dependencies without legacy providers."""
+
+    from compair_core.db import SessionLocal
+    from compair_core.server.settings import get_settings
+
+    from .retrieval.embedding import create_configured_persistent_baseline_retriever
+    from .retrieval.evidence_persistence import BaselineEvidencePersistenceService
+
+    retriever = create_configured_persistent_baseline_retriever(
+        SessionLocal,
+        settings=get_settings(),
+    )
+    return retriever, BaselineEvidencePersistenceService(SessionLocal)
+
+
+def _baseline_outcome_without_result(
+    *,
+    retrieval_query: str | None,
+    request_id: str,
+    source_chunk_id: str,
+    group_id: str | None,
+    parent_run_trace_id: str,
+    error_code: str,
+) -> BaselineProcessingOutcome:
+    provenance = retrieval_query_provenance(
+        retrieval_query,
+        (
+            RetrievalQueryOrigin.EXPLICIT
+            if retrieval_query is not None
+            else RetrievalQueryOrigin.ABSENT
+        ),
+    )
+    return BaselineProcessingOutcome(
+        status=BaselineProcessingStatus.ERROR,
+        retrieval_status=RetrievalStatus.ERROR.value,
+        request_id=request_id,
+        source_chunk_id=source_chunk_id,
+        group_id=group_id,
+        parent_run_trace_id=parent_run_trace_id,
+        selected_reference_count=0,
+        persistence_run_id=None,
+        idempotent_replay=False,
+        error_code=error_code,
+        query_provenance=provenance,
+    )
+
+
+def _record_baseline_processing_outcome(outcome: BaselineProcessingOutcome) -> None:
+    log_event("baseline_processing_outcome", **outcome.as_dict())
+
+
+def _process_baseline_reference_evidence(
+    *,
+    session: SASession,
+    existing_chunk: Chunk,
+    retrieval_query: str | None,
+    processing_run_key: str,
+    group_id: str,
+    caller_user_id: str | None,
+) -> BaselineProcessingOutcome:
+    from .retrieval.evidence_persistence import (
+        BaselineEvidencePersistenceCommand,
+        BaselineEvidencePersistenceError,
+    )
+
+    selected_group_id = validate_baseline_group_id(group_id)
+    parent_trace_id = processing_run_trace_id(processing_run_key, selected_group_id)
+    source_chunk_id = str(existing_chunk.chunk_id or "")
+    request_id = f"{parent_trace_id}:{source_chunk_id}"
+    scope, scope_error = _resolve_baseline_source_scope(
+        session,
+        source_chunk_id,
+        selected_group_id,
+        caller_user_id,
+    )
+    if scope is None:
+        outcome = _baseline_outcome_without_result(
+            retrieval_query=retrieval_query,
+            request_id=request_id,
+            source_chunk_id=source_chunk_id,
+            group_id=selected_group_id,
+            parent_run_trace_id=parent_trace_id,
+            error_code=scope_error or "source_authorization_absent",
+        )
+        _record_baseline_processing_outcome(outcome)
+        return outcome
+
+    corpus_version, changed_repository_id, corpus_complete = (
+        _baseline_request_corpus_fields(session, scope.group_id)
+    )
+    request = RetrievalRequest(
+        request_id=request_id,
+        changed_repository=None,
+        repository_roots=(),
+        corpus_version=corpus_version,
+        retrieval_query=retrieval_query,
+        retrieval_query_origin=(
+            RetrievalQueryOrigin.EXPLICIT
+            if retrieval_query is not None
+            else RetrievalQueryOrigin.ABSENT
+        ),
+        corpus_complete=corpus_complete,
+        corpus_scope_key=f"group:{scope.group_id}",
+        changed_repository_id=changed_repository_id,
+        group_id=scope.group_id,
+    )
+    # Release the processing session's read transaction before the dedicated
+    # persistence service acquires its SQLite/PostgreSQL writer locks.
+    session.commit()
+    result: RetrievalResult | None = None
+    try:
+        retriever, persistence_service = _baseline_runtime_components()
+        retrieved = retrieve_reference_evidence(
+            engine_name=BASELINE_RETRIEVAL_ENGINE,
+            baseline_retriever=retriever,
+            request=request,
+        )
+        if not isinstance(retrieved, RetrievalResult):
+            raise RuntimeError("baseline retrieval returned an invalid result type")
+        result = retrieved
+        if result.status is not RetrievalStatus.OK:
+            outcome = BaselineProcessingOutcome.from_result(
+                result,
+                source_chunk_id=scope.source_chunk_id,
+                group_id=scope.group_id,
+                parent_run_trace_id=parent_trace_id,
+                status=(
+                    BaselineProcessingStatus.INSUFFICIENT
+                    if result.status is RetrievalStatus.INSUFFICIENT
+                    else BaselineProcessingStatus.ERROR
+                ),
+                error_code=result.error.code if result.error is not None else None,
+            )
+            _record_baseline_processing_outcome(outcome)
+            return outcome
+
+        receipt = persistence_service.persist(
+            BaselineEvidencePersistenceCommand(
+                group_id=scope.group_id,
+                source_chunk_id=scope.source_chunk_id,
+                source_document_id=scope.source_document_id,
+                idempotency_key=derive_baseline_persistence_idempotency_key(
+                    processing_run_key,
+                    scope.group_id,
+                    scope.source_chunk_id,
+                ),
+                retrieval_result=result,
+                caller_user_id=caller_user_id,
+            )
+        )
+        outcome = BaselineProcessingOutcome.from_result(
+            result,
+            source_chunk_id=scope.source_chunk_id,
+            group_id=scope.group_id,
+            parent_run_trace_id=parent_trace_id,
+            status=BaselineProcessingStatus.REFERENCES_PERSISTED,
+            selected_reference_count=len(receipt.reference_ids),
+            persistence_run_id=receipt.run_id,
+            idempotent_replay=receipt.replayed,
+        )
+        _record_baseline_processing_outcome(outcome)
+        return outcome
+    except BaselineEvidencePersistenceError as exc:
+        error_code = exc.code
+    except Exception as exc:  # noqa: BLE001 - provider/database integration boundary
+        error_code = str(getattr(exc, "code", "baseline_processing_failed"))
+
+    if result is not None:
+        outcome = BaselineProcessingOutcome.from_result(
+            result,
+            source_chunk_id=scope.source_chunk_id,
+            group_id=scope.group_id,
+            parent_run_trace_id=parent_trace_id,
+            status=BaselineProcessingStatus.ERROR,
+            error_code=error_code,
+        )
+    else:
+        outcome = _baseline_outcome_without_result(
+            retrieval_query=retrieval_query,
+            request_id=request_id,
+            source_chunk_id=scope.source_chunk_id,
+            group_id=scope.group_id,
+            parent_run_trace_id=parent_trace_id,
+            error_code=error_code,
+        )
+    _record_baseline_processing_outcome(outcome)
+    return outcome
 
 
 def process_text(
@@ -4107,8 +5326,19 @@ def process_text(
     change_context: str = "",
     reference_doc_ids: list[str] | None = None,
     retrieval_query: str | None = None,
-) -> None:
+    retrieval_engine: str = DEFAULT_RETRIEVAL_ENGINE,
+    processing_run_key: str | None = None,
+    group_id: str | None = None,
+    caller_user_id: str | None = None,
+) -> BaselineProcessingOutcome | None:
     logger = logging.getLogger(__name__)
+    selected_retrieval_engine = validate_retrieval_engine_name(retrieval_engine)
+    if selected_retrieval_engine == BASELINE_RETRIEVAL_ENGINE:
+        validated_processing_run_key = validate_processing_run_key(processing_run_key)
+        validated_group_id = validate_baseline_group_id(group_id)
+    else:
+        validated_processing_run_key = None
+        validated_group_id = None
     text = sanitize_text_for_database(text)
     chunk_hash = stable_chunk_hash(text)
 
@@ -4117,27 +5347,33 @@ def process_text(
 
     # Check by stable hash first. Comparing full chunk text and loading full rows
     # is expensive on large code snapshots.
-    existing_chunks = session.query(Chunk).options(
-        load_only(Chunk.chunk_id, Chunk.hash, Chunk.embedding)
-    ).filter(
-        Chunk.document_id == doc.document_id,
-        Chunk.chunk_type == chunk_type,
-        Chunk.note_id == note_id,
-        Chunk.hash == chunk_hash,
+    existing_chunks = (
+        session.query(Chunk)
+        .options(load_only(Chunk.chunk_id, Chunk.hash, Chunk.embedding))
+        .filter(
+            Chunk.document_id == doc.document_id,
+            Chunk.chunk_type == chunk_type,
+            Chunk.note_id == note_id,
+            Chunk.hash == chunk_hash,
+        )
     )
 
     user = session.query(User).filter(User.user_id == doc.author_id).first()
     existing_rows = existing_chunks.all()
     # Legacy fallback is opt-in because text equality against large chunks is the
     # pressure point that can destabilize small Postgres instances.
-    if not existing_rows and os.getenv("COMPAIR_ENABLE_LEGACY_CONTENT_CHUNK_LOOKUP", "").lower() in {"1", "true", "yes"}:
-        legacy_chunks = session.query(Chunk).options(
-            load_only(Chunk.chunk_id, Chunk.hash, Chunk.embedding)
-        ).filter(
-            Chunk.document_id == doc.document_id,
-            Chunk.chunk_type == chunk_type,
-            Chunk.note_id == note_id,
-            Chunk.content == text,
+    if not existing_rows and os.getenv(
+        "COMPAIR_ENABLE_LEGACY_CONTENT_CHUNK_LOOKUP", ""
+    ).lower() in {"1", "true", "yes"}:
+        legacy_chunks = (
+            session.query(Chunk)
+            .options(load_only(Chunk.chunk_id, Chunk.hash, Chunk.embedding))
+            .filter(
+                Chunk.document_id == doc.document_id,
+                Chunk.chunk_type == chunk_type,
+                Chunk.note_id == note_id,
+                Chunk.content == text,
+            )
         )
         existing_rows = legacy_chunks.all()
     existing_chunk = existing_rows[0] if existing_rows else None
@@ -4147,12 +5383,19 @@ def process_text(
         for chunk in existing_rows:
             if chunk.hash != chunk_hash:
                 chunk.hash = chunk_hash
-            if embedding is None and chunk.embedding is not None:
+            if (
+                selected_retrieval_engine == DEFAULT_RETRIEVAL_ENGINE
+                and embedding is None
+                and chunk.embedding is not None
+            ):
                 embedding = chunk.embedding
-        if embedding is None:
+        if selected_retrieval_engine == DEFAULT_RETRIEVAL_ENGINE and embedding is None:
             embedding = create_embedding(embedder, text, user=user)
         for chunk in existing_rows:
-            if chunk.embedding is None:
+            if (
+                selected_retrieval_engine == DEFAULT_RETRIEVAL_ENGINE
+                and chunk.embedding is None
+            ):
                 chunk.embedding = embedding
         session.commit()
     else:
@@ -4163,19 +5406,39 @@ def process_text(
             chunk_type=chunk_type,
             content=text,
         )
-        if embedding is None:
+        if selected_retrieval_engine == DEFAULT_RETRIEVAL_ENGINE and embedding is None:
             embedding = create_embedding(embedder, text, user=user)
-        chunk.embedding = embedding
+        if embedding is not None:
+            chunk.embedding = embedding
         session.add(chunk)
         session.commit()
         existing_chunk = chunk
     if existing_chunk is None:
-        existing_chunk = session.query(Chunk).filter(
-            Chunk.document_id == doc.document_id,
-            Chunk.chunk_type == chunk_type,
-            Chunk.note_id == note_id,
-            Chunk.hash == chunk_hash,
-        ).first()
+        existing_chunk = (
+            session.query(Chunk)
+            .filter(
+                Chunk.document_id == doc.document_id,
+                Chunk.chunk_type == chunk_type,
+                Chunk.note_id == note_id,
+                Chunk.hash == chunk_hash,
+            )
+            .first()
+        )
+
+    if (
+        generate_feedback
+        and existing_chunk
+        and selected_retrieval_engine == BASELINE_RETRIEVAL_ENGINE
+    ):
+        assert validated_processing_run_key is not None
+        return _process_baseline_reference_evidence(
+            session=session,
+            existing_chunk=existing_chunk,
+            retrieval_query=retrieval_query,
+            processing_run_key=validated_processing_run_key,
+            group_id=validated_group_id,
+            caller_user_id=caller_user_id,
+        )
 
     references: list[Chunk] = []
     if generate_feedback and existing_chunk:
@@ -4287,7 +5550,9 @@ def process_text(
                             chunk_id=ref_chunk.chunk_id,
                             chunk_text=ref_chunk.content,
                             doc_type=ref_doc.doc_type if ref_doc else "",
-                            author_role=ref_user.role if ref_user and ref_user.role else "",
+                            author_role=ref_user.role
+                            if ref_user and ref_user.role
+                            else "",
                             author_team="",
                             last_modified_utc=(
                                 ref_doc.datetime_modified.isoformat()
@@ -4308,7 +5573,9 @@ def process_text(
                             target_doc_title=doc.title or "",
                             target_doc_type=doc.doc_type or "",
                             target_last_modified_utc=(
-                                doc.datetime_modified.isoformat() if doc.datetime_modified else None
+                                doc.datetime_modified.isoformat()
+                                if doc.datetime_modified
+                                else None
                             ),
                             user_role=user.role if user and user.role else "",
                             user_team="",
@@ -4350,10 +5617,14 @@ def get_all_chunks_for_document(session: SASession, doc: Document) -> list[Chunk
         note_text_chunks = chunk_text_with_mode(note.content)
         for text in note_text_chunks:
             chunk_hash = stable_chunk_hash(text)
-            existing = session.query(Chunk).filter(
-                Chunk.document_id == doc.document_id,
-                Chunk.content == text,
-            ).first()
+            existing = (
+                session.query(Chunk)
+                .filter(
+                    Chunk.document_id == doc.document_id,
+                    Chunk.content == text,
+                )
+                .first()
+            )
             if not existing:
                 embedding = create_embedding(Embedder(), text, user=doc.author_id)
                 note_chunk = Chunk(
@@ -4387,7 +5658,9 @@ def review_documents_now(
     del session  # Included for parity with other main helpers.
     if generate_now_review is None:
         raise RuntimeError("Now review is unavailable in this runtime")
-    group_name = str(getattr(group, "name", "") or getattr(group, "group_id", "") or "Active group")
+    group_name = str(
+        getattr(group, "name", "") or getattr(group, "group_id", "") or "Active group"
+    )
     return generate_now_review(
         reviewer,
         documents,
@@ -4413,7 +5686,9 @@ def quote_documents_now(
     quote_now = getattr(feedback_module, "quote_documents_now", None)
     if quote_now is None:
         raise RuntimeError("Now review quote is unavailable in this runtime")
-    group_name = str(getattr(group, "name", "") or getattr(group, "group_id", "") or "Active group")
+    group_name = str(
+        getattr(group, "name", "") or getattr(group, "group_id", "") or "Active group"
+    )
     return quote_now(
         reviewer,
         documents,

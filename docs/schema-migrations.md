@@ -3,7 +3,8 @@
 ## Scope
 
 Phase 2B2F.0 added the migration registry and runner. Phase 2B2F.1 uses it for
-the additive immutable baseline-evidence schema. It does not add bridge writes
+the additive immutable baseline-evidence schema, and Phase 2B2F.2 adds the
+forward retention correction. It does not add bridge writes
 or reads and does not change retrieval, normal Reference persistence,
 generation, API, or CLI behavior.
 
@@ -75,11 +76,21 @@ and `feedback`; and does not rebuild, rewrite, or backfill legacy rows. The
 exact contract and manual downgrade procedure are in
 `docs/design/baseline-evidence-schema.md`.
 
+## Implemented retention migration
+
+`0002_baseline_evidence_retention_v1` corrects source-deletion semantics without
+rewriting evidence content or adding bridge behavior. Source chunk/document
+foreign keys become nullable `SET NULL`; baseline selected evidence directly
+group-cascades but restricts run/artifact deletion; baseline Feedback targets
+the selected `(run_id, ordinal)`; and a scoped chunk trigger preserves legacy
+source-owned deletion while retaining baseline Reference and Feedback rows.
+Corpus/index identifiers remain copied values with no lifecycle foreign keys.
+
 ### SQLite
 
 - `BEGIN IMMEDIATE` serializes bootstrap and migration writers. SQLite DDL is
-  included in the transaction, so failed additive DDL rolls back with the
-  pending batch.
+  included in the transaction, so failed DDL rolls back with the pending
+  batch.
 - A nullable foreign key can be introduced without rebuilding the owner table
   by using `ALTER TABLE ... ADD COLUMN ... REFERENCES ...` with the implicit
   `NULL` default, after creating the referenced table. The index is a separate
@@ -88,9 +99,14 @@ exact contract and manual downgrade procedure are in
   `ALTER TABLE ... ADD CONSTRAINT`. The reference clause must therefore be part
   of `ADD COLUMN`. Core now establishes and tests per-connection
   `PRAGMA foreign_keys=ON` before any bridge constraint or cascade is used.
-- Any future change that SQLite cannot express additively requires a separately
-  reviewed copy-and-swap migration, an offline backup, integrity checks, and an
-  explicit maintenance window. The runner will not infer or perform one.
+- Migration `0002` is the reviewed copy-and-swap needed to change existing FK
+  actions and nullability. The locked migration connection disables FK actions
+  before `BEGIN IMMEDIATE`, copies all columns and explicit indexes/triggers,
+  swaps the four affected tables transactionally, then requires a clean
+  `PRAGMA foreign_key_check` before commit. It restores and verifies
+  `PRAGMA foreign_keys=ON` before returning the connection to the pool. An
+  injected failure proves the original tables/data survive and reviewed retry
+  succeeds.
 
 ### PostgreSQL
 
@@ -105,6 +121,9 @@ exact contract and manual downgrade procedure are in
   transactional `CREATE INDEX` while the migration lock is held. `CREATE INDEX
   CONCURRENTLY` is intentionally outside this transaction model and would
   require a separately designed migration state machine.
+- Migration `0002` uses named `ALTER TABLE` operations: drop only the audited
+  old FKs, drop source-column `NOT NULL`, install and validate the replacement
+  `SET NULL`/restrictive/composite FKs, and create the scoped chunk trigger.
 
 ## Failure recovery and rollback
 
