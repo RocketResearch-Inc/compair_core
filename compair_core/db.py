@@ -1,10 +1,24 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from pathlib import Path
 
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.orm import sessionmaker
+
+
+@event.listens_for(Engine, "connect")
+def _enforce_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+    """Enable durable FK/cascade enforcement on every SQLite connection."""
+
+    if not isinstance(dbapi_connection, sqlite3.Connection):
+        return
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+    finally:
+        cursor.close()
 
 
 def _bool_env(name: str, default: bool) -> bool:

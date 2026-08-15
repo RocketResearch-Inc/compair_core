@@ -2,8 +2,9 @@
 
 ## Scope
 
-Phase 2B2F.0 adds a migration registry and runner only. It does not add a
-baseline-evidence table, alter `reference`, or change retrieval, persistence,
+Phase 2B2F.0 added the migration registry and runner. Phase 2B2F.1 uses it for
+the additive immutable baseline-evidence schema. It does not add bridge writes
+or reads and does not change retrieval, normal Reference persistence,
 generation, API, or CLI behavior.
 
 The previous startup path uses SQLAlchemy `create_all(checkfirst=True)` and a
@@ -56,20 +57,23 @@ failed state according to a reviewed recovery procedure.
 Editing an applied migration changes its checksum and fails closed. Corrections
 must be new, ordered migrations.
 
-## Additive bridge migration pattern
+## Implemented additive bridge migration
 
-The future Phase 2B2F schema migration should remain additive:
+`0001_baseline_evidence_bridge_v1` performs these additive operations:
 
 1. Create immutable evidence/run tables and their indexes.
 2. Add any nullable relationship column with a `NULL` default, so existing
    legacy `reference` rows remain valid.
 3. Add and validate the foreign key using the backend-specific form below.
-4. Create the lookup/order indexes.
+4. Create the lookup/order and partial unique indexes.
 5. Validate tables, columns, constraints, and indexes before recording the
    migration as applied.
 
-No automatic table copy, table drop, column rewrite, or destructive rebuild is
-part of this foundation.
+It creates `baseline_retrieval_run`, `baseline_evidence_artifact`, and
+`baseline_selected_evidence`; adds nullable bridge target fields to `reference`
+and `feedback`; and does not rebuild, rewrite, or backfill legacy rows. The
+exact contract and manual downgrade procedure are in
+`docs/design/baseline-evidence-schema.md`.
 
 ### SQLite
 
@@ -82,9 +86,8 @@ part of this foundation.
   `CREATE INDEX` statement.
 - SQLite cannot generally add an independently named table constraint with
   `ALTER TABLE ... ADD CONSTRAINT`. The reference clause must therefore be part
-  of `ADD COLUMN`. The Phase 2B2F implementation must also establish and test
-  the application's per-connection `PRAGMA foreign_keys=ON` policy before
-  relying on enforcement; the current Core engine does not set it globally.
+  of `ADD COLUMN`. Core now establishes and tests per-connection
+  `PRAGMA foreign_keys=ON` before any bridge constraint or cascade is used.
 - Any future change that SQLite cannot express additively requires a separately
   reviewed copy-and-swap migration, an offline backup, integrity checks, and an
   explicit maintenance window. The runner will not infer or perform one.
@@ -96,10 +99,12 @@ part of this foundation.
 - PostgreSQL transactional DDL rolls back with the batch.
 - Add the nullable column first, then add a named foreign key as `NOT VALID` and
   validate it explicitly. Existing rows are unaffected because the new column
-  is null. Index creation uses ordinary transactional `CREATE INDEX` while the
-  migration lock is held. `CREATE INDEX CONCURRENTLY` is intentionally outside
-  this transaction model and would require a separately designed migration
-  state machine.
+  is null. The Reference XOR check intentionally remains `NOT VALID`, which
+  enforces new/updated rows without rejecting historical document-only rows
+  created before `reference_chunk_id`. Index creation uses ordinary
+  transactional `CREATE INDEX` while the migration lock is held. `CREATE INDEX
+  CONCURRENTLY` is intentionally outside this transaction model and would
+  require a separately designed migration state machine.
 
 ## Failure recovery and rollback
 
@@ -120,17 +125,15 @@ that one `failed` row for an idempotent retry or publish a new corrective
 migration. An `applied` row must never be manually rewritten to bypass a
 checksum mismatch.
 
-## Phase 2B2F prerequisites
+## Phase 2B2G prerequisites
 
-Before implementing the approved bridge schema:
+Before implementing bridge writes:
 
-- freeze the evidence/run/reference relationship names, null/delete semantics,
-  uniqueness/idempotency keys, explicit ordering columns, and authorization
-  scope from `docs/design/baseline-reference-bridge.md`;
-- choose and test the SQLite foreign-key connection policy;
-- write dialect-specific, additive DDL plus post-DDL validators;
-- test upgrading a copied pre-registry Core database with legacy rows intact;
-- run SQLite and real PostgreSQL migration, retry, and failure rollback tests;
-  and
-- document backup, deployment ordering, and the reviewed operational down plan.
-
+- define the pure result/provenance/authorization validator;
+- freeze group-scoped artifact-key and caller idempotency-key semantics;
+- revalidate active corpus/index state inside the write transaction;
+- persist run/artifact/selection/Reference atomically in explicit ordinal order;
+- prove non-`ok`, stale, retry, concurrent, and injected-failure behavior on
+  SQLite and PostgreSQL; and
+- keep Reference reads, generation, API/CLI changes, and finding enablement out
+  of that persistence-only step.

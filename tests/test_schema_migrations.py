@@ -92,16 +92,25 @@ def test_existing_startup_schema_gets_transactional_baseline_marker(
         second = run_schema_migrations(engine)
         state = read_schema_migration_state(engine)
 
-        assert first.applied == ("0000_core_schema_baseline",)
+        assert first.applied == (
+            "0000_core_schema_baseline",
+            "0001_baseline_evidence_bridge_v1",
+        )
         assert first.already_applied == ()
         assert second.applied == ()
-        assert second.already_applied == ("0000_core_schema_baseline",)
+        assert second.already_applied == (
+            "0000_core_schema_baseline",
+            "0001_baseline_evidence_bridge_v1",
+        )
         assert [(row.migration_id, row.state) for row in state] == [
-            ("0000_core_schema_baseline", "applied")
+            ("0000_core_schema_baseline", "applied"),
+            ("0001_baseline_evidence_bridge_v1", "applied"),
         ]
-        assert state[0].checksum == CORE_SCHEMA_MIGRATIONS[0].checksum
-        assert state[0].runner_version == MIGRATION_RUNNER_VERSION
-        assert state[0].error_code is None
+        assert [row.checksum for row in state] == [
+            migration.checksum for migration in CORE_SCHEMA_MIGRATIONS
+        ]
+        assert all(row.runner_version == MIGRATION_RUNNER_VERSION for row in state)
+        assert all(row.error_code is None for row in state)
     finally:
         engine.dispose()
 

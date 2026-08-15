@@ -1,8 +1,11 @@
 # Durable baseline evidence to Reference bridge
 
-Status: Phase 2B2E design only. This document proposes a future schema and
-transaction boundary. It does not authorize implementation, migration, API,
-retrieval, or generation changes.
+Status: Option A was approved. Phase 2B2F.1 freezes and implements the schema
+and migration under `baseline-reference-bridge.v1`. Bridge writes, reads,
+retrieval integration, API serialization, and generation remain disabled and
+are Phase 2B2G or later work. The frozen names and lifecycle in
+`docs/design/baseline-evidence-schema.md` supersede earlier provisional names
+below where they differ.
 
 ## Current-state findings
 
