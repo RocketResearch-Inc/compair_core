@@ -39,6 +39,12 @@ from .models import (
     cosine_similarity,
 )
 from .reference_reranker import load_model as load_reference_reranker_model, score_trace_row as score_reference_trace_row
+from .retrieval import (
+    RetrievalQueryOrigin,
+    RetrievalRequest,
+    retrieval_query_provenance,
+    retrieve_reference_evidence,
+)
 from .topic_tags import extract_topic_tags
 from .utils import (
     chunk_text_with_mode,
@@ -3177,6 +3183,7 @@ def process_document(
     reanalyze_existing: bool = False,
     reference_doc_ids: list[str] | None = None,
     focus_manifest: FocusManifest = None,
+    retrieval_query: str | None = None,
 ) -> Mapping[str, int]:
     new = False
     doc.content = sanitize_text_for_database(doc.content)
@@ -3416,6 +3423,7 @@ def process_document(
             focus_text=feedback_focus_by_new_index.get(i, ""),
             change_context=feedback_change_context_by_new_index.get(i, ""),
             reference_doc_ids=reference_doc_ids,
+            retrieval_query=retrieval_query,
         )
 
     for idx in existing_indices_to_generate_feedback:
@@ -3436,6 +3444,7 @@ def process_document(
             focus_text=focus_text,
             change_context=change_context,
             reference_doc_ids=reference_doc_ids,
+            retrieval_query=retrieval_query,
         )
 
     removed = [c for c in prev_chunks if c not in set(chunks)]
@@ -3770,6 +3779,320 @@ def _change_context_for_chunk(chunk: str, prev_chunks: list[str], *, code_focus:
     return _compact_change_context(chunk, previous_chunk)
 
 
+def _select_legacy_reference_chunks(
+    session: SASession,
+    embedder: Embedder,
+    user: User,
+    doc: Document,
+    existing_chunk: Chunk,
+    text: str,
+    *,
+    code_focus: bool,
+    query_embedding: list[float] | None,
+    focus_text: str,
+    change_context: str,
+    reference_doc_ids: list[str] | None,
+    retrieval_request: RetrievalRequest | None = None,
+) -> list[Chunk]:
+    references: list[Chunk] = []
+    doc_group_ids = [g.group_id for g in doc.groups]
+    target_embedding = existing_chunk.embedding
+    scoped_reference_doc_ids = _clean_reference_document_ids(reference_doc_ids)
+    allow_same_document = _reference_scope_allows_same_document(
+        getattr(doc, "document_id", None),
+        allow_same_document=_allow_same_document_feedback(user),
+        reference_doc_ids=scoped_reference_doc_ids,
+    )
+    query_variants = _reference_query_variants(text, focus_text, change_context, code_focus=code_focus)
+    query_text = query_variants[0][1] if query_variants else text
+    source_retrieval_text = getattr(existing_chunk, "content", "") or text or query_text
+    query_vectors: list[tuple[str, list[float]]] = []
+    for variant_name, variant_text in query_variants:
+        vector: list[float] | None = None
+        if variant_text == text:
+            vector = target_embedding
+        elif variant_name == "primary" and query_embedding is not None:
+            vector = query_embedding
+        if vector is None and variant_text:
+            vector = create_embedding(embedder, variant_text, user=user)
+        if vector is not None:
+            query_vectors.append((variant_name, vector))
+    candidate_limit, _, _ = _reference_selection_config(code_focus)
+    merge_limit = _reference_merge_limit(code_focus, candidate_limit)
+    vector_fetch_limit = _reference_effective_vector_fetch_limit(
+        text,
+        code_focus=code_focus,
+        candidate_limit=candidate_limit,
+        merge_limit=merge_limit,
+    )
+
+    if query_vectors:
+        fts_candidates: list[Chunk] = []
+        lexical_candidates: list[Chunk] = []
+        anchor_candidates: list[Chunk] = []
+        counterpart_candidates: list[Chunk] = []
+        candidate_count = 0
+        filtered_counts: dict[str, int] = {}
+        raw_candidate_count = 0
+        raw_all_candidates: list[Chunk] = []
+        raw_vector_candidates: list[Chunk] = []
+        base_query = None
+        if doc_group_ids:
+            base_query = (
+                session.query(Chunk)
+                .join(Chunk.document)
+                .join(Document.groups)
+                .filter(Group.group_id.in_(doc_group_ids))
+            )
+        elif allow_same_document:
+            base_query = (
+                session.query(Chunk)
+                .join(Chunk.document)
+                .filter(Document.document_id == doc.document_id)
+            )
+
+        all_candidates: list[Chunk] | None = None
+        if base_query is None:
+            candidates = []
+        else:
+            published_filter = Document.is_published.is_(True)
+            if allow_same_document:
+                published_filter = or_(Document.is_published.is_(True), Document.document_id == doc.document_id)
+            else:
+                base_query = base_query.filter(Document.document_id != doc.document_id)
+            if scoped_reference_doc_ids:
+                base_query = base_query.filter(Document.document_id.in_(scoped_reference_doc_ids))
+            base_query = base_query.filter(
+                published_filter,
+                Chunk.chunk_type == "document",
+            )
+
+        if base_query is None:
+            candidates = []
+        elif VECTOR_BACKEND == "pgvector":
+            vector_candidate_sets: list[list[Chunk]] = []
+            for _, query_vector in query_vectors:
+                vector_candidate_sets.append(
+                    base_query.order_by(
+                        Chunk.embedding.cosine_distance(query_vector)
+                    )
+                    .limit(vector_fetch_limit)
+                    .all()
+                )
+            raw_vector_candidates = _interleave_reference_candidates(
+                *vector_candidate_sets,
+                limit=max(vector_fetch_limit * max(1, len(vector_candidate_sets)), vector_fetch_limit),
+            )
+            candidates = list(raw_vector_candidates)
+            raw_candidate_count = len(raw_vector_candidates)
+            if code_focus:
+                all_candidates = base_query.all()
+                raw_all_candidates = list(all_candidates)
+                raw_candidate_count = len(all_candidates)
+        else:
+            all_candidates = base_query.all()
+            raw_all_candidates = list(all_candidates)
+            raw_candidate_count = len(all_candidates)
+            scored: list[tuple[float, Chunk]] = []
+            for candidate in all_candidates:
+                best_score: float | None = None
+                for _, query_vector in query_vectors:
+                    score = cosine_similarity(candidate.embedding, query_vector)
+                    if score is None:
+                        continue
+                    if best_score is None or score > best_score:
+                        best_score = score
+                if best_score is not None:
+                    scored.append((best_score, candidate))
+            scored.sort(key=lambda item: item[0], reverse=True)
+            vector_limit = max(vector_fetch_limit, vector_fetch_limit * max(1, len(query_vectors)))
+            candidates = [chunk for _, chunk in scored[:vector_limit]]
+            raw_vector_candidates = list(candidates)
+        if not raw_all_candidates:
+            raw_all_candidates = list(all_candidates or candidates)
+        if all_candidates is not None:
+            all_candidates, filtered_counts = _filter_reference_candidates(
+                all_candidates,
+                doc=doc,
+                source_chunk=existing_chunk,
+                allow_same_document=allow_same_document,
+                code_focus=code_focus,
+            )
+        candidates, candidate_filtered_counts = _filter_reference_candidates(
+            candidates,
+            doc=doc,
+            source_chunk=existing_chunk,
+            allow_same_document=allow_same_document,
+            code_focus=code_focus,
+        )
+        for reason, count in candidate_filtered_counts.items():
+            filtered_counts[reason] = max(filtered_counts.get(reason, 0), count)
+        candidate_count = len(all_candidates) if all_candidates is not None else len(candidates)
+        if code_focus:
+            fts_candidates = _reference_fts_candidates(
+                source_retrieval_text,
+                query_variants,
+                all_candidates or [],
+                limit=_reference_fts_candidate_limit(code_focus, candidate_limit),
+                code_focus=True,
+            )
+            lexical_candidates = _lexical_reference_candidates(
+                source_retrieval_text,
+                all_candidates or [],
+                limit=candidate_limit,
+                code_focus=True,
+            )
+            anchor_candidates = _anchor_reference_candidates(
+                source_retrieval_text,
+                all_candidates or [],
+                limit=candidate_limit * 2,
+                code_focus=True,
+            )
+            counterpart_candidates = _reference_counterpart_candidates(
+                source_retrieval_text,
+                all_candidates or [],
+                limit=max(candidate_limit * 2, candidate_limit + 2),
+                code_focus=True,
+            )
+            candidates = _interleave_reference_candidates(
+                candidates,
+                fts_candidates,
+                counterpart_candidates,
+                anchor_candidates,
+                lexical_candidates,
+                limit=merge_limit,
+            )
+        rerank_debug: dict[str, Any] = {}
+        references = _rerank_reference_chunks(
+            query_text,
+            candidates,
+            code_focus=code_focus,
+            source_chunk=existing_chunk,
+            doc=doc,
+            raw_vector_candidates=raw_vector_candidates,
+            fts_candidates=fts_candidates,
+            lexical_candidates=lexical_candidates,
+            anchor_candidates=anchor_candidates,
+            counterpart_candidates=counterpart_candidates,
+            debug_stats=rerank_debug,
+        )
+        if _reference_trace_enabled():
+            trace_query_provenance = (
+                retrieval_request.query_provenance
+                if retrieval_request is not None
+                and retrieval_request.retrieval_query_origin
+                is RetrievalQueryOrigin.EXPLICIT
+                else retrieval_query_provenance(
+                    query_text,
+                    RetrievalQueryOrigin.LEGACY_DERIVED,
+                )
+            )
+            log_event(
+                "feedback_reference_trace",
+                document_id=doc.document_id,
+                source_chunk_id=existing_chunk.chunk_id,
+                source_path=_extract_snapshot_file_path(text),
+                query_path=_extract_snapshot_file_path(query_text),
+                code_focus=code_focus,
+                allow_same_document=allow_same_document,
+                raw_candidate_count=raw_candidate_count,
+                candidate_count=candidate_count,
+                fts_candidate_count=len(fts_candidates),
+                lexical_candidate_count=len(lexical_candidates),
+                anchor_candidate_count=len(anchor_candidates),
+                counterpart_candidate_count=len(counterpart_candidates),
+                query_variant_count=len(query_vectors),
+                query_variant_names=[name for name, _ in query_vectors],
+                **trace_query_provenance.trace_fields(),
+                vector_fetch_limit=vector_fetch_limit,
+                selected_reference_count=len(references),
+                hybrid_enabled=bool(rerank_debug.get("hybrid_enabled")),
+                reranker_enabled=bool(rerank_debug.get("reranker_enabled")),
+                reranker_model_version=rerank_debug.get("reranker_model_version"),
+                reranker_model_path=rerank_debug.get("reranker_model_path"),
+                adjudicator_enabled=bool(rerank_debug.get("adjudicator_enabled")),
+                adjudicated_candidate_count=int(rerank_debug.get("adjudicated_candidate_count") or 0),
+                positive_adjudication_count=int(rerank_debug.get("positive_adjudication_count") or 0),
+                rescued_adjudication_count=int(rerank_debug.get("rescued_adjudication_count") or 0),
+                candidates=_reference_trace_entries(
+                    query_text=query_text,
+                    source_chunk=existing_chunk,
+                    doc=doc,
+                    raw_candidates=raw_all_candidates,
+                    raw_vector_candidates=raw_vector_candidates,
+                    allow_same_document=allow_same_document,
+                    code_focus=code_focus,
+                    fts_candidates=fts_candidates,
+                    lexical_candidates=lexical_candidates,
+                    anchor_candidates=anchor_candidates,
+                    counterpart_candidates=counterpart_candidates,
+                    selected_references=references,
+                    row_debug=rerank_debug.get("row_debug_by_chunk_id"),
+                ),
+            )
+        if not references:
+            log_event(
+                "feedback_no_references",
+                document_id=doc.document_id,
+                source_chunk_id=existing_chunk.chunk_id,
+                group_ids=doc_group_ids,
+                code_focus=code_focus,
+                allow_same_document=allow_same_document,
+                raw_candidate_count=raw_candidate_count,
+                candidate_count=candidate_count,
+                fts_candidate_count=len(fts_candidates),
+                lexical_candidate_count=len(lexical_candidates),
+                anchor_candidate_count=len(anchor_candidates),
+                counterpart_candidate_count=len(counterpart_candidates),
+                query_variant_count=len(query_vectors),
+                query_variant_names=[name for name, _ in query_vectors],
+                vector_fetch_limit=vector_fetch_limit,
+                hybrid_enabled=bool(rerank_debug.get("hybrid_enabled")),
+                reranker_enabled=bool(rerank_debug.get("reranker_enabled")),
+                reranker_model_version=rerank_debug.get("reranker_model_version"),
+                reranker_model_path=rerank_debug.get("reranker_model_path"),
+                adjudicator_enabled=bool(rerank_debug.get("adjudicator_enabled")),
+                adjudicated_candidate_count=int(rerank_debug.get("adjudicated_candidate_count") or 0),
+                positive_adjudication_count=int(rerank_debug.get("positive_adjudication_count") or 0),
+                rescued_adjudication_count=int(rerank_debug.get("rescued_adjudication_count") or 0),
+                filtered_header_only=filtered_counts.get("header_only", 0),
+                filtered_same_file=filtered_counts.get("same_file", 0),
+                filtered_same_document=filtered_counts.get("same_document_disabled", 0),
+                filtered_same_chunk=filtered_counts.get("same_chunk", 0),
+            )
+        else:
+            log_event(
+                "feedback_references_selected",
+                document_id=doc.document_id,
+                source_chunk_id=existing_chunk.chunk_id,
+                group_ids=doc_group_ids,
+                code_focus=code_focus,
+                allow_same_document=allow_same_document,
+                raw_candidate_count=raw_candidate_count,
+                candidate_count=candidate_count,
+                lexical_candidate_count=len(lexical_candidates),
+                anchor_candidate_count=len(anchor_candidates),
+                counterpart_candidate_count=len(counterpart_candidates),
+                query_variant_count=len(query_vectors),
+                query_variant_names=[name for name, _ in query_vectors],
+                vector_fetch_limit=vector_fetch_limit,
+                selected_reference_count=len(references),
+                hybrid_enabled=bool(rerank_debug.get("hybrid_enabled")),
+                reranker_enabled=bool(rerank_debug.get("reranker_enabled")),
+                reranker_model_version=rerank_debug.get("reranker_model_version"),
+                reranker_model_path=rerank_debug.get("reranker_model_path"),
+                adjudicator_enabled=bool(rerank_debug.get("adjudicator_enabled")),
+                adjudicated_candidate_count=int(rerank_debug.get("adjudicated_candidate_count") or 0),
+                positive_adjudication_count=int(rerank_debug.get("positive_adjudication_count") or 0),
+                rescued_adjudication_count=int(rerank_debug.get("rescued_adjudication_count") or 0),
+                filtered_header_only=filtered_counts.get("header_only", 0),
+                filtered_same_file=filtered_counts.get("same_file", 0),
+                filtered_same_document=filtered_counts.get("same_document_disabled", 0),
+                filtered_same_chunk=filtered_counts.get("same_chunk", 0),
+            )
+    return references
+
+
 def process_text(
     session: SASession,
     embedder: Embedder,
@@ -3783,6 +4106,7 @@ def process_text(
     focus_text: str = "",
     change_context: str = "",
     reference_doc_ids: list[str] | None = None,
+    retrieval_query: str | None = None,
 ) -> None:
     logger = logging.getLogger(__name__)
     text = sanitize_text_for_database(text)
@@ -3855,291 +4179,37 @@ def process_text(
 
     references: list[Chunk] = []
     if generate_feedback and existing_chunk:
-        doc_group_ids = [g.group_id for g in doc.groups]
-        target_embedding = existing_chunk.embedding
         code_focus = _is_code_review_chunk(doc, text)
-        scoped_reference_doc_ids = _clean_reference_document_ids(reference_doc_ids)
-        allow_same_document = _reference_scope_allows_same_document(
-            getattr(doc, "document_id", None),
-            allow_same_document=_allow_same_document_feedback(user),
-            reference_doc_ids=scoped_reference_doc_ids,
+        retrieval_request = RetrievalRequest(
+            request_id=str(existing_chunk.chunk_id or ""),
+            changed_repository=None,
+            repository_roots=(),
+            corpus_version="",
+            retrieval_query=retrieval_query,
+            retrieval_query_origin=(
+                RetrievalQueryOrigin.EXPLICIT
+                if retrieval_query is not None
+                else RetrievalQueryOrigin.ABSENT
+            ),
+            corpus_complete=False,
         )
-        query_variants = _reference_query_variants(text, focus_text, change_context, code_focus=code_focus)
-        query_text = query_variants[0][1] if query_variants else text
-        source_retrieval_text = getattr(existing_chunk, "content", "") or text or query_text
-        query_vectors: list[tuple[str, list[float]]] = []
-        for variant_name, variant_text in query_variants:
-            vector: list[float] | None = None
-            if variant_text == text:
-                vector = target_embedding
-            elif variant_name == "primary" and query_embedding is not None:
-                vector = query_embedding
-            if vector is None and variant_text:
-                vector = create_embedding(embedder, variant_text, user=user)
-            if vector is not None:
-                query_vectors.append((variant_name, vector))
-        candidate_limit, _, _ = _reference_selection_config(code_focus)
-        merge_limit = _reference_merge_limit(code_focus, candidate_limit)
-        vector_fetch_limit = _reference_effective_vector_fetch_limit(
-            text,
-            code_focus=code_focus,
-            candidate_limit=candidate_limit,
-            merge_limit=merge_limit,
+        references = retrieve_reference_evidence(
+            legacy_selector=lambda: _select_legacy_reference_chunks(
+                session,
+                embedder,
+                user,
+                doc,
+                existing_chunk,
+                text,
+                code_focus=code_focus,
+                query_embedding=query_embedding,
+                focus_text=focus_text,
+                change_context=change_context,
+                reference_doc_ids=reference_doc_ids,
+                retrieval_request=retrieval_request,
+            ),
+            request=retrieval_request,
         )
-
-        if query_vectors:
-            fts_candidates: list[Chunk] = []
-            lexical_candidates: list[Chunk] = []
-            anchor_candidates: list[Chunk] = []
-            counterpart_candidates: list[Chunk] = []
-            candidate_count = 0
-            filtered_counts: dict[str, int] = {}
-            raw_candidate_count = 0
-            raw_all_candidates: list[Chunk] = []
-            raw_vector_candidates: list[Chunk] = []
-            base_query = None
-            if doc_group_ids:
-                base_query = (
-                    session.query(Chunk)
-                    .join(Chunk.document)
-                    .join(Document.groups)
-                    .filter(Group.group_id.in_(doc_group_ids))
-                )
-            elif allow_same_document:
-                base_query = (
-                    session.query(Chunk)
-                    .join(Chunk.document)
-                    .filter(Document.document_id == doc.document_id)
-                )
-
-            all_candidates: list[Chunk] | None = None
-            if base_query is None:
-                candidates = []
-            else:
-                published_filter = Document.is_published.is_(True)
-                if allow_same_document:
-                    published_filter = or_(Document.is_published.is_(True), Document.document_id == doc.document_id)
-                else:
-                    base_query = base_query.filter(Document.document_id != doc.document_id)
-                if scoped_reference_doc_ids:
-                    base_query = base_query.filter(Document.document_id.in_(scoped_reference_doc_ids))
-                base_query = base_query.filter(
-                    published_filter,
-                    Chunk.chunk_type == "document",
-                )
-
-            if base_query is None:
-                candidates = []
-            elif VECTOR_BACKEND == "pgvector":
-                vector_candidate_sets: list[list[Chunk]] = []
-                for _, query_vector in query_vectors:
-                    vector_candidate_sets.append(
-                        base_query.order_by(
-                            Chunk.embedding.cosine_distance(query_vector)
-                        )
-                        .limit(vector_fetch_limit)
-                        .all()
-                    )
-                raw_vector_candidates = _interleave_reference_candidates(
-                    *vector_candidate_sets,
-                    limit=max(vector_fetch_limit * max(1, len(vector_candidate_sets)), vector_fetch_limit),
-                )
-                candidates = list(raw_vector_candidates)
-                raw_candidate_count = len(raw_vector_candidates)
-                if code_focus:
-                    all_candidates = base_query.all()
-                    raw_all_candidates = list(all_candidates)
-                    raw_candidate_count = len(all_candidates)
-            else:
-                all_candidates = base_query.all()
-                raw_all_candidates = list(all_candidates)
-                raw_candidate_count = len(all_candidates)
-                scored: list[tuple[float, Chunk]] = []
-                for candidate in all_candidates:
-                    best_score: float | None = None
-                    for _, query_vector in query_vectors:
-                        score = cosine_similarity(candidate.embedding, query_vector)
-                        if score is None:
-                            continue
-                        if best_score is None or score > best_score:
-                            best_score = score
-                    if best_score is not None:
-                        scored.append((best_score, candidate))
-                scored.sort(key=lambda item: item[0], reverse=True)
-                vector_limit = max(vector_fetch_limit, vector_fetch_limit * max(1, len(query_vectors)))
-                candidates = [chunk for _, chunk in scored[:vector_limit]]
-                raw_vector_candidates = list(candidates)
-            if not raw_all_candidates:
-                raw_all_candidates = list(all_candidates or candidates)
-            if all_candidates is not None:
-                all_candidates, filtered_counts = _filter_reference_candidates(
-                    all_candidates,
-                    doc=doc,
-                    source_chunk=existing_chunk,
-                    allow_same_document=allow_same_document,
-                    code_focus=code_focus,
-                )
-            candidates, candidate_filtered_counts = _filter_reference_candidates(
-                candidates,
-                doc=doc,
-                source_chunk=existing_chunk,
-                allow_same_document=allow_same_document,
-                code_focus=code_focus,
-            )
-            for reason, count in candidate_filtered_counts.items():
-                filtered_counts[reason] = max(filtered_counts.get(reason, 0), count)
-            candidate_count = len(all_candidates) if all_candidates is not None else len(candidates)
-            if code_focus:
-                fts_candidates = _reference_fts_candidates(
-                    source_retrieval_text,
-                    query_variants,
-                    all_candidates or [],
-                    limit=_reference_fts_candidate_limit(code_focus, candidate_limit),
-                    code_focus=True,
-                )
-                lexical_candidates = _lexical_reference_candidates(
-                    source_retrieval_text,
-                    all_candidates or [],
-                    limit=candidate_limit,
-                    code_focus=True,
-                )
-                anchor_candidates = _anchor_reference_candidates(
-                    source_retrieval_text,
-                    all_candidates or [],
-                    limit=candidate_limit * 2,
-                    code_focus=True,
-                )
-                counterpart_candidates = _reference_counterpart_candidates(
-                    source_retrieval_text,
-                    all_candidates or [],
-                    limit=max(candidate_limit * 2, candidate_limit + 2),
-                    code_focus=True,
-                )
-                candidates = _interleave_reference_candidates(
-                    candidates,
-                    fts_candidates,
-                    counterpart_candidates,
-                    anchor_candidates,
-                    lexical_candidates,
-                    limit=merge_limit,
-                )
-            rerank_debug: dict[str, Any] = {}
-            references = _rerank_reference_chunks(
-                query_text,
-                candidates,
-                code_focus=code_focus,
-                source_chunk=existing_chunk,
-                doc=doc,
-                raw_vector_candidates=raw_vector_candidates,
-                fts_candidates=fts_candidates,
-                lexical_candidates=lexical_candidates,
-                anchor_candidates=anchor_candidates,
-                counterpart_candidates=counterpart_candidates,
-                debug_stats=rerank_debug,
-            )
-            if _reference_trace_enabled():
-                log_event(
-                    "feedback_reference_trace",
-                    document_id=doc.document_id,
-                    source_chunk_id=existing_chunk.chunk_id,
-                    source_path=_extract_snapshot_file_path(text),
-                    query_path=_extract_snapshot_file_path(query_text),
-                    code_focus=code_focus,
-                    allow_same_document=allow_same_document,
-                    raw_candidate_count=raw_candidate_count,
-                    candidate_count=candidate_count,
-                    fts_candidate_count=len(fts_candidates),
-                    lexical_candidate_count=len(lexical_candidates),
-                    anchor_candidate_count=len(anchor_candidates),
-                    counterpart_candidate_count=len(counterpart_candidates),
-                    query_variant_count=len(query_vectors),
-                    query_variant_names=[name for name, _ in query_vectors],
-                    vector_fetch_limit=vector_fetch_limit,
-                    selected_reference_count=len(references),
-                    hybrid_enabled=bool(rerank_debug.get("hybrid_enabled")),
-                    reranker_enabled=bool(rerank_debug.get("reranker_enabled")),
-                    reranker_model_version=rerank_debug.get("reranker_model_version"),
-                    reranker_model_path=rerank_debug.get("reranker_model_path"),
-                    adjudicator_enabled=bool(rerank_debug.get("adjudicator_enabled")),
-                    adjudicated_candidate_count=int(rerank_debug.get("adjudicated_candidate_count") or 0),
-                    positive_adjudication_count=int(rerank_debug.get("positive_adjudication_count") or 0),
-                    rescued_adjudication_count=int(rerank_debug.get("rescued_adjudication_count") or 0),
-                    candidates=_reference_trace_entries(
-                        query_text=query_text,
-                        source_chunk=existing_chunk,
-                        doc=doc,
-                        raw_candidates=raw_all_candidates,
-                        raw_vector_candidates=raw_vector_candidates,
-                        allow_same_document=allow_same_document,
-                        code_focus=code_focus,
-                        fts_candidates=fts_candidates,
-                        lexical_candidates=lexical_candidates,
-                        anchor_candidates=anchor_candidates,
-                        counterpart_candidates=counterpart_candidates,
-                        selected_references=references,
-                        row_debug=rerank_debug.get("row_debug_by_chunk_id"),
-                    ),
-                )
-            if not references:
-                log_event(
-                    "feedback_no_references",
-                    document_id=doc.document_id,
-                    source_chunk_id=existing_chunk.chunk_id,
-                    group_ids=doc_group_ids,
-                    code_focus=code_focus,
-                    allow_same_document=allow_same_document,
-                    raw_candidate_count=raw_candidate_count,
-                    candidate_count=candidate_count,
-                    fts_candidate_count=len(fts_candidates),
-                    lexical_candidate_count=len(lexical_candidates),
-                    anchor_candidate_count=len(anchor_candidates),
-                    counterpart_candidate_count=len(counterpart_candidates),
-                    query_variant_count=len(query_vectors),
-                    query_variant_names=[name for name, _ in query_vectors],
-                    vector_fetch_limit=vector_fetch_limit,
-                    hybrid_enabled=bool(rerank_debug.get("hybrid_enabled")),
-                    reranker_enabled=bool(rerank_debug.get("reranker_enabled")),
-                    reranker_model_version=rerank_debug.get("reranker_model_version"),
-                    reranker_model_path=rerank_debug.get("reranker_model_path"),
-                    adjudicator_enabled=bool(rerank_debug.get("adjudicator_enabled")),
-                    adjudicated_candidate_count=int(rerank_debug.get("adjudicated_candidate_count") or 0),
-                    positive_adjudication_count=int(rerank_debug.get("positive_adjudication_count") or 0),
-                    rescued_adjudication_count=int(rerank_debug.get("rescued_adjudication_count") or 0),
-                    filtered_header_only=filtered_counts.get("header_only", 0),
-                    filtered_same_file=filtered_counts.get("same_file", 0),
-                    filtered_same_document=filtered_counts.get("same_document_disabled", 0),
-                    filtered_same_chunk=filtered_counts.get("same_chunk", 0),
-                )
-            else:
-                log_event(
-                    "feedback_references_selected",
-                    document_id=doc.document_id,
-                    source_chunk_id=existing_chunk.chunk_id,
-                    group_ids=doc_group_ids,
-                    code_focus=code_focus,
-                    allow_same_document=allow_same_document,
-                    raw_candidate_count=raw_candidate_count,
-                    candidate_count=candidate_count,
-                    lexical_candidate_count=len(lexical_candidates),
-                    anchor_candidate_count=len(anchor_candidates),
-                    counterpart_candidate_count=len(counterpart_candidates),
-                    query_variant_count=len(query_vectors),
-                    query_variant_names=[name for name, _ in query_vectors],
-                    vector_fetch_limit=vector_fetch_limit,
-                    selected_reference_count=len(references),
-                    hybrid_enabled=bool(rerank_debug.get("hybrid_enabled")),
-                    reranker_enabled=bool(rerank_debug.get("reranker_enabled")),
-                    reranker_model_version=rerank_debug.get("reranker_model_version"),
-                    reranker_model_path=rerank_debug.get("reranker_model_path"),
-                    adjudicator_enabled=bool(rerank_debug.get("adjudicator_enabled")),
-                    adjudicated_candidate_count=int(rerank_debug.get("adjudicated_candidate_count") or 0),
-                    positive_adjudication_count=int(rerank_debug.get("positive_adjudication_count") or 0),
-                    rescued_adjudication_count=int(rerank_debug.get("rescued_adjudication_count") or 0),
-                    filtered_header_only=filtered_counts.get("header_only", 0),
-                    filtered_same_file=filtered_counts.get("same_file", 0),
-                    filtered_same_document=filtered_counts.get("same_document_disabled", 0),
-                    filtered_same_chunk=filtered_counts.get("same_chunk", 0),
-                )
 
         sql_references: list[Reference] = []
         for ref_chunk in references:

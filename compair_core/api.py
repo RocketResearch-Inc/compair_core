@@ -8,13 +8,10 @@ import requests
 import base64
 import binascii
 import secrets
-import threading
-import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional, Tuple
 
 import httpx
-import psutil
 from celery.result import AsyncResult
 from fastapi import APIRouter, Body, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
@@ -28,6 +25,7 @@ from sqlalchemy.orm import joinedload, load_only, Session
 from .server.deps import get_analytics, get_billing, get_ocr, get_settings_dependency, get_storage
 from .server.feature_flags import review_now_backend_enabled, review_now_disabled_detail
 from .server.providers.contracts import Analytics, BillingProvider, OCRProvider, StorageProvider
+from .server.resource_metrics import attach_service_resource_metrics
 from .server.settings import Settings
 
 from . import compair
@@ -35,6 +33,13 @@ from .compair import models, schema
 from .compair.embeddings import create_embedding, Embedder
 from .compair.focus_manifest import normalize_focus_manifest
 from .compair.logger import log_event 
+from .compair.retrieval import RetrievalQueryOrigin, retrieval_query_provenance
+from .compair.retrieval.transport import (
+    REDACTED_TASK_ARGS_REPR,
+    REDACTED_TASK_KWARGS_REPR,
+    RetrievalQueryTransportPolicyError,
+    require_retrieval_query_transport,
+)
 from .compair.topic_tags import extract_topic_tags
 from .compair.utils import (
     chunk_text,
@@ -498,13 +503,37 @@ def _dispatch_process_document_task(
     snapshot_payload_key: str | None = None,
     reference_doc_ids: list[str] | None = None,
     focus_manifest: dict[str, Any] | None = None,
+    retrieval_query: str | None = None,
+    allow_insecure_local_query_transport: bool = False,
 ):
     task_kwargs: dict[str, Any] = {
         "snapshot_payload_key": snapshot_payload_key,
         "reference_doc_ids": reference_doc_ids,
     }
+    if retrieval_query is not None:
+        task_kwargs["retrieval_query"] = retrieval_query
     if focus_manifest is not None:
         task_kwargs["focus_manifest"] = focus_manifest
+    if retrieval_query is not None:
+        require_retrieval_query_transport(
+            process_document_celery,
+            allow_insecure_local_transport=allow_insecure_local_query_transport,
+        )
+        task_apply_async = getattr(process_document_celery, "apply_async", None)
+        if callable(task_apply_async):
+            return task_apply_async(
+                args=(
+                    user_id,
+                    doc_id,
+                    doc_text or "",
+                    generate_feedback,
+                    chunk_mode,
+                    reanalyze_existing,
+                ),
+                kwargs=task_kwargs,
+                argsrepr=REDACTED_TASK_ARGS_REPR,
+                kwargsrepr=REDACTED_TASK_KWARGS_REPR,
+            )
     task_callable = getattr(process_document_celery, "delay", None)
     if callable(task_callable):
         try:
@@ -518,6 +547,8 @@ def _dispatch_process_document_task(
                 **task_kwargs,
             )
         except TypeError:
+            if retrieval_query is not None:
+                raise
             try:
                 return task_callable(user_id, doc_id, doc_text or "", generate_feedback, chunk_mode)
             except TypeError:
@@ -533,6 +564,8 @@ def _dispatch_process_document_task(
             **task_kwargs,
         )
     except TypeError:
+        if retrieval_query is not None:
+            raise
         try:
             return process_document_celery(user_id, doc_id, doc_text or "", generate_feedback, chunk_mode)
         except TypeError:
@@ -1180,25 +1213,6 @@ def get_current_user_with_access_to_doc(
         if doc.is_published:
             return current_user
         raise HTTPException(status_code=403, detail="Not authorized to access this document")
-
-def log_service_resource_metrics(service_name="backend"):
-    def log():
-        try:
-            p = psutil.Process(os.getpid())
-            mem_mb = round(p.memory_info().rss / 1024 / 1024, 2)
-            cpu_percent = p.cpu_percent(interval=1)
-            log_event("service_resource", service=service_name, memory_mb=mem_mb, cpu_percent=cpu_percent)
-        except Exception as e:
-            logger.warning("resource log failed: %s", e)
-        finally:
-            # Re-schedule logging in 5 minutes
-            threading.Timer(300, log).start()
-    log()
-
-log_service_resource_metrics(service_name="backend")  # or "frontend"
-
-# Run via: fastapi dev api.py
-
 
 @router.post("/login")
 def login(request: schema.LoginRequest) -> dict:
@@ -3092,6 +3106,7 @@ async def process_doc(
     chunk_mode = _parse_process_doc_string(payload.get("chunk_mode"))
     reanalyze_existing = _parse_process_doc_bool(payload.get("reanalyze_existing"), False)
     reference_doc_ids = _parse_process_doc_list(payload.get("reference_doc_ids"))
+    retrieval_query = _parse_process_doc_string(payload.get("retrieval_query"))
     try:
         focus_manifest = normalize_focus_manifest(payload.get("focus_manifest"))
     except ValueError as exc:
@@ -3134,6 +3149,14 @@ async def process_doc(
         if doc_text_b64 is not None
         else len((doc_text or "").encode("utf-8"))
     )
+    query_provenance = retrieval_query_provenance(
+        retrieval_query,
+        (
+            RetrievalQueryOrigin.EXPLICIT
+            if retrieval_query is not None
+            else RetrievalQueryOrigin.ABSENT
+        ),
+    )
     log_event(
         "process_doc_request_received",
         user_id=current_user.user_id,
@@ -3142,6 +3165,7 @@ async def process_doc(
         payload_bytes=payload_bytes,
         payload_stage_backend=_process_doc_payload_stage_backend_for_key(staged_payload_key),
         staged_via_redis=_process_doc_payload_stage_backend_for_key(staged_payload_key) == "redis",
+        **query_provenance.trace_fields(),
     )
 
     with compair.Session() as session:
@@ -3183,17 +3207,28 @@ async def process_doc(
         seen_reference_doc_ids.add(cleaned)
         cleaned_reference_doc_ids.append(cleaned)
 
-    task_result = _dispatch_process_document_task(
-        user_id=current_user.user_id,
-        doc_id=doc_id,
-        doc_text=doc_text,
-        generate_feedback=generate_feedback,
-        chunk_mode=chunk_mode,
-        reanalyze_existing=reanalyze_existing,
-        snapshot_payload_key=staged_payload_key,
-        reference_doc_ids=cleaned_reference_doc_ids or None,
-        focus_manifest=focus_manifest,
-    )
+    try:
+        task_result = _dispatch_process_document_task(
+            user_id=current_user.user_id,
+            doc_id=doc_id,
+            doc_text=doc_text,
+            generate_feedback=generate_feedback,
+            chunk_mode=chunk_mode,
+            reanalyze_existing=reanalyze_existing,
+            snapshot_payload_key=staged_payload_key,
+            reference_doc_ids=cleaned_reference_doc_ids or None,
+            focus_manifest=focus_manifest,
+            retrieval_query=retrieval_query,
+            allow_insecure_local_query_transport=bool(
+                getattr(
+                    settings,
+                    "retrieval_query_allow_insecure_local_transport",
+                    False,
+                )
+            ),
+        )
+    except RetrievalQueryTransportPolicyError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     task_id = getattr(task_result, "id", None)
 
     if generate_feedback:
@@ -6683,6 +6718,7 @@ def create_fastapi_app():
 
     fastapi_app = FastAPI()
     fastapi_app.include_router(router)
+    attach_service_resource_metrics(fastapi_app)
     return fastapi_app
 
 

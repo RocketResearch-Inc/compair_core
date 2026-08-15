@@ -114,7 +114,620 @@ class DummyChunk:
     chunk_id: str | None = None
 
 
+class _SelectionField:
+    def __eq__(self, other):
+        return ("eq", other)
+
+    def __ne__(self, other):
+        return ("ne", other)
+
+    def in_(self, values):
+        return ("in", tuple(values))
+
+    def is_(self, value):
+        return ("is", value)
+
+
+def _install_selection_fields() -> None:
+    for name in (
+        "chunk_id",
+        "hash",
+        "embedding",
+        "document_id",
+        "chunk_type",
+        "note_id",
+        "content",
+        "document",
+    ):
+        setattr(main.Chunk, name, _SelectionField())
+    for name in ("document_id", "groups", "is_published"):
+        setattr(main.Document, name, _SelectionField())
+    main.Group.group_id = _SelectionField()
+    main.User.user_id = _SelectionField()
+
+
+class _SelectionQuery:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def options(self, *args, **kwargs):
+        return self
+
+    def filter(self, *args, **kwargs):
+        return self
+
+    def join(self, *args, **kwargs):
+        return self
+
+    def all(self):
+        return list(self.rows)
+
+    def first(self):
+        return self.rows[0] if self.rows else None
+
+
+class _BridgeSession:
+    def __init__(self, candidates):
+        self.candidates = candidates
+
+    def query(self, model):
+        if model is main.Chunk:
+            return _SelectionQuery(self.candidates)
+        raise AssertionError(f"unexpected query model: {model}")
+
+
+def _bridge_subjects(candidates):
+    _install_selection_fields()
+    source = types.SimpleNamespace(
+        chunk_id="source",
+        embedding=[1.0, 0.0],
+        document_id="source-doc",
+        chunk_type="document",
+        content="source text",
+    )
+    user = types.SimpleNamespace(user_id="user")
+    doc = types.SimpleNamespace(
+        document_id="source-doc",
+        groups=[types.SimpleNamespace(group_id="group")],
+    )
+    return _BridgeSession(candidates), user, doc, source
+
+
 class MainRetrievalTests(unittest.TestCase):
+    def test_process_text_passes_explicit_query_to_retrieval_engine_unchanged(self) -> None:
+        _install_selection_fields()
+        text = "source text"
+        source = types.SimpleNamespace(
+            chunk_id="source",
+            hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            embedding=[1.0, 0.0],
+            document_id="source-doc",
+            note_id=None,
+            chunk_type="document",
+            content=text,
+        )
+        user = types.SimpleNamespace(user_id="user")
+        doc = types.SimpleNamespace(
+            document_id="source-doc",
+            author_id="user",
+            groups=[types.SimpleNamespace(group_id="group")],
+        )
+
+        class Session:
+            def query(self, model):
+                if model is main.User:
+                    return _SelectionQuery([user])
+                if model is main.Chunk:
+                    return _SelectionQuery([source])
+                raise AssertionError(f"unexpected query model: {model}")
+
+            def commit(self):
+                return None
+
+        captured = {}
+
+        def retrieval_spy(**kwargs):
+            captured.update(kwargs)
+            return []
+
+        query = "diff --git a/source.py b/source.py\n-old\n+new\n"
+        with mock.patch.object(main, "retrieve_reference_evidence", side_effect=retrieval_spy):
+            main.process_text(
+                Session(),
+                embedder=object(),
+                reviewer=object(),
+                doc=doc,
+                text=text,
+                retrieval_query=query,
+            )
+
+        request = captured["request"]
+        self.assertEqual(request.retrieval_query, query)
+        self.assertEqual(request.retrieval_query_origin.value, "explicit")
+
+    def test_process_document_passes_retrieval_query_to_process_text(self) -> None:
+        _install_selection_fields()
+        main.Feedback.source_chunk_id = _SelectionField()
+
+        class TimestampField:
+            def __ge__(self, other):
+                return ("ge", other)
+
+        main.Feedback.timestamp = TimestampField()
+        query = "diff --git a/source.py b/source.py\n+changed = True\n"
+        user = types.SimpleNamespace(user_id="user")
+        doc = types.SimpleNamespace(
+            document_id="source-doc",
+            author_id="user",
+            content="a sufficiently long source chunk",
+            topic_tags=[],
+            groups=[],
+        )
+
+        class CountQuery:
+            def __iter__(self):
+                return iter(())
+
+            def filter(self, *args, **kwargs):
+                return self
+
+            def count(self):
+                return 0
+
+        session = types.SimpleNamespace(
+            query=lambda model: CountQuery(),
+            commit=lambda: None,
+        )
+
+        with (
+            mock.patch.object(main, "get_history", return_value=types.SimpleNamespace(deleted=[])),
+            mock.patch.object(main, "chunk_text_with_mode", return_value=[doc.content]),
+            mock.patch.object(main, "extract_topic_tags", return_value=[]),
+            mock.patch.object(main, "is_code_review_document", return_value=False),
+            mock.patch.object(main, "detect_significant_edits", return_value=[0]),
+            mock.patch.object(main, "count_tokens", return_value=200),
+            mock.patch.object(main, "create_embeddings", return_value=[[1.0, 0.0]]),
+            mock.patch.object(main, "process_text") as process_text_spy,
+        ):
+            main.process_document(
+                user,
+                session,
+                embedder=object(),
+                reviewer=object(),
+                doc=doc,
+                retrieval_query=query,
+            )
+
+        self.assertEqual(process_text_spy.call_count, 1)
+        self.assertEqual(process_text_spy.call_args.kwargs["retrieval_query"], query)
+
+    def test_legacy_trace_hashes_query_without_recording_text(self) -> None:
+        session, user, doc, source = _bridge_subjects([])
+        query = "diff --git a/source.py b/source.py\n+private value\n"
+        request = main.RetrievalRequest(
+            request_id="source",
+            changed_repository=None,
+            repository_roots=(),
+            corpus_version="",
+            retrieval_query=query,
+            retrieval_query_origin=main.RetrievalQueryOrigin.EXPLICIT,
+            corpus_complete=False,
+        )
+        events = []
+
+        with (
+            mock.patch.object(main, "VECTOR_BACKEND", "json"),
+            mock.patch.object(main, "_allow_same_document_feedback", return_value=False),
+            mock.patch.object(main, "_reference_trace_enabled", return_value=True),
+            mock.patch.object(main, "log_event", side_effect=lambda name, **values: events.append((name, values))),
+        ):
+            main._select_legacy_reference_chunks(
+                session,
+                embedder=object(),
+                user=user,
+                doc=doc,
+                existing_chunk=source,
+                text="source text",
+                code_focus=False,
+                query_embedding=None,
+                focus_text="",
+                change_context="",
+                reference_doc_ids=None,
+                retrieval_request=request,
+            )
+
+        trace = next(values for name, values in events if name == "feedback_reference_trace")
+        self.assertEqual(trace["retrieval_query_sha256"], hashlib.sha256(query.encode()).hexdigest())
+        self.assertEqual(trace["retrieval_query_length"], len(query))
+        self.assertEqual(trace["retrieval_query_origin"], "explicit")
+        self.assertNotIn(query, repr(trace))
+
+    def test_legacy_trace_marks_its_existing_query_as_derived(self) -> None:
+        session, user, doc, source = _bridge_subjects([])
+        events = []
+
+        with (
+            mock.patch.object(main, "VECTOR_BACKEND", "json"),
+            mock.patch.object(main, "_allow_same_document_feedback", return_value=False),
+            mock.patch.object(main, "_reference_trace_enabled", return_value=True),
+            mock.patch.object(main, "log_event", side_effect=lambda name, **values: events.append((name, values))),
+        ):
+            main._select_legacy_reference_chunks(
+                session,
+                embedder=object(),
+                user=user,
+                doc=doc,
+                existing_chunk=source,
+                text="source text",
+                code_focus=False,
+                query_embedding=None,
+                focus_text="",
+                change_context="",
+                reference_doc_ids=None,
+            )
+
+        trace = next(values for name, values in events if name == "feedback_reference_trace")
+        self.assertEqual(trace["retrieval_query_origin"], "legacy_derived")
+        self.assertEqual(trace["retrieval_query_length"], len("source text"))
+        self.assertEqual(
+            trace["retrieval_query_sha256"],
+            hashlib.sha256(b"source text").hexdigest(),
+        )
+
+    def test_legacy_selection_bridge_empty_candidates_snapshot(self) -> None:
+        session, user, doc, source = _bridge_subjects([])
+        with (
+            mock.patch.object(main, "VECTOR_BACKEND", "json"),
+            mock.patch.object(main, "_is_code_review_chunk", return_value=False),
+            mock.patch.object(main, "_allow_same_document_feedback", return_value=False),
+            mock.patch.object(main, "_reference_trace_enabled", return_value=False),
+        ):
+            selected = main._select_legacy_reference_chunks(
+                session,
+                embedder=object(),
+                user=user,
+                doc=doc,
+                existing_chunk=source,
+                text="source text",
+                code_focus=False,
+                query_embedding=None,
+                focus_text="",
+                change_context="",
+                reference_doc_ids=None,
+            )
+
+        self.assertEqual(selected, [])
+
+    def test_process_text_empty_selection_persists_and_generates_nothing(self) -> None:
+        _install_selection_fields()
+        text = "source text"
+        source = types.SimpleNamespace(
+            chunk_id="source",
+            hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            embedding=[1.0, 0.0],
+            document_id="source-doc",
+            note_id=None,
+            chunk_type="document",
+            content=text,
+        )
+        user = types.SimpleNamespace(user_id="user")
+        doc = types.SimpleNamespace(
+            document_id="source-doc",
+            author_id="user",
+            groups=[types.SimpleNamespace(group_id="group")],
+        )
+
+        class Session:
+            def __init__(self):
+                self.persisted = []
+
+            def query(self, model):
+                if model is main.User:
+                    return _SelectionQuery([user])
+                if model is main.Chunk:
+                    return _SelectionQuery([source])
+                raise AssertionError(f"unexpected query model: {model}")
+
+            def commit(self):
+                return None
+
+            def add_all(self, values):
+                self.persisted.extend(values)
+
+        session = Session()
+        with (
+            mock.patch.object(main, "_select_legacy_reference_chunks", return_value=[]),
+            mock.patch.object(main, "get_feedback") as feedback,
+        ):
+            main.process_text(
+                session,
+                embedder=object(),
+                reviewer=object(),
+                doc=doc,
+                text=text,
+            )
+
+        self.assertEqual(session.persisted, [])
+        feedback.assert_not_called()
+
+    def test_legacy_selection_bridge_preserves_input_order_for_vector_ties(self) -> None:
+        candidates = [
+            DummyChunk(content=f"candidate {index}", chunk_id=f"peer-{index}")
+            for index in range(1, 6)
+        ]
+        for candidate in candidates:
+            candidate.embedding = [1.0, 0.0]
+        session, user, doc, source = _bridge_subjects(candidates)
+
+        with (
+            mock.patch.object(main, "VECTOR_BACKEND", "json"),
+            mock.patch.object(main, "_is_code_review_chunk", return_value=False),
+            mock.patch.object(main, "_allow_same_document_feedback", return_value=False),
+            mock.patch.object(main, "_reference_selection_config", return_value=(6, 4, 2)),
+            mock.patch.object(main, "_reference_effective_vector_fetch_limit", return_value=6),
+            mock.patch.object(
+                main,
+                "_filter_reference_candidates",
+                side_effect=lambda values, **kwargs: (list(values), {}),
+            ),
+            mock.patch.object(main, "_reference_trace_enabled", return_value=False),
+        ):
+            selected = main._select_legacy_reference_chunks(
+                session,
+                embedder=object(),
+                user=user,
+                doc=doc,
+                existing_chunk=source,
+                text="source text",
+                code_focus=False,
+                query_embedding=None,
+                focus_text="",
+                change_context="",
+                reference_doc_ids=None,
+            )
+
+        self.assertEqual(selected, candidates[:4])
+        self.assertTrue(all(actual is expected for actual, expected in zip(selected, candidates)))
+
+    def test_legacy_selection_bridge_code_hybrid_lane_snapshot(self) -> None:
+        candidates = [
+            DummyChunk(
+                content=f"### File: src/{name}.py\nvalue = '{name}'\n",
+                chunk_id=name,
+                document_id=f"doc-{name}",
+            )
+            for name in ("vector-1", "lexical-1", "fts-1", "counterpart-1", "anchor-1")
+        ]
+        for index, candidate in enumerate(candidates):
+            candidate.embedding = [1.0 - (index * 0.1), index * 0.1]
+        session, user, doc, source = _bridge_subjects(candidates)
+        captured_order = []
+
+        def capture_rerank(target_text, merged, **kwargs):
+            captured_order.extend(merged)
+            debug_stats = kwargs.get("debug_stats")
+            if isinstance(debug_stats, dict):
+                debug_stats["hybrid_enabled"] = True
+            return list(merged[:4])
+
+        with (
+            mock.patch.dict(os.environ, {"COMPAIR_REFERENCE_HYBRID_ENABLED": "1"}),
+            mock.patch.object(main, "VECTOR_BACKEND", "json"),
+            mock.patch.object(main, "_is_code_review_chunk", return_value=True),
+            mock.patch.object(main, "_allow_same_document_feedback", return_value=False),
+            mock.patch.object(main, "_reference_query_variants", return_value=[("primary", "source text")]),
+            mock.patch.object(main, "_reference_selection_config", return_value=(6, 4, 2)),
+            mock.patch.object(main, "_reference_merge_limit", return_value=10),
+            mock.patch.object(main, "_reference_effective_vector_fetch_limit", return_value=6),
+            mock.patch.object(
+                main,
+                "_filter_reference_candidates",
+                side_effect=lambda values, **kwargs: (list(values), {}),
+            ),
+            mock.patch.object(main, "_reference_fts_candidates", return_value=[candidates[2]]),
+            mock.patch.object(main, "_lexical_reference_candidates", return_value=[candidates[1]]),
+            mock.patch.object(main, "_anchor_reference_candidates", return_value=[candidates[4]]),
+            mock.patch.object(main, "_reference_counterpart_candidates", return_value=[candidates[3]]),
+            mock.patch.object(main, "_rerank_reference_chunks", side_effect=capture_rerank),
+            mock.patch.object(main, "_reference_trace_enabled", return_value=False),
+        ):
+            self.assertTrue(main._reference_hybrid_enabled())
+            selected = main._select_legacy_reference_chunks(
+                session,
+                embedder=object(),
+                user=user,
+                doc=doc,
+                existing_chunk=source,
+                text="source text",
+                code_focus=True,
+                query_embedding=None,
+                focus_text="",
+                change_context="",
+                reference_doc_ids=None,
+            )
+
+        expected_order = [
+            candidates[0],
+            candidates[2],
+            candidates[3],
+            candidates[4],
+            candidates[1],
+        ]
+        self.assertEqual(captured_order, expected_order)
+        self.assertEqual(selected, expected_order[:4])
+
+    def test_process_text_legacy_selection_snapshot_preserves_chunk_identity_and_order(self) -> None:
+        class Field:
+            def __eq__(self, other):
+                return ("eq", other)
+
+            def __ne__(self, other):
+                return ("ne", other)
+
+            def in_(self, values):
+                return ("in", tuple(values))
+
+            def is_(self, value):
+                return ("is", value)
+
+        for name in (
+            "chunk_id",
+            "hash",
+            "embedding",
+            "document_id",
+            "chunk_type",
+            "note_id",
+            "content",
+            "document",
+        ):
+            setattr(main.Chunk, name, Field())
+        for name in ("document_id", "groups", "is_published"):
+            setattr(main.Document, name, Field())
+        main.Group.group_id = Field()
+        main.User.user_id = Field()
+
+        text = "A plain source chunk used for a stable retrieval snapshot."
+        chunk_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        source = types.SimpleNamespace(
+            chunk_id="source",
+            hash=chunk_hash,
+            embedding=[1.0, 0.0],
+            document_id="source-doc",
+            note_id=None,
+            chunk_type="document",
+            content=text,
+        )
+        candidates = [
+            types.SimpleNamespace(
+                chunk_id="peer-a",
+                embedding=[0.0, 1.0],
+                document_id="peer-doc-a",
+                note_id=None,
+                chunk_type="document",
+                content="candidate a",
+            ),
+            types.SimpleNamespace(
+                chunk_id="peer-b",
+                embedding=[0.6, 0.8],
+                document_id="peer-doc-b",
+                note_id=None,
+                chunk_type="document",
+                content="candidate b",
+            ),
+            types.SimpleNamespace(
+                chunk_id="peer-c",
+                embedding=[1.0, 0.0],
+                document_id="peer-doc-c",
+                note_id=None,
+                chunk_type="document",
+                content="candidate c",
+            ),
+            types.SimpleNamespace(
+                chunk_id="peer-d",
+                embedding=[0.8, 0.6],
+                document_id="peer-doc-d",
+                note_id=None,
+                chunk_type="document",
+                content="candidate d",
+            ),
+            types.SimpleNamespace(
+                chunk_id="peer-e",
+                embedding=[-1.0, 0.0],
+                document_id="peer-doc-e",
+                note_id=None,
+                chunk_type="document",
+                content="candidate e",
+            ),
+        ]
+        user = types.SimpleNamespace(user_id="user")
+        doc = types.SimpleNamespace(
+            document_id="source-doc",
+            author_id="user",
+            groups=[types.SimpleNamespace(group_id="group")],
+        )
+
+        class Query:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def options(self, *args, **kwargs):
+                return self
+
+            def filter(self, *args, **kwargs):
+                return self
+
+            def join(self, *args, **kwargs):
+                return self
+
+            def all(self):
+                return list(self.rows)
+
+            def first(self):
+                return self.rows[0] if self.rows else None
+
+        class Session:
+            def __init__(self):
+                self.chunk_query_count = 0
+                self.persisted = []
+
+            def query(self, model):
+                if model is main.User:
+                    return Query([user])
+                if model is main.Chunk:
+                    self.chunk_query_count += 1
+                    return Query([source] if self.chunk_query_count == 1 else candidates)
+                raise AssertionError(f"unexpected query model: {model}")
+
+            def commit(self):
+                return None
+
+            def add_all(self, values):
+                self.persisted.extend(values)
+
+        class CapturedReference:
+            def __init__(self, **values):
+                self.__dict__.update(values)
+
+        captured_generation_references = []
+
+        def capture_feedback(reviewer, document, source_text, references, current_user, **kwargs):
+            captured_generation_references.extend(references)
+            return "NONE"
+
+        session = Session()
+        with (
+            mock.patch.object(main, "VECTOR_BACKEND", "json"),
+            mock.patch.object(main, "Reference", CapturedReference),
+            mock.patch.object(main, "get_feedback", side_effect=capture_feedback),
+            mock.patch.object(main, "_is_code_review_chunk", return_value=False),
+            mock.patch.object(main, "_allow_same_document_feedback", return_value=False),
+            mock.patch.object(main, "_reference_selection_config", return_value=(6, 4, 2)),
+            mock.patch.object(main, "_reference_effective_vector_fetch_limit", return_value=6),
+            mock.patch.object(
+                main,
+                "_filter_reference_candidates",
+                side_effect=lambda values, **kwargs: (list(values), {}),
+            ),
+            mock.patch.object(main, "_reference_trace_enabled", return_value=False),
+        ):
+            main.process_text(
+                session,
+                embedder=object(),
+                reviewer=types.SimpleNamespace(model="fixture", provider="fixture"),
+                doc=doc,
+                text=text,
+            )
+
+        expected = [candidates[2], candidates[3], candidates[1], candidates[0]]
+        self.assertEqual(captured_generation_references, expected)
+        self.assertTrue(
+            all(actual is expected_chunk for actual, expected_chunk in zip(captured_generation_references, expected))
+        )
+        self.assertEqual(
+            [reference.reference_chunk_id for reference in session.persisted],
+            ["peer-c", "peer-d", "peer-b", "peer-a"],
+        )
+
     def test_reference_scope_allows_same_document_when_explicitly_requested(self) -> None:
         self.assertTrue(
             main._reference_scope_allows_same_document(

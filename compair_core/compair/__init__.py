@@ -166,12 +166,26 @@ def _ensure_pgvector_extension() -> None:
         print(f"[compair_core] pgvector extension setup skipped: {exc}", file=sys.stderr)
 
 
+def _ensure_retrieval_corpus_tables() -> None:
+    """Add Phase 2B1 tables without altering or rebuilding existing data."""
+
+    try:
+        from .retrieval.corpus import ensure_retrieval_corpus_schema
+
+        ensure_retrieval_corpus_schema(engine)
+    except Exception as exc:
+        # Legacy startup remains available; baseline readiness fails closed when
+        # these tables are absent or incompatible.
+        print(f"[compair_core] retrieval corpus migration skipped: {exc}", file=sys.stderr)
+
+
 def initialize_database() -> None:
     _ensure_pgvector_extension()
     if edition == "cloud" and initialize_database_override:
         initialize_database_override(engine)
     else:
         models.Base.metadata.create_all(engine)
+    _ensure_retrieval_corpus_tables()
     _ensure_user_retrial_count_default()
     _ensure_notification_preferences_delivery_columns()
     _ensure_reference_chunk_id_column()

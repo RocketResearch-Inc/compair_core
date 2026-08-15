@@ -4,11 +4,30 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
 
-from ..settings import Settings, get_settings
 from ...compair.notifications.service import is_scoring_enabled
+from ...compair.retrieval.embedding import assess_baseline_embedding
+from ...compair.retrieval.transport import assess_retrieval_query_transport
 from ...db import engine
+from ..settings import Settings, get_settings
 
 router = APIRouter(tags=["meta"])
+
+
+def _retrieval_query_transport(settings: Settings) -> dict[str, object]:
+    # Import lazily so capability discovery preserves Core's optional Cloud
+    # task boundary and reports the task implementation actually installed.
+    from ...compair.tasks import process_document_task
+
+    return assess_retrieval_query_transport(
+        process_document_task,
+        allow_insecure_local_transport=(
+            settings.retrieval_query_allow_insecure_local_transport
+        ),
+    ).as_dict()
+
+
+def _baseline_embedding(settings: Settings) -> dict[str, object]:
+    return assess_baseline_embedding(settings).as_dict()
 
 
 @router.get("/capabilities")
@@ -56,6 +75,8 @@ def capabilities(settings: Settings = Depends(get_settings)) -> dict[str, object
             "notification_preferences": True,
             "notification_delivery": edition == "cloud",
         },
+        "baseline_embedding": _baseline_embedding(settings),
+        "retrieval_query_transport": _retrieval_query_transport(settings),
         "server": "Compair Cloud" if edition == "cloud" else "Compair Core",
         "version": settings.version,
         "legacy_routes": settings.include_legacy_routes,
@@ -73,4 +94,6 @@ def health(settings: Settings = Depends(get_settings)) -> dict[str, object]:
         "status": "ok",
         "edition": settings.edition,
         "version": settings.version,
+        "baseline_embedding": _baseline_embedding(settings),
+        "retrieval_query_transport": _retrieval_query_transport(settings),
     }

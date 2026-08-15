@@ -1,6 +1,8 @@
 """Application settings and feature flag definitions."""
 from functools import lru_cache
+from typing import Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -22,6 +24,25 @@ class Settings(BaseSettings):
     single_user_name: str = "Compair Local User"
     include_legacy_routes: bool = False
     cors_allow_origins: str | None = None
+
+    # Explicit retrieval-query transport. This is intentionally off by
+    # default and can only relax policy for direct/eager/test/loopback paths.
+    retrieval_query_allow_insecure_local_transport: bool = False
+
+    # Baseline_v1 uses a separate fail-closed embedding provider. It never
+    # inherits or falls back to the legacy embedding configuration.
+    baseline_embedding_provider: Literal["disabled", "http"] = "disabled"
+    baseline_embedding_endpoint: str | None = None
+    baseline_embedding_model: str = "BAAI/bge-small-en-v1.5"
+    baseline_embedding_revision: str | None = None
+    baseline_embedding_dimension: int = Field(default=384, ge=1, le=8192)
+    baseline_embedding_timeout_seconds: float = Field(
+        default=10.0,
+        ge=0.1,
+        le=60.0,
+    )
+    baseline_embedding_batch_size: int = Field(default=32, ge=1, le=256)
+    baseline_embedding_allow_insecure_loopback: bool = False
 
     # Core/local storage defaults
     local_upload_dir: str = "~/.compair-core/data/uploads"

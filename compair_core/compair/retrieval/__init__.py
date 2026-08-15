@@ -1,0 +1,65 @@
+"""Pure retrieval engines and their versioned internal contracts."""
+
+from .baseline import (
+    BASELINE_DOCUMENT_FORMAT_VERSION,
+    BASELINE_TOKENIZER_VERSION,
+    BaselineV1Retriever,
+    baseline_ranking_document,
+    bm25_scores,
+    enumerate_file_candidates,
+    frozen_tokens,
+    reciprocal_rank_fusion,
+)
+from .factory import (
+    BASELINE_RETRIEVAL_ENGINE,
+    DEFAULT_RETRIEVAL_ENGINE,
+    BaselineV1Invocation,
+    UnknownRetrievalEngineError,
+    create_retrieval_engine,
+    invoke_retrieval,
+    retrieve_reference_evidence,
+)
+from .legacy import LegacyRetriever
+from .types import (
+    DenseEmbeddingProvider,
+    FileCandidate,
+    RetrievalCandidate,
+    RetrievalError,
+    RetrievalEvidence,
+    RetrievalQueryOrigin,
+    RetrievalQueryProvenance,
+    RetrievalRequest,
+    RetrievalResult,
+    RetrievalStatus,
+    retrieval_query_provenance,
+)
+
+__all__ = [
+    "BASELINE_DOCUMENT_FORMAT_VERSION",
+    "BASELINE_RETRIEVAL_ENGINE",
+    "BASELINE_TOKENIZER_VERSION",
+    "DEFAULT_RETRIEVAL_ENGINE",
+    "BaselineV1Invocation",
+    "BaselineV1Retriever",
+    "DenseEmbeddingProvider",
+    "FileCandidate",
+    "LegacyRetriever",
+    "RetrievalCandidate",
+    "RetrievalError",
+    "RetrievalEvidence",
+    "RetrievalQueryOrigin",
+    "RetrievalQueryProvenance",
+    "RetrievalRequest",
+    "RetrievalResult",
+    "RetrievalStatus",
+    "UnknownRetrievalEngineError",
+    "baseline_ranking_document",
+    "bm25_scores",
+    "create_retrieval_engine",
+    "enumerate_file_candidates",
+    "frozen_tokens",
+    "invoke_retrieval",
+    "reciprocal_rank_fusion",
+    "retrieval_query_provenance",
+    "retrieve_reference_evidence",
+]

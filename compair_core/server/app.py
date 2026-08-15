@@ -13,6 +13,7 @@ from .deps import (
     get_storage,
 )
 from .providers.local_storage import LocalStorage
+from .resource_metrics import attach_service_resource_metrics
 from .routers.capabilities import router as capabilities_router
 from .settings import Settings, get_settings
 from .telemetry import start_usage_telemetry
@@ -72,6 +73,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         else:
             app.include_router(core_router)
     app.include_router(capabilities_router)
+    attach_service_resource_metrics(app)
 
     # Share the resolved settings with request handlers
     app.dependency_overrides[get_settings_dependency] = lambda: resolved_settings
