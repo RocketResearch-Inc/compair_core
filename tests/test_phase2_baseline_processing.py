@@ -37,6 +37,7 @@ from compair_core.compair.retrieval.corpus import CorpusFileInput
 from compair_core.compair.retrieval.evidence_persistence import (
     BaselineEvidencePersistenceService,
 )
+from compair_core.compair.retrieval.generation import BaselineGenerationService
 from compair_core.compair.retrieval.indexing import (
     BaselineEmbeddingIdentity,
     BaselineIndexBuilder,
@@ -131,6 +132,20 @@ class _CapturingRetriever:
     def retrieve(self, request):
         self.requests.append(request)
         return self.wrapped.retrieve(request)
+
+
+class _FixtureGenerationProvider:
+    provider = "fixture-generation"
+    model = "fixture-reviewer"
+    version = "fixture-reviewer-r1"
+    supports_idempotency = False
+
+    def generate(self, generation_input, *, idempotency_key):
+        del idempotency_key
+        assert [item.ordinal for item in generation_input.evidence] == list(
+            range(1, len(generation_input.evidence) + 1)
+        )
+        return "fixture baseline finding"
 
 
 class _RevokingRetriever:
@@ -234,7 +249,12 @@ def _install_actual_task_path(
     monkeypatch.setattr(
         main,
         "_baseline_runtime_components",
-        lambda: (retriever, persistence_service),
+        lambda: (
+            retriever,
+            persistence_service,
+            BaselineGenerationService(environment.sessions),
+            _FixtureGenerationProvider(),
+        ),
     )
     return generation, embedding, events
 
@@ -370,7 +390,7 @@ def _add_authorized_group_with_publication(
     return group_id, paths
 
 
-def test_actual_baseline_task_path_persists_order_and_bypasses_generation(
+def test_actual_baseline_task_path_persists_order_and_generates_without_notifications(
     tmp_path: Path,
     monkeypatch,
     request,
@@ -387,9 +407,11 @@ def test_actual_baseline_task_path_persists_order_and_bypasses_generation(
         task_result = _run_task(environment, parent_key)
 
         outcome = task_result["baseline_processing"]["outcomes"][0]
-        assert outcome["status"] == BaselineProcessingStatus.REFERENCES_PERSISTED.value
+        assert outcome["status"] == BaselineProcessingStatus.FEEDBACK_PERSISTED.value
         assert outcome["retrieval_status"] == "ok"
-        assert outcome["generation_bypassed"] is True
+        assert outcome["generation_bypassed"] is False
+        assert outcome["generation_state"] == "succeeded"
+        assert outcome["feedback_count"] == 1
         assert outcome["selected_reference_count"] == 4
         assert outcome["idempotent_replay"] is False
         assert outcome["group_id"] == environment.group_id
@@ -411,7 +433,7 @@ def test_actual_baseline_task_path_persists_order_and_bypasses_generation(
         assert all(row.reference_type == "baseline_file" for row in rows)
         assert all(row.reference_chunk_id is None for row in rows)
         assert all(row.reference_document_id is None for row in rows)
-        assert persistence_counts(environment.engine) == (1, 4, 4, 4, 0)
+        assert persistence_counts(environment.engine) == (1, 4, 4, 4, 1)
         with environment.engine.connect() as connection:
             assert connection.execute(text("SELECT count(*) FROM notification_event")).scalar_one() == 0
         generation.assert_not_called()
@@ -451,7 +473,7 @@ def test_task_retry_reuses_per_chunk_intent_without_duplicates(
         assert replay["baseline_processing"]["parent_run_trace_id"] == (
             processing_run_trace_id(parent_key, environment.group_id)
         )
-        assert persistence_counts(environment.engine) == (1, 4, 4, 4, 0)
+        assert persistence_counts(environment.engine) == (1, 4, 4, 4, 1)
         with environment.engine.connect() as connection:
             durable_key = connection.execute(
                 text("SELECT idempotency_key FROM baseline_retrieval_run")
@@ -544,7 +566,7 @@ def test_missing_explicit_group_returns_structured_zero_write_outcome(
         result = _run_task(environment, parent_key, group_id=None)
 
         processing = result["baseline_processing"]
-        assert processing["schema_version"] == "baseline-document-processing.v2"
+        assert processing["schema_version"] == "baseline-document-processing.v3"
         assert processing["status"] == "error"
         assert processing["error_code"] == "explicit_group_id_absent"
         assert processing["group_id"] is None
@@ -680,8 +702,8 @@ def test_document_in_two_groups_selects_only_explicit_group_publication(
         outcome_b = result_b["baseline_processing"]["outcomes"][0]
         assert outcome_a["group_id"] == environment.group_id
         assert outcome_b["group_id"] == group_b
-        assert outcome_a["status"] == "references_persisted"
-        assert outcome_b["status"] == "references_persisted"
+        assert outcome_a["status"] == "feedback_persisted"
+        assert outcome_b["status"] == "feedback_persisted"
         assert outcome_a["parent_run_trace_id"] == processing_run_trace_id(
             parent_key,
             environment.group_id,
@@ -719,7 +741,7 @@ def test_document_in_two_groups_selects_only_explicit_group_publication(
             )
         assert run_groups == {environment.group_id, group_b}
         assert len({row.idempotency_key for row in run_rows}) == 2
-        assert persistence_counts(environment.engine) == (2, 8, 8, 8, 0)
+        assert persistence_counts(environment.engine) == (2, 8, 8, 8, 2)
     finally:
         environment.engine.dispose()
 
@@ -816,7 +838,7 @@ def test_retry_after_group_authorization_deletion_writes_nothing_new(
         retry = _run_task(environment, parent_key)
 
         assert first["baseline_processing"]["outcomes"][0]["status"] == (
-            "references_persisted"
+            "feedback_persisted"
         )
         retry_outcome = retry["baseline_processing"]
         assert retry_outcome["status"] == "error"
@@ -840,7 +862,7 @@ def test_retry_after_selected_group_deletion_returns_structured_zero_write_outco
         _install_actual_task_path(monkeypatch, environment)
         parent_key = new_processing_run_key()
         first = _run_task(environment, parent_key)
-        assert first["baseline_processing"]["status"] == "references_persisted"
+        assert first["baseline_processing"]["status"] == "feedback_persisted"
         with environment.engine.begin() as connection:
             connection.execute(
                 text('DELETE FROM "group" WHERE group_id = :group_id'),
@@ -929,9 +951,9 @@ def test_document_outcome_preserves_actual_per_chunk_order(
             chunk_ids_by_content["second source chunk"],
         ]
         assert all(outcome["group_id"] == environment.group_id for outcome in outcomes)
-        assert all(outcome["status"] == "references_persisted" for outcome in outcomes)
+        assert all(outcome["status"] == "feedback_persisted" for outcome in outcomes)
         assert [outcome["selected_reference_count"] for outcome in outcomes] == [4, 4]
-        assert persistence_counts(environment.engine) == (2, 4, 8, 8, 0)
+        assert persistence_counts(environment.engine) == (2, 4, 8, 8, 2)
     finally:
         environment.engine.dispose()
 

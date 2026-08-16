@@ -65,12 +65,12 @@ def test_postgres_actual_baseline_processing_and_retry(
 
         first_outcome = first["baseline_processing"]["outcomes"][0]
         replay_outcome = replay["baseline_processing"]["outcomes"][0]
-        assert first_outcome["status"] == "references_persisted"
+        assert first_outcome["status"] == "feedback_persisted"
         assert first_outcome["group_id"] == environment.group_id
         assert first_outcome["idempotent_replay"] is False
         assert replay_outcome["group_id"] == environment.group_id
         assert replay_outcome["idempotent_replay"] is True
-        assert persistence_counts(scoped_engine) == (1, 4, 4, 4, 0)
+        assert persistence_counts(scoped_engine) == (1, 4, 4, 4, 1)
         assert [row.ordinal for row in _baseline_reference_rows(environment)] == [
             1,
             2,

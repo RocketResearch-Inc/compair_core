@@ -10,8 +10,8 @@ from enum import Enum
 
 from .types import RetrievalQueryProvenance, RetrievalResult
 
-BASELINE_PROCESSING_OUTCOME_SCHEMA_VERSION = "baseline-processing-outcome.v2"
-BASELINE_DOCUMENT_PROCESSING_SCHEMA_VERSION = "baseline-document-processing.v2"
+BASELINE_PROCESSING_OUTCOME_SCHEMA_VERSION = "baseline-processing-outcome.v3"
+BASELINE_DOCUMENT_PROCESSING_SCHEMA_VERSION = "baseline-document-processing.v3"
 PROCESSING_RUN_KEY_BYTES = 32
 MAX_BASELINE_GROUP_ID_LENGTH = 36
 
@@ -22,6 +22,10 @@ class ProcessingRunIdentityError(ValueError):
 
 class BaselineProcessingStatus(str, Enum):
     REFERENCES_PERSISTED = "references_persisted"
+    FEEDBACK_PERSISTED = "feedback_persisted"
+    GENERATION_RETRYABLE_FAILED = "generation_retryable_failed"
+    GENERATION_TERMINAL_FAILED = "generation_terminal_failed"
+    GENERATION_BLOCKED = "generation_blocked"
     INSUFFICIENT = "insufficient"
     ERROR = "error"
 
@@ -111,7 +115,7 @@ def derive_baseline_persistence_idempotency_key(
 
 @dataclass(frozen=True, slots=True)
 class BaselineProcessingOutcome:
-    """Versioned retrieval/persistence outcome; generation is always bypassed."""
+    """Versioned retrieval, persistence, and baseline-generation outcome."""
 
     status: BaselineProcessingStatus
     retrieval_status: str
@@ -132,6 +136,11 @@ class BaselineProcessingOutcome:
     embedding_fingerprint: str | None = None
     engine: str = "baseline_v1"
     generation_bypassed: bool = True
+    generation_state: str | None = None
+    generation_attempt_count: int = 0
+    feedback_count: int = 0
+    generation_input_fingerprint: str | None = None
+    generation_output_fingerprint: str | None = None
     schema_version: str = BASELINE_PROCESSING_OUTCOME_SCHEMA_VERSION
 
     @classmethod
@@ -147,6 +156,12 @@ class BaselineProcessingOutcome:
         persistence_run_id: str | None = None,
         idempotent_replay: bool = False,
         error_code: str | None = None,
+        generation_bypassed: bool = True,
+        generation_state: str | None = None,
+        generation_attempt_count: int = 0,
+        feedback_count: int = 0,
+        generation_input_fingerprint: str | None = None,
+        generation_output_fingerprint: str | None = None,
     ) -> BaselineProcessingOutcome:
         if result.query_provenance is None:
             raise ValueError("baseline processing result lacks query provenance")
@@ -161,6 +176,12 @@ class BaselineProcessingOutcome:
             persistence_run_id=persistence_run_id,
             idempotent_replay=idempotent_replay,
             error_code=error_code,
+            generation_bypassed=generation_bypassed,
+            generation_state=generation_state,
+            generation_attempt_count=generation_attempt_count,
+            feedback_count=feedback_count,
+            generation_input_fingerprint=generation_input_fingerprint,
+            generation_output_fingerprint=generation_output_fingerprint,
             query_provenance=result.query_provenance,
             corpus_id=result.corpus_id,
             corpus_manifest_hash=result.corpus_manifest_hash,
@@ -177,6 +198,11 @@ class BaselineProcessingOutcome:
             "retrieval_status": self.retrieval_status,
             "engine": self.engine,
             "generation_bypassed": self.generation_bypassed,
+            "generation_state": self.generation_state,
+            "generation_attempt_count": self.generation_attempt_count,
+            "feedback_count": self.feedback_count,
+            "generation_input_fingerprint": self.generation_input_fingerprint,
+            "generation_output_fingerprint": self.generation_output_fingerprint,
             "request_id": self.request_id,
             "source_chunk_id": self.source_chunk_id,
             "group_id": self.group_id,
@@ -213,13 +239,34 @@ def baseline_document_processing_outcome(
         outcome.status is BaselineProcessingStatus.INSUFFICIENT for outcome in outcomes
     ) or not outcomes:
         document_status = BaselineProcessingStatus.INSUFFICIENT
+    elif any(
+        outcome.status is BaselineProcessingStatus.GENERATION_BLOCKED
+        for outcome in outcomes
+    ):
+        document_status = BaselineProcessingStatus.GENERATION_BLOCKED
+    elif any(
+        outcome.status is BaselineProcessingStatus.GENERATION_TERMINAL_FAILED
+        for outcome in outcomes
+    ):
+        document_status = BaselineProcessingStatus.GENERATION_TERMINAL_FAILED
+    elif any(
+        outcome.status is BaselineProcessingStatus.GENERATION_RETRYABLE_FAILED
+        for outcome in outcomes
+    ):
+        document_status = BaselineProcessingStatus.GENERATION_RETRYABLE_FAILED
+    elif outcomes and all(
+        outcome.status is BaselineProcessingStatus.FEEDBACK_PERSISTED
+        for outcome in outcomes
+    ):
+        document_status = BaselineProcessingStatus.FEEDBACK_PERSISTED
     else:
         document_status = BaselineProcessingStatus.REFERENCES_PERSISTED
 
     serialized: dict[str, object] = {
         "schema_version": BASELINE_DOCUMENT_PROCESSING_SCHEMA_VERSION,
         "engine": "baseline_v1",
-        "generation_bypassed": True,
+        "generation_bypassed": not outcomes
+        or all(outcome.generation_bypassed for outcome in outcomes),
         "group_id": group_id,
         "parent_run_trace_id": parent_run_trace_id,
         "status": document_status.value,

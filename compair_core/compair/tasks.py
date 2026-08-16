@@ -222,7 +222,7 @@ except (ImportError, ModuleNotFoundError) as exc:
                     "baseline_processing": processing_result.get(
                         "baseline_processing",
                         {
-                            "schema_version": "baseline-document-processing.v2",
+                            "schema_version": "baseline-document-processing.v3",
                             "engine": "baseline_v1",
                             "generation_bypassed": True,
                             "group_id": group_id,

@@ -5123,19 +5123,28 @@ def _baseline_request_corpus_fields(
 
 
 def _baseline_runtime_components():
-    """Build production baseline-only dependencies without legacy providers."""
+    """Build production baseline-only retrieval, persistence, and generation."""
 
     from compair_core.db import SessionLocal
     from compair_core.server.settings import get_settings
 
     from .retrieval.embedding import create_configured_persistent_baseline_retriever
     from .retrieval.evidence_persistence import BaselineEvidencePersistenceService
+    from .retrieval.generation import (
+        BaselineGenerationService,
+        ReviewerBaselineGenerationProvider,
+    )
 
     retriever = create_configured_persistent_baseline_retriever(
         SessionLocal,
         settings=get_settings(),
     )
-    return retriever, BaselineEvidencePersistenceService(SessionLocal)
+    return (
+        retriever,
+        BaselineEvidencePersistenceService(SessionLocal),
+        BaselineGenerationService(SessionLocal),
+        ReviewerBaselineGenerationProvider(Reviewer()),
+    )
 
 
 def _baseline_outcome_without_result(
@@ -5187,6 +5196,12 @@ def _process_baseline_reference_evidence(
         BaselineEvidencePersistenceCommand,
         BaselineEvidencePersistenceError,
     )
+    from .retrieval.generation import (
+        BaselineGenerationBusyError,
+        BaselineGenerationCommand,
+        BaselineGenerationError,
+        BaselineGenerationState,
+    )
 
     selected_group_id = validate_baseline_group_id(group_id)
     parent_trace_id = processing_run_trace_id(processing_run_key, selected_group_id)
@@ -5234,7 +5249,12 @@ def _process_baseline_reference_evidence(
     session.commit()
     result: RetrievalResult | None = None
     try:
-        retriever, persistence_service = _baseline_runtime_components()
+        (
+            retriever,
+            persistence_service,
+            generation_service,
+            generation_provider,
+        ) = _baseline_runtime_components()
         retrieved = retrieve_reference_evidence(
             engine_name=BASELINE_RETRIEVAL_ENGINE,
             baseline_retriever=retriever,
@@ -5273,19 +5293,55 @@ def _process_baseline_reference_evidence(
                 caller_user_id=caller_user_id,
             )
         )
+        if caller_user_id is None:
+            raise BaselineGenerationError(
+                "generation_caller_absent",
+                "baseline generation requires an explicit authorized caller",
+            )
+        generation_receipt = generation_service.generate(
+            BaselineGenerationCommand(
+                run_id=receipt.run_id,
+                group_id=scope.group_id,
+                caller_user_id=caller_user_id,
+            ),
+            generation_provider,
+        )
+        generation_status = {
+            BaselineGenerationState.SUCCEEDED: BaselineProcessingStatus.FEEDBACK_PERSISTED,
+            BaselineGenerationState.RETRYABLE_FAILED: (
+                BaselineProcessingStatus.GENERATION_RETRYABLE_FAILED
+            ),
+            BaselineGenerationState.TERMINAL_FAILED: (
+                BaselineProcessingStatus.GENERATION_TERMINAL_FAILED
+            ),
+            BaselineGenerationState.BLOCKED: BaselineProcessingStatus.GENERATION_BLOCKED,
+            BaselineGenerationState.PENDING: BaselineProcessingStatus.ERROR,
+            BaselineGenerationState.RUNNING: (
+                BaselineProcessingStatus.GENERATION_RETRYABLE_FAILED
+            ),
+        }[generation_receipt.state]
         outcome = BaselineProcessingOutcome.from_result(
             result,
             source_chunk_id=scope.source_chunk_id,
             group_id=scope.group_id,
             parent_run_trace_id=parent_trace_id,
-            status=BaselineProcessingStatus.REFERENCES_PERSISTED,
+            status=generation_status,
             selected_reference_count=len(receipt.reference_ids),
             persistence_run_id=receipt.run_id,
-            idempotent_replay=receipt.replayed,
+            idempotent_replay=receipt.replayed or generation_receipt.replayed,
+            error_code=generation_receipt.error_code,
+            generation_bypassed=False,
+            generation_state=generation_receipt.state.value,
+            generation_attempt_count=generation_receipt.attempt_count,
+            feedback_count=len(generation_receipt.feedback_ids),
+            generation_input_fingerprint=generation_receipt.input_fingerprint,
+            generation_output_fingerprint=generation_receipt.output_fingerprint,
         )
         _record_baseline_processing_outcome(outcome)
         return outcome
     except BaselineEvidencePersistenceError as exc:
+        error_code = exc.code
+    except (BaselineGenerationBusyError, BaselineGenerationError) as exc:
         error_code = exc.code
     except Exception as exc:  # noqa: BLE001 - provider/database integration boundary
         error_code = str(getattr(exc, "code", "baseline_processing_failed"))

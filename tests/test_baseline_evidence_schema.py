@@ -385,6 +385,7 @@ def test_sqlite_copied_legacy_database_upgrade_preserves_reference_order_and_byt
             "0000_core_schema_baseline",
             "0001_baseline_evidence_bridge_v1",
             "0002_baseline_evidence_retention_v1",
+            "0003_baseline_generation_state_v1",
         )
         with engine.connect() as connection:
             after = connection.execute(
@@ -412,6 +413,7 @@ def test_sqlite_copied_legacy_database_upgrade_preserves_reference_order_and_byt
             "0000_core_schema_baseline",
             "0001_baseline_evidence_bridge_v1",
             "0002_baseline_evidence_retention_v1",
+            "0003_baseline_generation_state_v1",
         ]
 
         forbidden = {"retrieval_query", "query_text", "raw_query", "document_id"}
@@ -428,6 +430,7 @@ def test_sqlite_copied_legacy_database_upgrade_preserves_reference_order_and_byt
             "0000_core_schema_baseline",
             "0001_baseline_evidence_bridge_v1",
             "0002_baseline_evidence_retention_v1",
+            "0003_baseline_generation_state_v1",
         )
         with engine.connect() as connection:
             assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
@@ -1137,11 +1140,59 @@ def test_sqlite_failed_retention_copy_swap_rolls_back_and_recovers(tmp_path: Pat
             )
         assert run_schema_migrations(engine).applied == (
             "0002_baseline_evidence_retention_v1",
+            "0003_baseline_generation_state_v1",
         )
         assert {
             column["name"]: column["nullable"]
             for column in inspect(engine).get_columns("reference")
         }["source_chunk_id"] is True
+    finally:
+        engine.dispose()
+
+
+def test_sqlite_failed_generation_state_copy_swap_rolls_back_and_recovers(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "failed-generation-state.db"
+    _create_legacy_database(database_path)
+    engine = _engine(database_path)
+    run_schema_migrations(engine, CORE_SCHEMA_MIGRATIONS[:3])
+    production = CORE_SCHEMA_MIGRATIONS[3]
+
+    def fail_after_real_upgrade(connection) -> None:
+        production.upgrade(connection)
+        raise RuntimeError("injected generation migration failure")
+
+    failing = replace(production, upgrade=fail_after_real_upgrade)
+    try:
+        with pytest.raises(SchemaMigrationError) as error:
+            run_schema_migrations(engine, (*CORE_SCHEMA_MIGRATIONS[:3], failing))
+        assert error.value.migration_id == "0003_baseline_generation_state_v1"
+        assert error.value.code == "upgrade_failed"
+        assert "generation_lease_token" not in {
+            column["name"]
+            for column in inspect(engine).get_columns("baseline_retrieval_run")
+        }
+        assert [(row.migration_id, row.state) for row in read_schema_migration_state(engine)] == [
+            ("0000_core_schema_baseline", "applied"),
+            ("0001_baseline_evidence_bridge_v1", "applied"),
+            ("0002_baseline_evidence_retention_v1", "applied"),
+            ("0003_baseline_generation_state_v1", "failed"),
+        ]
+        with engine.begin() as connection:
+            connection.execute(
+                schema_migration_table.delete().where(
+                    schema_migration_table.c.migration_id
+                    == "0003_baseline_generation_state_v1"
+                )
+            )
+        assert run_schema_migrations(engine).applied == (
+            "0003_baseline_generation_state_v1",
+        )
+        assert "generation_lease_token" in {
+            column["name"]
+            for column in inspect(engine).get_columns("baseline_retrieval_run")
+        }
     finally:
         engine.dispose()
 
@@ -1186,6 +1237,7 @@ def test_sqlite_failed_bridge_migration_requires_reviewed_recovery(
             "0000_core_schema_baseline",
             "0001_baseline_evidence_bridge_v1",
             "0002_baseline_evidence_retention_v1",
+            "0003_baseline_generation_state_v1",
         )
     finally:
         engine.dispose()

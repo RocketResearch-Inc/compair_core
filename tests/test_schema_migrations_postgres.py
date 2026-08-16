@@ -142,6 +142,7 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
             "0000_core_schema_baseline",
             "0001_baseline_evidence_bridge_v1",
             "0002_baseline_evidence_retention_v1",
+            "0003_baseline_generation_state_v1",
         )
         with scoped_engine.connect() as connection:
             assert connection.execute(
@@ -465,6 +466,7 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
             "0000_core_schema_baseline",
             "0001_baseline_evidence_bridge_v1",
             "0002_baseline_evidence_retention_v1",
+            "0003_baseline_generation_state_v1",
             first.migration_id,
         )
 
@@ -490,6 +492,7 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
             ("0000_core_schema_baseline", "applied"),
             ("0001_baseline_evidence_bridge_v1", "applied"),
             ("0002_baseline_evidence_retention_v1", "applied"),
+            ("0003_baseline_generation_state_v1", "applied"),
             (first.migration_id, "applied"),
             (second.migration_id, "failed"),
         ]

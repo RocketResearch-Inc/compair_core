@@ -237,6 +237,34 @@ _FEEDBACK_INSERT_TRIGGER = "trg_feedback_baseline_pair_insert"
 _FEEDBACK_UPDATE_TRIGGER = "trg_feedback_baseline_pair_update"
 _CHUNK_RETENTION_TRIGGER = "trg_chunk_baseline_retention_before_delete"
 _CHUNK_RETENTION_FUNCTION = "core_chunk_baseline_retention_v1"
+_GENERATION_STATES = (
+    "pending",
+    "running",
+    "succeeded",
+    "retryable_failed",
+    "terminal_failed",
+    "blocked",
+)
+
+_GENERATION_RUN_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("generation_lease_token", "VARCHAR(128)"),
+    ("generation_started_at", "TIMESTAMP"),
+    ("generation_input_fingerprint", "VARCHAR(64)"),
+    ("generation_provider", "VARCHAR(128)"),
+    ("generation_model", "VARCHAR(256)"),
+    ("generation_model_version", "VARCHAR(256)"),
+    ("generation_output_fingerprint", "VARCHAR(64)"),
+    ("generation_error_fingerprint", "VARCHAR(64)"),
+    ("generation_updated_at", "TIMESTAMP"),
+)
+
+_GENERATION_FEEDBACK_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("generation_provider", "VARCHAR(128)"),
+    ("generation_model", "VARCHAR(256)"),
+    ("generation_model_version", "VARCHAR(256)"),
+    ("generation_input_fingerprint", "VARCHAR(64)"),
+    ("generation_output_fingerprint", "VARCHAR(64)"),
+)
 
 
 def _column_names(connection: Connection, table_name: str) -> set[str]:
@@ -603,7 +631,13 @@ def _validate_baseline_evidence_bridge(connection: Connection) -> None:
             for constraint in table.constraints
             if isinstance(constraint, CheckConstraint) and constraint.name is not None
         }
-        if not expected_checks <= _constraint_names(connection, table.name, "check"):
+        actual_checks = _constraint_names(connection, table.name, "check")
+        if (
+            table.name == BASELINE_RETRIEVAL_RUN_TABLE
+            and "ck_bl_run_generation_v1" in actual_checks
+        ):
+            expected_checks.discard("ck_bl_run_generation")
+        if not expected_checks <= actual_checks:
             raise SchemaInvariantError(f"missing_check_constraint:{table.name}")
 
     if connection.dialect.name == "sqlite":
@@ -1079,6 +1113,244 @@ def _validate_baseline_evidence_retention(connection: Connection) -> None:
             raise SchemaInvariantError(f"retention_mutable_provenance_fk:{table_name}")
 
 
+def _sqlite_clone_table_sql(
+    connection: Connection,
+    table_name: str,
+    target_name: str,
+) -> str:
+    source = connection.execute(
+        text(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = :table_name"
+        ),
+        {"table_name": table_name},
+    ).scalar_one_or_none()
+    if not source:
+        raise SchemaInvariantError(f"sqlite_table_sql_missing:{table_name}")
+    return _sqlite_retarget_table(str(source), table_name, target_name)
+
+
+def _sqlite_append_columns(
+    sql: str,
+    columns: Sequence[str],
+    table_name: str,
+) -> str:
+    if not columns:
+        return sql
+    constraint = re.search(
+        r",\s*(?=(?:PRIMARY\s+KEY|UNIQUE\s*\(|CHECK\s*\(|"
+        r"CONSTRAINT\s+|FOREIGN\s+KEY\s*\())",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    if constraint is None:
+        raise SchemaInvariantError(f"sqlite_column_append_failed:{table_name}")
+    insertion = ", " + ", ".join(columns)
+    return f"{sql[:constraint.start()]}{insertion}{sql[constraint.start():]}"
+
+
+def _sqlite_generation_run_sql(
+    connection: Connection,
+    target_name: str,
+) -> str:
+    sql = _sqlite_clone_table_sql(
+        connection,
+        BASELINE_RETRIEVAL_RUN_TABLE,
+        target_name,
+    )
+    states = ", ".join(f"'{state}'" for state in _GENERATION_STATES)
+    sql, count = re.subn(
+        r"generation_state\s+IN\s*\(\s*'pending'\s*,\s*'generating'\s*,"
+        r"\s*'completed'\s*,\s*'failed'\s*\)",
+        f"generation_state IN ({states})",
+        sql,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    if count != 1:
+        raise SchemaInvariantError("sqlite_generation_check_rewrite_failed")
+    existing = _column_names(connection, BASELINE_RETRIEVAL_RUN_TABLE)
+    additions = [
+        f'"{column_name}" {ddl}'
+        for column_name, ddl in _GENERATION_RUN_COLUMNS
+        if column_name not in existing
+    ]
+    return _sqlite_append_columns(sql, additions, target_name)
+
+
+def _sqlite_generation_feedback_sql(
+    connection: Connection,
+    target_name: str,
+) -> str:
+    sql = _sqlite_clone_table_sql(connection, "feedback", target_name)
+    existing = _column_names(connection, "feedback")
+    additions = [
+        f'"{column_name}" {ddl}'
+        for column_name, ddl in _GENERATION_FEEDBACK_COLUMNS
+        if column_name not in existing
+    ]
+    return _sqlite_append_columns(sql, additions, target_name)
+
+
+def _sqlite_copy_generation_run(
+    connection: Connection,
+    target_name: str,
+) -> None:
+    columns = [
+        str(row[1])
+        for row in connection.exec_driver_sql(
+            f'PRAGMA table_info("{BASELINE_RETRIEVAL_RUN_TABLE}")'
+        ).all()
+    ]
+    quoted = ", ".join(f'"{column}"' for column in columns)
+    selected = [
+        (
+            "CASE generation_state "
+            "WHEN 'generating' THEN 'running' "
+            "WHEN 'completed' THEN 'succeeded' "
+            "WHEN 'failed' THEN 'retryable_failed' "
+            "ELSE generation_state END"
+            if column == "generation_state"
+            else f'"{column}"'
+        )
+        for column in columns
+    ]
+    connection.exec_driver_sql(
+        f'INSERT INTO "{target_name}" ({quoted}) '
+        f"SELECT {', '.join(selected)} "
+        f'FROM "{BASELINE_RETRIEVAL_RUN_TABLE}"'
+    )
+
+
+def _upgrade_sqlite_baseline_generation_state(connection: Connection) -> None:
+    table_names = (
+        BASELINE_RETRIEVAL_RUN_TABLE,
+        BASELINE_SELECTED_EVIDENCE_TABLE,
+        "reference",
+        "feedback",
+    )
+    preserved_objects = _sqlite_schema_objects(connection, table_names)
+    temporary = {
+        table_name: f"__generation_v1_{table_name}" for table_name in table_names
+    }
+    connection.exec_driver_sql(
+        _sqlite_generation_run_sql(
+            connection,
+            temporary[BASELINE_RETRIEVAL_RUN_TABLE],
+        )
+    )
+    _sqlite_copy_generation_run(
+        connection,
+        temporary[BASELINE_RETRIEVAL_RUN_TABLE],
+    )
+    for table_name in (BASELINE_SELECTED_EVIDENCE_TABLE, "reference"):
+        connection.exec_driver_sql(
+            _sqlite_clone_table_sql(connection, table_name, temporary[table_name])
+        )
+        _sqlite_copy_table(connection, table_name, temporary[table_name])
+    connection.exec_driver_sql(
+        _sqlite_generation_feedback_sql(connection, temporary["feedback"])
+    )
+    _sqlite_copy_table(connection, "feedback", temporary["feedback"])
+
+    connection.exec_driver_sql(
+        f"DROP TRIGGER IF EXISTS {_CHUNK_RETENTION_TRIGGER}"
+    )
+    for table_name in (
+        "reference",
+        "feedback",
+        BASELINE_SELECTED_EVIDENCE_TABLE,
+        BASELINE_RETRIEVAL_RUN_TABLE,
+    ):
+        connection.exec_driver_sql(f'DROP TABLE "{table_name}"')
+    for table_name in table_names:
+        connection.exec_driver_sql(
+            f'ALTER TABLE "{temporary[table_name]}" RENAME TO "{table_name}"'
+        )
+    for ddl in preserved_objects:
+        connection.exec_driver_sql(ddl)
+    _create_sqlite_chunk_retention_trigger(connection)
+    connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_bl_run_generation_state "
+        "ON baseline_retrieval_run(generation_state, generation_lease_expires_at)"
+    )
+
+
+def _upgrade_postgres_baseline_generation_state(connection: Connection) -> None:
+    run_columns = _column_names(connection, BASELINE_RETRIEVAL_RUN_TABLE)
+    for column_name, ddl in _GENERATION_RUN_COLUMNS:
+        if column_name not in run_columns:
+            connection.exec_driver_sql(
+                f"ALTER TABLE baseline_retrieval_run ADD COLUMN {column_name} {ddl}"
+            )
+    feedback_columns = _column_names(connection, "feedback")
+    for column_name, ddl in _GENERATION_FEEDBACK_COLUMNS:
+        if column_name not in feedback_columns:
+            connection.exec_driver_sql(
+                f"ALTER TABLE feedback ADD COLUMN {column_name} {ddl}"
+            )
+    connection.exec_driver_sql(
+        "ALTER TABLE baseline_retrieval_run "
+        "DROP CONSTRAINT IF EXISTS ck_bl_run_generation"
+    )
+    connection.exec_driver_sql(
+        "UPDATE baseline_retrieval_run SET generation_state = CASE generation_state "
+        "WHEN 'generating' THEN 'running' WHEN 'completed' THEN 'succeeded' "
+        "WHEN 'failed' THEN 'retryable_failed' ELSE generation_state END"
+    )
+    states = ", ".join(f"'{state}'" for state in _GENERATION_STATES)
+    _postgres_add_constraint(
+        connection,
+        table_name=BASELINE_RETRIEVAL_RUN_TABLE,
+        constraint_name="ck_bl_run_generation_v1",
+        definition=(
+            f"CHECK (generation_state IN ({states}) "
+            "AND generation_attempt_count >= 0)"
+        ),
+        kind="check",
+    )
+    connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_bl_run_generation_state "
+        "ON baseline_retrieval_run(generation_state, generation_lease_expires_at)"
+    )
+
+
+def _upgrade_baseline_generation_state(connection: Connection) -> None:
+    if connection.dialect.name == "sqlite":
+        _upgrade_sqlite_baseline_generation_state(connection)
+    else:
+        _upgrade_postgres_baseline_generation_state(connection)
+
+
+def _validate_baseline_generation_state(connection: Connection) -> None:
+    required_run = {name for name, _ddl in _GENERATION_RUN_COLUMNS}
+    required_feedback = {name for name, _ddl in _GENERATION_FEEDBACK_COLUMNS}
+    if not required_run <= _column_names(connection, BASELINE_RETRIEVAL_RUN_TABLE):
+        raise SchemaInvariantError("baseline_generation_run_columns_missing")
+    if not required_feedback <= _column_names(connection, "feedback"):
+        raise SchemaInvariantError("baseline_generation_feedback_columns_missing")
+    if "ix_bl_run_generation_state" not in _index_names(
+        connection, BASELINE_RETRIEVAL_RUN_TABLE
+    ):
+        raise SchemaInvariantError("baseline_generation_state_index_missing")
+    if connection.dialect.name == "sqlite":
+        schema_sql = connection.execute(
+            text(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'baseline_retrieval_run'"
+            )
+        ).scalar_one()
+        for state in _GENERATION_STATES:
+            if f"'{state}'" not in str(schema_sql):
+                raise SchemaInvariantError(
+                    f"baseline_generation_state_missing:{state}"
+                )
+    elif "ck_bl_run_generation_v1" not in _constraint_names(
+        connection, BASELINE_RETRIEVAL_RUN_TABLE, "check"
+    ):
+        raise SchemaInvariantError("baseline_generation_state_check_missing")
+
+
 CORE_SCHEMA_MIGRATIONS: tuple[SchemaMigration, ...] = (
     SchemaMigration(
         migration_id="0000_core_schema_baseline",
@@ -1119,6 +1391,20 @@ CORE_SCHEMA_MIGRATIONS: tuple[SchemaMigration, ...] = (
         ),
         upgrade=_upgrade_baseline_evidence_retention,
         validate=_validate_baseline_evidence_retention,
+    ),
+    SchemaMigration(
+        migration_id="0003_baseline_generation_state_v1",
+        description="Add leased baseline generation and idempotent Feedback provenance",
+        checksum_material=(
+            "baseline-generation-state.v1; pending running succeeded "
+            "retryable_failed terminal_failed blocked; lease token and expiry; "
+            "attempt count; input output and sanitized error fingerprints; "
+            "provider model revision provenance on run and Feedback; SQLite "
+            "transactional copy/swap preserving retention constraints; PostgreSQL "
+            "additive columns and validated state check; ddl-v1"
+        ),
+        upgrade=_upgrade_baseline_generation_state,
+        validate=_validate_baseline_generation_state,
     ),
 )
 

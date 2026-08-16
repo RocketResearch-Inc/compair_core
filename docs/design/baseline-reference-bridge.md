@@ -123,8 +123,9 @@ One row represents one successfully persisted `RetrievalResult`:
   character counts plus `underfilled`;
 - `authorization_scope_hash` and canonical `authorization_group_ids_json` as a
   creation-time audit snapshot;
-- generation state (`pending`, `generating`, `completed`, or `failed`), sanitized
-  error code, attempt count, lease timestamp, and created/completed timestamps.
+- generation state and lease fields. Phase 2B2I supersedes the provisional four
+  states with the durable `baseline-generation-state.v1` lifecycle documented
+  in `docs/design/baseline-generation-lifecycle.md`.
 
 Only an `ok` result can create a run. The idempotency key is SHA-256 over a
 versioned canonical tuple containing source chunk, request ID, engine/version,
