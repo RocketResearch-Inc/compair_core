@@ -36,8 +36,12 @@ from .corpus import (
     RetrievalCorpusGeneration,
     RetrievalIndexState,
 )
-from .persistent import published_index_fingerprint
 from .evidence_persistence import render_baseline_evidence
+from .notification_outbox import (
+    baseline_notifications_enabled,
+    schedule_baseline_notification,
+)
+from .persistent import published_index_fingerprint
 
 GENERATION_CONTRACT_VERSION = "baseline-generation-input.v1"
 GENERATION_STATE_VERSION = "baseline-generation-state.v1"
@@ -58,6 +62,7 @@ class BaselineGenerationState(str, Enum):
 class GenerationWriteStage(str, Enum):
     FEEDBACK = "feedback"
     STATE = "state"
+    OUTBOX = "outbox"
 
 
 @dataclass(frozen=True, slots=True)
@@ -518,6 +523,7 @@ class BaselineGenerationService:
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
         stage_hook: StageHook | None = None,
         clock: Callable[[], datetime] = _utcnow,
+        notifications_enabled: bool | None = None,
     ) -> None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -525,6 +531,11 @@ class BaselineGenerationService:
         self._lease_seconds = lease_seconds
         self._stage_hook = stage_hook
         self._clock = clock
+        self._notifications_enabled = (
+            baseline_notifications_enabled()
+            if notifications_enabled is None
+            else notifications_enabled
+        )
         self._input_adapter = BaselineGenerationInputAdapter()
 
     def generate(
@@ -857,6 +868,17 @@ class BaselineGenerationService:
                 )
                 session.flush()
                 self._after_stage(GenerationWriteStage.STATE)
+                schedule_baseline_notification(
+                    session,
+                    run_id=command.run_id,
+                    group_id=command.group_id,
+                    recipient_user_id=command.caller_user_id,
+                    feedback_ids=feedback_ids,
+                    enabled=self._notifications_enabled,
+                    now=completed,
+                )
+                session.flush()
+                self._after_stage(GenerationWriteStage.OUTBOX)
                 session.commit()
                 return BaselineGenerationReceipt(
                     run_id=command.run_id,

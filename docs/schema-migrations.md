@@ -4,9 +4,9 @@
 
 Phase 2B2F.0 added the migration registry and runner. Phase 2B2F.1 uses it for
 the additive immutable baseline-evidence schema, and Phase 2B2F.2 adds the
-forward retention correction. It does not add bridge writes
-or reads and does not change retrieval, normal Reference persistence,
-generation, API, or CLI behavior.
+forward retention correction. Later baseline-only migrations add the leased
+generation state and the notification digest outbox without changing legacy
+retrieval or notification behavior.
 
 The previous startup path uses SQLAlchemy `create_all(checkfirst=True)` and a
 set of `_ensure_*` helpers. That approach can create a missing table, but it
@@ -85,6 +85,18 @@ group-cascades but restricts run/artifact deletion; baseline Feedback targets
 the selected `(run_id, ordinal)`; and a scoped chunk trigger preserves legacy
 source-owned deletion while retaining baseline Reference and Feedback rows.
 Corpus/index identifiers remain copied values with no lifecycle foreign keys.
+
+## Implemented notification outbox migration
+
+`0004_baseline_notification_outbox_v1` creates the group-scoped
+`baseline_notification_outbox`. It stores only an ordered manifest of Feedback
+identifiers/ordinals and privacy-safe hashes/state metadata. Composite run/group
+ownership cascades with the baseline run, group deletion follows Core's privacy
+cascade, and recipient deletion sets the recipient pointer to `NULL` so a
+dispatcher can record cancellation. SQLite and PostgreSQL triggers reject rows
+for non-succeeded runs and prevent mutation of digest identity/payload fields.
+The full state and delivery contract is in
+`docs/design/baseline-notification-outbox.md`.
 
 ### SQLite
 

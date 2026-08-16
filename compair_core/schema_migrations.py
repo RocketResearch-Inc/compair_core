@@ -266,6 +266,21 @@ _GENERATION_FEEDBACK_COLUMNS: tuple[tuple[str, str], ...] = (
     ("generation_output_fingerprint", "VARCHAR(64)"),
 )
 
+_BASELINE_NOTIFICATION_OUTBOX_TABLE = "baseline_notification_outbox"
+_BASELINE_NOTIFICATION_STATES = (
+    "pending",
+    "running",
+    "delivered",
+    "retryable_failed",
+    "terminal_failed",
+    "suppressed",
+    "cancelled",
+)
+_BASELINE_NOTIFICATION_INSERT_TRIGGER = "trg_bl_notify_succeeded_insert"
+_BASELINE_NOTIFICATION_IMMUTABLE_TRIGGER = "trg_bl_notify_payload_immutable"
+_BASELINE_NOTIFICATION_INSERT_FUNCTION = "core_bl_notify_succeeded_insert_v1"
+_BASELINE_NOTIFICATION_IMMUTABLE_FUNCTION = "core_bl_notify_payload_immutable_v1"
+
 
 def _column_names(connection: Connection, table_name: str) -> set[str]:
     return {column["name"] for column in inspect(connection).get_columns(table_name)}
@@ -1351,6 +1366,277 @@ def _validate_baseline_generation_state(connection: Connection) -> None:
         raise SchemaInvariantError("baseline_generation_state_check_missing")
 
 
+def _baseline_notification_outbox_ddl(dialect: str) -> str:
+    timestamp_type = "TIMESTAMP WITH TIME ZONE" if dialect == "postgresql" else "TIMESTAMP"
+    states = ", ".join(f"'{state}'" for state in _BASELINE_NOTIFICATION_STATES)
+    return f"""
+CREATE TABLE IF NOT EXISTS {_BASELINE_NOTIFICATION_OUTBOX_TABLE} (
+    outbox_id VARCHAR(36) NOT NULL,
+    run_id VARCHAR(36) NOT NULL,
+    group_id VARCHAR(36) NOT NULL,
+    recipient_user_id VARCHAR(36),
+    channel VARCHAR(32) NOT NULL,
+    digest_key VARCHAR(64) NOT NULL,
+    payload_schema_version VARCHAR(64) NOT NULL,
+    finding_count INTEGER NOT NULL,
+    finding_manifest TEXT NOT NULL,
+    finding_manifest_hash VARCHAR(64) NOT NULL,
+    state VARCHAR(32) NOT NULL,
+    lease_token VARCHAR(128),
+    lease_expires_at {timestamp_type},
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    error_code VARCHAR(128),
+    error_fingerprint VARCHAR(64),
+    created_at {timestamp_type} NOT NULL,
+    updated_at {timestamp_type} NOT NULL,
+    delivered_at {timestamp_type},
+    suppressed_at {timestamp_type},
+    cancelled_at {timestamp_type},
+    CONSTRAINT pk_baseline_notification_outbox PRIMARY KEY (outbox_id),
+    CONSTRAINT uq_bl_notify_run_recipient_channel UNIQUE (run_id, recipient_user_id, channel),
+    CONSTRAINT uq_bl_notify_digest_key UNIQUE (digest_key),
+    CONSTRAINT fk_bl_notify_run_group FOREIGN KEY (run_id, group_id)
+        REFERENCES {BASELINE_RETRIEVAL_RUN_TABLE}(run_id, group_id)
+        ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT fk_bl_notify_group FOREIGN KEY (group_id)
+        REFERENCES "group"(group_id) ON DELETE CASCADE,
+    CONSTRAINT fk_bl_notify_recipient FOREIGN KEY (recipient_user_id)
+        REFERENCES "user"(user_id) ON DELETE SET NULL,
+    CONSTRAINT ck_bl_notify_contract CHECK (
+        channel = 'in_app'
+        AND payload_schema_version = 'baseline-notification-digest.v1'
+        AND finding_count BETWEEN 1 AND 4
+        AND length(digest_key) = 64
+        AND length(finding_manifest_hash) = 64
+        AND attempt_count >= 0
+    ),
+    CONSTRAINT ck_bl_notify_state CHECK (state IN ({states})),
+    CONSTRAINT ck_bl_notify_lease CHECK (
+        (state = 'running' AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+        OR (state <> 'running' AND lease_token IS NULL AND lease_expires_at IS NULL)
+    )
+)
+"""
+
+
+def _create_sqlite_baseline_notification_triggers(connection: Connection) -> None:
+    connection.exec_driver_sql(
+        f"""
+CREATE TRIGGER IF NOT EXISTS {_BASELINE_NOTIFICATION_INSERT_TRIGGER}
+BEFORE INSERT ON {_BASELINE_NOTIFICATION_OUTBOX_TABLE}
+FOR EACH ROW
+WHEN NEW.recipient_user_id IS NULL OR NOT EXISTS (
+    SELECT 1 FROM {BASELINE_RETRIEVAL_RUN_TABLE} r
+    WHERE r.run_id = NEW.run_id
+      AND r.group_id = NEW.group_id
+      AND r.generation_state = 'succeeded'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'baseline_notification_requires_succeeded_run');
+END
+"""
+    )
+    connection.exec_driver_sql(
+        f"""
+CREATE TRIGGER IF NOT EXISTS {_BASELINE_NOTIFICATION_IMMUTABLE_TRIGGER}
+BEFORE UPDATE ON {_BASELINE_NOTIFICATION_OUTBOX_TABLE}
+FOR EACH ROW
+WHEN NEW.run_id <> OLD.run_id
+  OR NEW.group_id <> OLD.group_id
+  OR NEW.channel <> OLD.channel
+  OR NEW.digest_key <> OLD.digest_key
+  OR NEW.payload_schema_version <> OLD.payload_schema_version
+  OR NEW.finding_count <> OLD.finding_count
+  OR NEW.finding_manifest <> OLD.finding_manifest
+  OR NEW.finding_manifest_hash <> OLD.finding_manifest_hash
+  OR NEW.created_at <> OLD.created_at
+BEGIN
+    SELECT RAISE(ABORT, 'baseline_notification_payload_immutable');
+END
+"""
+    )
+
+
+def _create_postgres_baseline_notification_triggers(connection: Connection) -> None:
+    connection.exec_driver_sql(
+        f"""
+CREATE OR REPLACE FUNCTION {_BASELINE_NOTIFICATION_INSERT_FUNCTION}()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.recipient_user_id IS NULL OR NOT EXISTS (
+        SELECT 1 FROM {BASELINE_RETRIEVAL_RUN_TABLE} r
+        WHERE r.run_id = NEW.run_id
+          AND r.group_id = NEW.group_id
+          AND r.generation_state = 'succeeded'
+    ) THEN
+        RAISE EXCEPTION 'baseline_notification_requires_succeeded_run';
+    END IF;
+    RETURN NEW;
+END
+$$
+"""
+    )
+    connection.exec_driver_sql(
+        f"""
+CREATE OR REPLACE FUNCTION {_BASELINE_NOTIFICATION_IMMUTABLE_FUNCTION}()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.run_id IS DISTINCT FROM OLD.run_id
+       OR NEW.group_id IS DISTINCT FROM OLD.group_id
+       OR NEW.channel IS DISTINCT FROM OLD.channel
+       OR NEW.digest_key IS DISTINCT FROM OLD.digest_key
+       OR NEW.payload_schema_version IS DISTINCT FROM OLD.payload_schema_version
+       OR NEW.finding_count IS DISTINCT FROM OLD.finding_count
+       OR NEW.finding_manifest IS DISTINCT FROM OLD.finding_manifest
+       OR NEW.finding_manifest_hash IS DISTINCT FROM OLD.finding_manifest_hash
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION 'baseline_notification_payload_immutable';
+    END IF;
+    RETURN NEW;
+END
+$$
+"""
+    )
+    connection.exec_driver_sql(
+        f"DROP TRIGGER IF EXISTS {_BASELINE_NOTIFICATION_INSERT_TRIGGER} "
+        f"ON {_BASELINE_NOTIFICATION_OUTBOX_TABLE}"
+    )
+    connection.exec_driver_sql(
+        f"CREATE TRIGGER {_BASELINE_NOTIFICATION_INSERT_TRIGGER} BEFORE INSERT "
+        f"ON {_BASELINE_NOTIFICATION_OUTBOX_TABLE} FOR EACH ROW "
+        f"EXECUTE FUNCTION {_BASELINE_NOTIFICATION_INSERT_FUNCTION}()"
+    )
+    connection.exec_driver_sql(
+        f"DROP TRIGGER IF EXISTS {_BASELINE_NOTIFICATION_IMMUTABLE_TRIGGER} "
+        f"ON {_BASELINE_NOTIFICATION_OUTBOX_TABLE}"
+    )
+    connection.exec_driver_sql(
+        f"CREATE TRIGGER {_BASELINE_NOTIFICATION_IMMUTABLE_TRIGGER} BEFORE UPDATE "
+        f"ON {_BASELINE_NOTIFICATION_OUTBOX_TABLE} FOR EACH ROW "
+        f"EXECUTE FUNCTION {_BASELINE_NOTIFICATION_IMMUTABLE_FUNCTION}()"
+    )
+
+
+def _upgrade_baseline_notification_outbox(connection: Connection) -> None:
+    connection.exec_driver_sql(
+        _baseline_notification_outbox_ddl(connection.dialect.name)
+    )
+    connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_bl_notify_dispatch "
+        "ON baseline_notification_outbox(state, lease_expires_at, created_at, outbox_id)"
+    )
+    connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_bl_notify_recipient "
+        "ON baseline_notification_outbox(recipient_user_id, state, created_at)"
+    )
+    connection.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_bl_notify_group_created "
+        "ON baseline_notification_outbox(group_id, created_at)"
+    )
+    if connection.dialect.name == "sqlite":
+        _create_sqlite_baseline_notification_triggers(connection)
+    else:
+        _create_postgres_baseline_notification_triggers(connection)
+
+
+def _validate_baseline_notification_outbox(connection: Connection) -> None:
+    table_name = _BASELINE_NOTIFICATION_OUTBOX_TABLE
+    if table_name not in inspect(connection).get_table_names():
+        raise SchemaInvariantError("baseline_notification_outbox_missing")
+    required_columns = {
+        "outbox_id",
+        "run_id",
+        "group_id",
+        "recipient_user_id",
+        "channel",
+        "digest_key",
+        "payload_schema_version",
+        "finding_count",
+        "finding_manifest",
+        "finding_manifest_hash",
+        "state",
+        "lease_token",
+        "lease_expires_at",
+        "attempt_count",
+        "error_code",
+        "error_fingerprint",
+        "created_at",
+        "updated_at",
+        "delivered_at",
+        "suppressed_at",
+        "cancelled_at",
+    }
+    if not required_columns <= _column_names(connection, table_name):
+        raise SchemaInvariantError("baseline_notification_outbox_columns_missing")
+    forbidden = {
+        "retrieval_query",
+        "query_text",
+        "raw_query",
+        "source_text",
+        "evidence_content",
+        "finding_text",
+        "feedback",
+    }
+    if forbidden & _column_names(connection, table_name):
+        raise SchemaInvariantError("baseline_notification_outbox_private_column")
+    required_fks = {
+        (
+            ("run_id", "group_id"),
+            BASELINE_RETRIEVAL_RUN_TABLE,
+            ("run_id", "group_id"),
+            "CASCADE",
+        ),
+        (("group_id",), "group", ("group_id",), "CASCADE"),
+        (("recipient_user_id",), "user", ("user_id",), "SET NULL"),
+    }
+    if not required_fks <= _foreign_key_targets(connection, table_name):
+        raise SchemaInvariantError("baseline_notification_outbox_foreign_key_invalid")
+    required_indexes = {
+        "ix_bl_notify_dispatch",
+        "ix_bl_notify_recipient",
+        "ix_bl_notify_group_created",
+    }
+    if not required_indexes <= _index_names(connection, table_name):
+        raise SchemaInvariantError("baseline_notification_outbox_index_missing")
+    required_unique = {
+        "uq_bl_notify_run_recipient_channel",
+        "uq_bl_notify_digest_key",
+    }
+    if not required_unique <= _unique_constraint_names(connection, table_name):
+        raise SchemaInvariantError("baseline_notification_outbox_unique_missing")
+    required_checks = {
+        "ck_bl_notify_contract",
+        "ck_bl_notify_state",
+        "ck_bl_notify_lease",
+    }
+    if not required_checks <= _constraint_names(connection, table_name, "check"):
+        raise SchemaInvariantError("baseline_notification_outbox_check_missing")
+    if connection.dialect.name == "sqlite":
+        triggers = {
+            str(row[0])
+            for row in connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            ).all()
+        }
+    else:
+        triggers = {
+            str(row[0])
+            for row in connection.execute(
+                text(
+                    "SELECT tgname FROM pg_trigger t "
+                    "JOIN pg_class c ON c.oid = t.tgrelid "
+                    "WHERE c.relname = :table_name AND NOT t.tgisinternal"
+                ),
+                {"table_name": table_name},
+            ).all()
+        }
+    if not {
+        _BASELINE_NOTIFICATION_INSERT_TRIGGER,
+        _BASELINE_NOTIFICATION_IMMUTABLE_TRIGGER,
+    } <= triggers:
+        raise SchemaInvariantError("baseline_notification_outbox_trigger_missing")
+
+
 CORE_SCHEMA_MIGRATIONS: tuple[SchemaMigration, ...] = (
     SchemaMigration(
         migration_id="0000_core_schema_baseline",
@@ -1405,6 +1691,20 @@ CORE_SCHEMA_MIGRATIONS: tuple[SchemaMigration, ...] = (
         ),
         upgrade=_upgrade_baseline_generation_state,
         validate=_validate_baseline_generation_state,
+    ),
+    SchemaMigration(
+        migration_id="0004_baseline_notification_outbox_v1",
+        description="Add privacy-safe idempotent baseline notification digest outbox",
+        checksum_material=(
+            "baseline-notification-digest.v1; one group-scoped in_app digest per "
+            "succeeded baseline run recipient channel; ordered Feedback identifiers "
+            "only; pending running delivered retryable_failed terminal_failed "
+            "suppressed cancelled; leased at-least-once dispatch; recipient SET NULL, "
+            "run/group CASCADE; succeeded-run insert and immutable-payload triggers; "
+            "SQLite and PostgreSQL DDL; no legacy notification changes; ddl-v1"
+        ),
+        upgrade=_upgrade_baseline_notification_outbox,
+        validate=_validate_baseline_notification_outbox,
     ),
 )
 
