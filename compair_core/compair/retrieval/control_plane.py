@@ -43,6 +43,7 @@ PROTOCOL_SHA256 = "3b45287a54d04cea751e9cc3209c5f0783192de13062e682eadcae40af322
 
 SNAPSHOT_SCHEMA_VERSION = "baseline-snapshot.v1"
 REPOSITORY_ADMIN_SCHEMA_VERSION = "baseline-repository-registration-admin.v1"
+REPOSITORY_DISCOVERY_SCHEMA_VERSION = "baseline-repository-discovery.v1"
 REPOSITORY_DESCRIPTOR_VERSION = "repository-identity.v1"
 CONTINUATION_SCHEMA_VERSION = "baseline-snapshot-continuation.v1"
 STAGING_LIFETIME = timedelta(hours=24)
@@ -466,6 +467,33 @@ def _repository_admin_request(
     )
     if (
         payload.get("schema_version") != REPOSITORY_ADMIN_SCHEMA_VERSION
+        or payload.get("message_type") != message_type
+    ):
+        raise ControlPlaneError("invalid_contract", status_code=422)
+    return (
+        _uuid(payload.get("request_id")),
+        _string(payload.get("group_id"), maximum=64, pattern=_IDENTIFIER),
+    )
+
+
+def _repository_discovery_request(
+    payload: Mapping[str, Any],
+    *,
+    message_type: str,
+    required: set[str],
+) -> tuple[str, str]:
+    _exact_keys(
+        payload,
+        required
+        | {
+            "schema_version",
+            "message_type",
+            "request_id",
+            "group_id",
+        },
+    )
+    if (
+        payload.get("schema_version") != REPOSITORY_DISCOVERY_SCHEMA_VERSION
         or payload.get("message_type") != message_type
     ):
         raise ControlPlaneError("invalid_contract", status_code=422)
@@ -1162,6 +1190,125 @@ class BaselineControlPlaneService:
                 state=state,
                 replayed=replayed,
             )
+
+    @classmethod
+    def _repository_metadata(cls, row: Mapping[str, Any]) -> dict[str, object]:
+        return {
+            "registration_id": str(row["registration_id"]),
+            "group_id": str(row["group_id"]),
+            "identity_descriptor_hash": str(row["descriptor_hash"]),
+            "identity_descriptor": {
+                "version": str(row["descriptor_version"]),
+                "authority": str(row["repository_authority"]),
+                "repository_uid": str(row["repository_uid"]),
+            },
+            "state": str(row["state"]),
+            "source_document_id": (
+                None
+                if row["source_document_id"] is None
+                else str(row["source_document_id"])
+            ),
+            "created_at": cls._timestamp(row["created_at"]),
+            "updated_at": cls._timestamp(row["updated_at"]),
+        }
+
+    @staticmethod
+    def _repository_discovery_query():
+        return select(
+            repository_registration.c.registration_id,
+            repository_registration.c.group_id,
+            repository_registration.c.source_document_id,
+            repository_approval.c.descriptor_hash,
+            repository_approval.c.descriptor_version,
+            repository_approval.c.repository_authority,
+            repository_approval.c.repository_uid,
+            repository_approval.c.state,
+            repository_approval.c.created_at,
+            repository_approval.c.updated_at,
+        ).select_from(
+            repository_registration.join(
+                repository_approval,
+                (
+                    repository_approval.c.registration_id
+                    == repository_registration.c.registration_id
+                )
+                & (
+                    repository_approval.c.group_id == repository_registration.c.group_id
+                ),
+            )
+        )
+
+    def list_repository_registrations(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        caller_user_id: str,
+    ) -> dict[str, object]:
+        request_id, group_id = _repository_discovery_request(
+            payload,
+            message_type="repository_list_request",
+            required=set(),
+        )
+        with self.engine.connect() as connection:
+            self._authorize_group_admin(
+                connection,
+                user_id=caller_user_id,
+                group_id=group_id,
+            )
+            rows = (
+                connection.execute(
+                    self._repository_discovery_query()
+                    .where(repository_registration.c.group_id == group_id)
+                    .order_by(repository_registration.c.registration_id)
+                )
+                .mappings()
+                .all()
+            )
+        return {
+            "schema_version": REPOSITORY_DISCOVERY_SCHEMA_VERSION,
+            "message_type": "repository_list",
+            "request_id": request_id,
+            "group_id": group_id,
+            "repositories": [self._repository_metadata(row) for row in rows],
+        }
+
+    def inspect_repository_registration(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        caller_user_id: str,
+    ) -> dict[str, object]:
+        request_id, group_id = _repository_discovery_request(
+            payload,
+            message_type="repository_inspect_request",
+            required={"registration_id"},
+        )
+        registration_id = _uuid(payload["registration_id"])
+        with self.engine.connect() as connection:
+            self._authorize_group(
+                connection,
+                user_id=caller_user_id,
+                group_id=group_id,
+            )
+            row = (
+                connection.execute(
+                    self._repository_discovery_query().where(
+                        repository_registration.c.group_id == group_id,
+                        repository_registration.c.registration_id == registration_id,
+                    )
+                )
+                .mappings()
+                .first()
+            )
+        if row is None:
+            raise ControlPlaneError("not_found_or_forbidden", status_code=404)
+        return {
+            "schema_version": REPOSITORY_DISCOVERY_SCHEMA_VERSION,
+            "message_type": "repository_inspection",
+            "request_id": request_id,
+            "group_id": group_id,
+            "repository": self._repository_metadata(row),
+        }
 
     @staticmethod
     def _authorize_snapshot_repositories(

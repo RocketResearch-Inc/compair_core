@@ -43,6 +43,7 @@ dev = [
   "twine>=5.0",
   "pytest>=8.0",
   "ruff>=0.3",
+  "scikit-learn>=1.4",
 ]
 ocr = [
   "pillow>=10.0",

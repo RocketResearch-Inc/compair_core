@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import importlib.util
 import os
@@ -8,6 +7,7 @@ import pathlib
 import sys
 import types
 import unittest
+from dataclasses import dataclass
 from unittest import mock
 
 
@@ -23,21 +23,17 @@ def _load_main_module():
 
     levenshtein = types.ModuleType("Levenshtein")
     levenshtein.ratio = lambda left, right: 0.0
-    sys.modules["Levenshtein"] = levenshtein
 
     sqlalchemy = types.ModuleType("sqlalchemy")
     sqlalchemy.select = lambda *args, **kwargs: None
     sqlalchemy.or_ = lambda *args, **kwargs: ("or", args)
-    sys.modules["sqlalchemy"] = sqlalchemy
 
     sqlalchemy_orm = types.ModuleType("sqlalchemy.orm")
     sqlalchemy_orm.Session = object
     sqlalchemy_orm.load_only = lambda *args, **kwargs: ("load_only", args)
-    sys.modules["sqlalchemy.orm"] = sqlalchemy_orm
 
     sqlalchemy_orm_attributes = types.ModuleType("sqlalchemy.orm.attributes")
     sqlalchemy_orm_attributes.get_history = lambda *args, **kwargs: types.SimpleNamespace(deleted=[])
-    sys.modules["sqlalchemy.orm.attributes"] = sqlalchemy_orm_attributes
 
     embeddings = types.ModuleType(f"{package_name}.embeddings")
     embeddings.create_embedding = lambda *args, **kwargs: []
@@ -98,7 +94,25 @@ def _load_main_module():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     assert spec.loader is not None
-    spec.loader.exec_module(module)
+    isolated_dependencies = {
+        "Levenshtein": levenshtein,
+        "sqlalchemy": sqlalchemy,
+        "sqlalchemy.orm": sqlalchemy_orm,
+        "sqlalchemy.orm.attributes": sqlalchemy_orm_attributes,
+    }
+    missing = object()
+    previous_dependencies = {
+        name: sys.modules.get(name, missing) for name in isolated_dependencies
+    }
+    try:
+        sys.modules.update(isolated_dependencies)
+        spec.loader.exec_module(module)
+    finally:
+        for name, previous in previous_dependencies.items():
+            if previous is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
     return module
 
 

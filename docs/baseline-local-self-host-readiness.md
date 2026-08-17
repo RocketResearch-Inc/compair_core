@@ -1,20 +1,29 @@
 # Baseline local self-host readiness audit
 
-Status: **blocked; not release-ready**  
-Audit date: 2026-08-17  
-Core committed revision: `16b05d162c3bfae63a76aba127930dc606e76019`  
-CLI committed revision: `df50c66d8f2ffb106f58d75c7f70a08b6a78326a`
+Status: **blocked; not release-ready**
+Audit date: 2026-08-17
+Core checkpoint (`feature/baseline-v1`): `4a31a47c79a6768319433e4835edb2688d21daae`
+CLI checkpoint (`main`): `94031136df4702d1613f0bd62467098d01b4e909`
 
-This is a Phase 2B2M.0 audit of the `baseline_v1` local workflow:
+This is the Phase 2B2M.0 audit updated through the Phase 2B2M.2 local
+repository-provisioning closeout for the `baseline_v1` workflow:
 
 ```text
 scan -> upload -> ingestion -> index -> run -> preview
 ```
 
-It changes no runtime behavior. “Clean clone” below means the files recorded by
-the two revisions above, not uncommitted files present in a developer working
-tree. The audit also inspected the current post-Phase working trees to identify
-what would become available after those changes are reviewed and committed.
+“Clean clone” below means the files recorded by the two revisions above, not
+uncommitted files, local excludes, editable installs, caches, or validation
+directories. Phase 2B2M.1 confirmed that both checkpoint clones now contain the
+baseline implementation. The CLI `main` checkpoint temporarily depends on the
+Core `feature/baseline-v1` checkpoint's API and protocol behavior. Do not
+publish or automate a mixed-branch release until that compatibility constraint
+is removed.
+
+The M2 repository-provisioning implementation described here is currently a
+tested working-tree change set, not part of those recorded revisions. Its
+“ready” classifications become clean-clone claims only after the Core and CLI
+changes are committed, pushed, and rerun from those new revisions.
 
 This audit does not claim benchmark parity. The earlier live validation proved
 that individual components can interoperate when manually provisioned; it did
@@ -23,31 +32,25 @@ artifacts.
 
 ## Verdict
 
-A technically capable user cannot currently complete the workflow from clean
-clones under the stated constraints. The first decisive failure is release
-integrity:
+A technically capable user still cannot complete the entire model-backed
+workflow from clean clones under the stated constraints, but repository
+provisioning and scan-plan creation are now supported. The CLI exposes
+repository register/list/inspect/state/bind, plan creation, and the existing
+scan/upload/index/run/preview commands. Core exposes authenticated discovery in
+addition to its existing group-admin registration and state services.
 
-- the committed CLI has no `compair baseline` command;
-- the committed Core has no control-plane worker entry point and does not
-  contain most of the current control-plane/run implementation; and
-- the current post-Phase source tree can build a Python wheel containing the
-  worker and runtime modules, but the loopback BGE helper, protocol artifacts,
-  and operator documents are not installed by that wheel.
+The local authority policy is now explicit: the existing
+`repository-identity.v1` envelope uses
+`authority=compair-local-repository.v1` and a cryptographically random UID
+generated once by the CLI. Core's opaque group-scoped registration ID remains
+the authority used by manifests. Paths, names, remotes, revisions, root commits,
+and the local Git sanity fingerprint do not authorize anything.
 
-Even after the current working trees are committed, the public workflow stops
-at repository approval. Core has a documented, authenticated group-admin POST
-API for registration, but the CLI has no register/list/state commands and no
-supported way to obtain the registration IDs for a scan plan. More importantly,
-the approved descriptor requires an authority and a provider-stable repository
-UID, while no committed security policy defines those values for a local-only
-Git repository. A checkout path, remote display name, or revision is explicitly
-not authorization. This audit therefore does not invent a mapping.
-
-The remaining release blockers are a supported strict local generation
-service, a reproducible local service stack, and operational discovery/
-diagnostics. The temporary Ollama translation proxy used during validation is
-not committed or supported, and Core cannot call native Ollama directly through
-the current strict baseline adapter.
+The remaining release blockers are a supported strict local generation service, a supported BGE
+service package/launcher, a reproducible local service stack, and operational
+discovery/diagnostics. The temporary Ollama translation proxy used during
+validation is not committed or supported, and Core cannot call native Ollama
+directly through the current strict baseline adapter.
 
 ## Classification
 
@@ -61,29 +64,29 @@ the current strict baseline adapter.
 
 ## End-to-end prerequisite audit
 
-| Step | Clean-clone state | Post-Phase working-tree state | Finding |
-| --- | --- | --- | --- |
-| Install Core | **ready** for the committed legacy package, assuming dependency download access | **ready** as an editable source install; current wheel includes the Python runtime modules | An offline isolated `pip install .` could not download build dependencies during this audit. `pip wheel --no-build-isolation --no-deps` succeeded. |
-| Install CLI | **ready** for legacy CLI | **ready** from source | The committed binary builds but `compair baseline --help` is an unknown command. Current working-tree binary exposes scan/upload/index/run/preview. |
-| Initialize SQLite | **ready** | **ready** | Import/startup creates the SQLite database and runs the forward migration registry. No separate command exists to inspect migration readiness. |
-| Initialize PostgreSQL | **requires manual/internal action** | **requires manual/internal action** | A PostgreSQL URL is supported and tests have exercised PostgreSQL, but there is no baseline-ready supported compose profile. The CLI development compose uses `postgres:15-alpine`, has a placeholder worker, and is not the baseline stack. |
-| Start Core API | **ready** for committed behavior | **ready** from source | `uvicorn compair_core.server.app:create_app --factory` is documented. The published container/`compair core up` path is not pinned to the audited working tree. |
-| Create/authenticate user | **ready** | **ready** | Single-user mode auto-provisions a user/session; account mode has CLI signup/login. Baseline endpoints still require an authenticated identity. |
-| Create/select group | **ready** | **ready** | `compair group create`, `group ls`, `group show`, and `group use` expose the group ID. |
-| Create authoritative source document | **ready** | **ready** | `compair track` creates the repository document; `compair group files` and `compair docs list --json` expose document IDs. |
-| Register repositories | **missing** from CLI; API absent in clean Core | **blocked** for local-only identity; otherwise **requires manual/internal action** | The admin POST API exists only in the current tree. There is no CLI register/list/state surface. Local authority/UID policy is unspecified. |
-| Configure AES-GCM keyring | **missing** | **usable but undocumented** in the main setup surface | The keyring format and add-before-remove procedure are documented in [baseline-run-query-protection.md](baseline-run-query-protection.md), but `.env.example` omits it and there is no safe inspect/drain command for deciding when an old key can be removed. |
-| Start pinned BGE | Helper is committed, but not packaged | **requires manual/internal action** | [baseline-embedding-service.md](baseline-embedding-service.md) documents an operator-only validation adapter and a pre-downloaded snapshot. There is no supported downloader, launcher, image, or compose service. |
-| Configure strict local generation | **missing** | **missing** | Native Ollama is incompatible with the current request/response envelope. The validation proxy is temporary and uncommitted. The bundled local model is a legacy hash/heuristic service and is not permitted as a baseline fallback. |
-| Start `compair-core-worker` | **missing** | **ready from the source tree/wheel**, but deployment is manual | Current help is `compair-core-worker (--once | --poll)`. The CLI compose worker remains `sleep infinity`. |
-| Verify capabilities | **missing** | **requires manual/internal action** | Baseline commands preflight internally, but no standalone baseline doctor/capability command exists. Safe reason codes collapse several causes into `capability_unavailable` or `worker_unavailable`. |
-| Create scan plan | **missing** | **requires manual/internal action**, then **blocked** by registration policy | The scanner is pure and deterministic, but the user must hand-author JSON containing opaque registration and source-document IDs. |
-| Scan | **missing** | **ready**, conditional on a valid plan | `compair baseline scan --dry-run --json` is local-only and rejects mutable/nonconforming input. |
-| Upload and ingest | **missing** | **ready**, conditional on registration, services, and worker | Upload is resumable and the database worker can execute the existing continuation. |
-| Build index | **missing** | **ready**, conditional on live pinned BGE and worker | The CLI submits the existing compatible-index continuation and can wait/status it. |
-| Run | **missing** | **ready**, conditional on the strict provider, keyring, worker, and exact publication | Document-level retrieval is fail-closed and has no legacy/hash fallback. |
-| Preview | **missing** | **ready**, conditional on a completed job | Preview returns findings in durable ordinal order and accepts an explicit group plus job/digest ID. |
-| Shutdown/restart | **missing as one stack** | **usable but undocumented** | Individual processes drain/recover by leases. No supported launcher orders startup/shutdown or verifies a common configuration. |
+| Step | Current implementation state | Finding |
+| --- | --- | --- |
+| Install Core | **ready** | A clean Python 3.11 install with declared `dev,postgres` extras builds wheel/sdist; a fresh wheel install exposes `compair-core-worker`. |
+| Install CLI | **ready** | A clean Go build exposes baseline scan/upload/index/run/preview. It is temporarily paired to the Core feature checkpoint above. |
+| Initialize SQLite | **ready** | Import/startup creates the SQLite database and runs migrations `0000` through `0013`. No separate command inspects migration readiness. |
+| Initialize PostgreSQL | **requires manual/internal action** | PostgreSQL is supported and tested, but there is no supported baseline-ready compose profile. |
+| Start Core API | **ready from source or wheel** | `uvicorn compair_core.server.app:create_app --factory` uses only packaged runtime modules. |
+| Create/authenticate user | **ready** | Single-user mode auto-provisions a user/session; account mode has CLI signup/login. Baseline endpoints still require an authenticated identity. |
+| Create/select group | **ready** | `compair group create`, `group ls`, `group show`, and `group use` expose the group ID. |
+| Create authoritative source document | **ready** | `compair track`, `group files`, and `docs list --json` expose document IDs. |
+| Register repositories | **ready** | `baseline repository register/list/inspect/state/bind` uses authenticated Core services and protected local bindings. |
+| Configure AES-GCM keyring | **documented but manual** | `.env.example` now shows a deliberately nonfunctional structure. There is still no safe inspect/drain command for rotation. |
+| Start pinned BGE | **validation-only helper** | The source-only helper requires a pre-downloaded snapshot; there is no supported downloader, package entry point, image, or supervisor. |
+| Configure strict local generation | **missing** | Native Ollama and the bundled legacy service do not implement the strict baseline envelope; the temporary proxy is not committed. |
+| Start `compair-core-worker` | **ready**, deployment manual | `compair-core-worker (--once | --poll)` is installed by the wheel. The CLI development compose worker remains unsuitable. |
+| Verify capabilities | **requires manual/internal action** | Commands preflight, but no standalone baseline doctor explains all not-ready causes. |
+| Create scan plan | **ready**, conditional on active registrations | `baseline plan create` resolves protected bindings, pins Git revisions, reauthorizes registrations, and writes the exact scanner-input contract. |
+| Scan | **ready**, conditional | `compair baseline scan --dry-run` emits JSON, is local-only, and fails closed. |
+| Upload and ingest | **ready**, conditional | Upload is resumable and the database worker can execute the continuation. |
+| Build index | **ready**, conditional | Requires a live, pinned BGE adapter and worker. |
+| Run | **ready**, conditional | Requires strict generation, keyring, worker, authorization, and the exact publication; there is no fallback. |
+| Preview | **ready**, conditional | Findings are returned in durable ordinal order. |
+| Shutdown/restart | **usable but undocumented as one stack** | Individual leases recover; no supported launcher verifies a common configuration. |
 
 ## Identifier discovery
 
@@ -94,7 +97,7 @@ No identifier in this workflow should be guessed.
 | user/session | `compair login`, `compair whoami`; single-user Core session | ready |
 | group ID | `compair group ls` or `compair group show` | ready |
 | source-document ID | `compair track`, then `compair group files` or `compair docs list --json` | ready |
-| repository registration ID | returned by the admin create API only; there is no list command/endpoint | missing discovery path |
+| repository registration ID | `compair baseline repository register/list/inspect` | ready |
 | corpus/generation ID | successful `baseline upload --wait` JSON | ready once upload is possible |
 | ingestion continuation/job ID | upload result/status JSON | ready once upload is possible |
 | index job/publication ID | `baseline index` result/status JSON | ready once index submission is possible |
@@ -102,9 +105,9 @@ No identifier in this workflow should be guessed.
 | notification digest ID | authenticated status/preview data when a digest exists | not required for job-ID preview |
 
 The scanner input field named `repository_id` is the opaque registration ID,
-not a Git remote, directory name, or friendly repository name. The current CLI
-help and scanner-input documentation do not make the end-to-end acquisition of
-that value possible.
+not a Git remote, directory name, or friendly repository name. `baseline plan
+create` supplies it only after resolving and revalidating an HMAC-protected
+local binding.
 
 ## Explicit investigation results
 
@@ -115,6 +118,8 @@ The current Core tree implements:
 ```text
 POST /baseline/control/admin/v1/repositories/register
 POST /baseline/control/admin/v1/repositories/state
+POST /baseline/control/admin/v1/repositories/list
+POST /baseline/control/v1/repositories/inspect
 ```
 
 Authorization is based on durable group membership plus `administrator` /
@@ -122,18 +127,23 @@ Authorization is based on durable group membership plus `administrator` /
 request-supplied role. Ordinary members cannot provision or reactivate a
 registration.
 
-The API contract is documented in
-[baseline-control-plane-continuation.md](baseline-control-plane-continuation.md),
-but it is not a complete self-host operator experience:
+The discovery contract is frozen in
+`protocol/baseline-repository-discovery.v1.*`. List is group-admin-only;
+inspect is available to a current authorized group member because plan and run
+submission must resolve an already approved registration. Responses contain
+the immutable descriptor and hash, opaque IDs, state, nullable source document,
+and timestamps. They contain no local path, remote URL, credentials, audit-user
+identity, private idempotency material, content, diff, or query.
 
-- no CLI command submits the admin request;
-- no list/read endpoint discovers existing registrations;
-- the normal CLI login does not expose a token for a separate documented curl
-  workflow; and
-- no policy defines `authority` and `repository_uid` for local-only repositories.
-
-The final item is a security decision. Persisting a checkout path, friendly
-name, or request revision as authority would violate the frozen trust model.
+The CLI stores bindings under
+`~/.compair/state/baseline-repositories/<binding-id>.json`. Each record is
+versioned, HMAC-authenticated with the existing installation secret, written
+atomically with private permissions, and contains the group, registration,
+random UID, descriptor hash, canonical local path, path hash, and a
+non-authoritative Git sanity hash. Moving or recloning requires the explicit
+`repository bind` operation. Disabling in Core immediately blocks plan and
+subsequent control-plane submission while preserving registration and local
+audit state.
 
 ### Generation and Ollama
 
@@ -182,17 +192,13 @@ normal local startup path.
 
 ### Configuration consistency
 
-`.env.example` contains only two baseline-related settings: legacy/default
-retrieval selection and notifications disabled. It omits all settings required
-for a real baseline run:
-
-- control-plane loopback/proxy policy;
-- baseline run enablement;
-- database-worker mode, polling, heartbeat, capacity, cleanup, and retry values;
-- baseline embedding provider, endpoint, pinned revision/dimension, limits, and
-  loopback policy;
-- AES-GCM keyring and payload lifetime; and
-- strict baseline generation model/version/timeout values.
+`.env.example` now enumerates the baseline retrieval default, explicit-query
+transport exception, control-plane loopback/proxy policy, run gate, worker
+timing/capacity/retry values, a deliberately nonfunctional AES-GCM keyring
+shape, payload lifetime, pinned embedding identity and limits, strict generation
+identity/timeout, notification default-off behavior, and a commented disposable
+PostgreSQL test URL. All opt-in or insecure-local switches remain false, and no
+working credential is present.
 
 The settings are distributed across focused documents, while the general
 README describes the legacy HTTP generation shape (`length_instruction` and a
@@ -262,18 +268,26 @@ this audit. The BGE validation environment is pinned to Python 3.11 but has no
 documented macOS-arm64 versus Linux-amd64 compatibility matrix. The exact
 snapshot ran previously on this macOS host; a clean Linux run was not executed.
 
-Package checks found:
+Checkpoint package checks found:
 
-- the committed CLI builds successfully, but contains no baseline command;
-- the current working-tree CLI builds with baseline commands because Go embeds
-  their source at compile time;
-- a clean committed Core wheel contains the earlier retrieval modules only and
-  no `compair-core-worker` entry point;
-- a current working-tree Core wheel contains `compair_core.worker`, the new
-  control-plane modules, and the console entry point; and
-- neither Core wheel contains top-level `scripts/`, `protocol/`, or `docs/`
-  files. In particular, the BGE service and frozen requirements are not
-  installed with `pip install compair-core`.
+- the clean CLI builds with baseline scan/upload/index/run/preview commands;
+- the clean Core wheel contains API startup, migrations `0000` through `0013`,
+  control-plane v1/v2, database worker, corpus ingestion, index publication,
+  run execution, evidence persistence, generation coordination, notification
+  outbox, preview, and the `compair-core-worker` entry point;
+- runtime code does not open top-level `protocol/`, `docs/`, or `scripts/` paths;
+  protocol identities and schemas used at runtime are frozen in package modules,
+  while repository tests enforce byte/hash identity against Core and CLI copies;
+- `protocol/` and `docs/` therefore remain repository-only specification and
+  operator material; and
+- `scripts/` remains source-only validation tooling. In particular,
+  `live_baseline_embedding_service.py` and its frozen requirements are not a
+  supported installed service and are intentionally absent from the wheel.
+
+No supported command depends on a source-checkout-relative path. If the BGE
+helper is promoted to a supported self-host service later, it must gain a
+packaged entry point or separate versioned distribution rather than silently
+relying on `scripts/`.
 
 The CLI development compose stack is not a solution: its worker command is a
 placeholder sleep, its model uses deterministic hash embeddings and heuristic
@@ -329,59 +343,35 @@ sleep worker and hash-model service from any profile advertised for
 
 ## Highest-priority gaps
 
-1. **Release integrity:** commit/review the current Core and CLI workflow, make
-   package/container contents reproducible, and test a checkout containing only
-   tracked files.
-2. **Repository authorization and discovery:** approve a local repository
-   identity policy, then add admin register/list/state commands and safe ID
-   discovery/plan creation.
-3. **Supported local providers:** package the pinned BGE service and replace the
+1. **Supported local providers:** package the pinned BGE service and replace the
    temporary Ollama proxy with a maintained strict adapter or direct support.
-4. **One truthful service configuration:** ship a complete environment/compose
+2. **One truthful service configuration:** ship a complete service/compose
    profile, attest API/worker config agreement, and make readiness diagnostics
    actionable.
-5. **Operations and retention:** add stale-resume inspection/cleanup, safe
+3. **Operations and retention:** add stale-resume inspection/cleanup, safe
    key-rotation inspection, and an authorized/audited retention purge policy.
 
 ## Minimum implementation phases
 
-### M1 — release and package integrity
+### M1 — release and package integrity (checkpoint complete)
 
-Likely files:
+The committed baseline checkpoint plus the Phase 2B2M.1 closeout change set has
+clean-clone Core wheel/sdist builds, wheel-install worker smoke, CLI command
+help, protocol byte/hash checks, package manifest inspection, and full-suite
+dependency/test-isolation corrections. This is not a release: CLI `main` still
+depends on Core `feature/baseline-v1`, no tag was created, and no publish
+workflow was invoked.
 
-- Core `pyproject.toml`, package/build manifests, container build files, and CI;
-- current Core control-plane/worker/protocol modules and tests;
-- current CLI baseline commands, `internal/baseline`, protocol copies, Go module
-  files, release configuration, and CI.
+### M2 — authorization bootstrap and discovery (implementation complete; commit pending)
 
-Required tests:
-
-- fresh `git clone`/`git ls-files` build with a clean status;
-- Core sdist/wheel install and console-entry smoke;
-- CLI release binary help and protocol-byte parity;
-- assert required runtime/provider assets are present in the selected delivery
-  artifact; and
-- assert no untracked helper is referenced.
-
-### M2 — authorization bootstrap and discovery
-
-Blocked prerequisite: approve the stable local repository identity authority/
-UID policy.
-
-Likely files:
-
-- Core registration list/read contract and authenticated API, if approved;
-- CLI `baseline repository register|list|state`, plan-init primitives, and docs;
-- safe capability/doctor projections; and
-- authorization and audit tests.
-
-Required tests:
-
-- admin/member/cross-group/revoked behavior on SQLite and PostgreSQL;
-- local and hosted descriptor normalization/collision cases;
-- no path/name/revision establishing authority;
-- registration/source/group IDs flow into a plan without guessing; and
-- no credentials or descriptors in unsafe logs.
+The local authority is frozen as `compair-local-repository.v1`: an
+administrator approves a random CLI-generated UID, while Core's opaque,
+group-scoped registration remains authoritative. Authenticated register,
+list, inspect, state, and explicit bind commands now resolve durable IDs into
+the existing scanner-input contract. Protected HMAC state detects moved,
+recloned, corrupt, and symlinked bindings; paths and remotes never establish or
+reach Core as authorization claims. SQLite, PostgreSQL, race, scanner
+compatibility, disable/reactivate, and no-disclosure tests cover the workflow.
 
 ### M3 — production local providers and configuration
 
@@ -481,46 +471,46 @@ documentation.
 
 ## Verification performed in this audit
 
-- cloned both repositories locally from their recorded commits into an empty
-  temporary directory;
-- built the committed CLI from source: exit 0;
-- inspected committed CLI help: `compair baseline` returned unknown command,
-  exit 1;
-- built the current working-tree CLI and inspected help for baseline,
-  scan/upload/index/run/preview, group/document, login, doctor, and Core;
-- built clean and current Core wheels without dependencies/build isolation and
-  inspected their file and entry-point manifests;
-- inspected `compair-core-worker --help` from the current source with an
-  isolated temporary SQLite database: exit 0;
-- traced API routes, authorization relationships, migration startup, provider
-  envelopes, capabilities, worker heartbeat, resume stores, and deletion/
-  retention schemas; and
-- compared `.env.example`, general setup documentation, focused baseline
-  documentation, and actual setting reads.
+- cloned the remote Core feature branch and CLI main branch into a new temporary
+  directory and confirmed the starting checkpoint SHAs above;
+- installed Core on Python 3.11 with declared `dev,postgres` extras, built wheel
+  and sdist, installed the wheel non-editably, imported API/worker modules, and
+  enumerated migrations `0000` through `0013`;
+- ran installed `compair-core-worker --help`: exit 0;
+- built the clean CLI and ran baseline plus scan/upload/index/run/preview help:
+  every command exited 0;
+- ran 44 focused Core protocol tests plus the CLI protocol/artifact identity
+  tests: pass;
+- applied the Phase 2B2M.1 packaging/test-isolation changes in the paired source
+  worktrees and ran the final Core suite: 562 passed, 42 skipped, no failures;
+- ran CLI `go test ./...`, `go vet ./...`, `go build`, and
+  `go test -race ./...`: all passed;
+- inspected wheel/sdist member lists and extracted content for credentials,
+  databases, local paths, model/cache/state/log/report/environment artifacts,
+  bytecode, and test caches; none were present; and
+- confirmed every package Python runtime module is present in the wheel and
+  that the sdist contains the same runtime source without repository-only tests,
+  protocol copies, docs, or validation scripts.
+
+The initial clean Core suite reproduced exactly two failures. The paginated
+document test failed because two collection-time unit-test loaders replaced
+global SQLAlchemy modules without restoring them; both loaders now restore the
+real modules in `finally`. The XGBoost manifest test failed because the declared
+development extra installed XGBoost but not its scikit-learn wrapper dependency;
+`scikit-learn>=1.4` is now explicit in that extra. The CLI race was two parallel
+tests mutating shared notification-gate globals; those two tests now run
+serially. These are test/development packaging corrections, not production
+retrieval or legacy behavior changes.
 
 Not executed:
 
-- network-dependent clean `pip install .` (the sandbox could not reach the
-  package index for isolated build dependencies);
 - a fresh model download;
 - a new live Ollama run, because no committed compatible adapter exists;
 - Linux/amd64 validation; and
-- an end-to-end clean-clone workflow, because the clean clones do not contain
-  the workflow and the local repository identity decision is blocked.
+- an end-to-end baseline workflow, because local repository authority and
+  supported model-service decisions remain blocked.
 
-Previous validation of the current development tree recorded two unrelated
-Core failures:
-
-```text
-tests/test_api_load_documents.py::test_load_documents_executes_only_paginated_query
-tests/test_reference_reranker.py::ReferenceRerankerTests::test_load_model_resolves_latest_manifest_for_xgboost
-```
-
-Neither is on the baseline control-plane path. They do not explain the
-clean-clone blockers, but a release gate should still either fix or explicitly
-quarantine them. The normal CLI suite passes. The full CLI race run has an
-existing global-state race in `TestCollectNotificationGateResultSkipsDropEvents`
-and `TestParseWaitTimeoutSeconds`; targeted baseline race tests pass. The race
-does not touch baseline scan/upload/index/run state, but it weakens the full
-release signal and should be fixed before calling the CLI release clean.
-
+No commit, tag, push, release, or publish action was performed. The only Core
+GitHub workflow at this checkpoint is a review workflow, not a package-release
+workflow. The CLI release behavior was not invoked; this audit created only
+local temporary build outputs.

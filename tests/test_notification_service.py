@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import importlib.util
 import pathlib
 import sys
 import types
 import unittest
+from dataclasses import dataclass
 
 
 def _load_service_module():
@@ -28,11 +28,9 @@ def _load_service_module():
     sys.modules[notifications_package_name] = notifications_package
 
     sqlalchemy = types.ModuleType("sqlalchemy")
-    sys.modules["sqlalchemy"] = sqlalchemy
 
     sqlalchemy_orm = types.ModuleType("sqlalchemy.orm")
     sqlalchemy_orm.Session = object
-    sys.modules["sqlalchemy.orm"] = sqlalchemy_orm
 
     local_summary = types.ModuleType(f"{compair_package_name}.local_summary")
     local_summary.assess_relation = lambda target, peer: types.SimpleNamespace(kind="route/path mismatch")
@@ -84,7 +82,23 @@ def _load_service_module():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     assert spec.loader is not None
-    spec.loader.exec_module(module)
+    isolated_dependencies = {
+        "sqlalchemy": sqlalchemy,
+        "sqlalchemy.orm": sqlalchemy_orm,
+    }
+    missing = object()
+    previous_dependencies = {
+        name: sys.modules.get(name, missing) for name in isolated_dependencies
+    }
+    try:
+        sys.modules.update(isolated_dependencies)
+        spec.loader.exec_module(module)
+    finally:
+        for name, previous in previous_dependencies.items():
+            if previous is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
     return module
 
 

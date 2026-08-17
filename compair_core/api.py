@@ -6060,6 +6060,70 @@ async def baseline_repository_registration_state_v1(
         )
 
 
+@router.post("/baseline/control/admin/v1/repositories/list")
+@core_router.post("/baseline/control/admin/v1/repositories/list")
+async def baseline_repository_registration_list_v1(
+    request: Request,
+    current_user: models.User = Depends(get_current_user),
+):
+    payload: Mapping[str, Any] | None = None
+    try:
+        require_control_transport(_control_transport_capability(request))
+        parsed = await _read_bounded_control_json(
+            request,
+            maximum_bytes=MAX_CONTROL_REQUEST_BYTES,
+        )
+        payload = parsed.value
+        result = _control_plane_service().list_repository_registrations(
+            payload,
+            caller_user_id=current_user.user_id,
+        )
+        return _control_response(result)
+    except ControlPlaneError as exc:
+        return _control_error_response(exc, payload=payload)
+    except Exception:  # noqa: BLE001 - redact database/provider internals
+        return _control_error_response(
+            ControlPlaneError(
+                "internal_failure",
+                status_code=503,
+                retryable=True,
+            ),
+            payload=payload,
+        )
+
+
+@router.post("/baseline/control/v1/repositories/inspect")
+@core_router.post("/baseline/control/v1/repositories/inspect")
+async def baseline_repository_registration_inspect_v1(
+    request: Request,
+    current_user: models.User = Depends(get_current_user),
+):
+    payload: Mapping[str, Any] | None = None
+    try:
+        require_control_transport(_control_transport_capability(request))
+        parsed = await _read_bounded_control_json(
+            request,
+            maximum_bytes=MAX_CONTROL_REQUEST_BYTES,
+        )
+        payload = parsed.value
+        result = _control_plane_service().inspect_repository_registration(
+            payload,
+            caller_user_id=current_user.user_id,
+        )
+        return _control_response(result)
+    except ControlPlaneError as exc:
+        return _control_error_response(exc, payload=payload)
+    except Exception:  # noqa: BLE001 - redact database/provider internals
+        return _control_error_response(
+            ControlPlaneError(
+                "internal_failure",
+                status_code=503,
+                retryable=True,
+            ),
+            payload=payload,
+        )
+
+
 @router.post("/baseline/control/v1/continuations/status")
 @core_router.post("/baseline/control/v1/continuations/status")
 async def baseline_snapshot_continuation_status_v1(

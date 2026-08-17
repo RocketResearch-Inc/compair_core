@@ -49,6 +49,9 @@ from compair_core.compair.retrieval.continuation_worker import (
     InternalContinuationWorkerIdentity,
 )
 from compair_core.compair.retrieval.control_plane import (
+    REPOSITORY_ADMIN_SCHEMA_VERSION,
+    REPOSITORY_DESCRIPTOR_VERSION,
+    REPOSITORY_DISCOVERY_SCHEMA_VERSION,
     BaselineControlPlaneService,
     ControlPlaneError,
     ControlWriteStage,
@@ -61,6 +64,61 @@ from compair_core.compair.retrieval.corpus import (
 from compair_core.schema_migrations import read_schema_migration_state
 
 POSTGRES_URL = os.getenv("COMPAIR_TEST_POSTGRES_URL")
+
+
+def test_postgres_local_repository_registration_discovery_and_state(
+    postgres_control_environment,
+) -> None:
+    environment = postgres_control_environment
+    registration = environment.service.register_repository(
+        {
+            "schema_version": REPOSITORY_ADMIN_SCHEMA_VERSION,
+            "message_type": "repository_registration_create",
+            "request_id": str(uuid4()),
+            "group_id": environment.group_id,
+            "identity_descriptor": {
+                "version": REPOSITORY_DESCRIPTOR_VERSION,
+                "authority": "compair-local-repository.v1",
+                "repository_uid": "postgres-local-repository-uid",
+            },
+            "source_document_id": environment.source_document_id,
+        },
+        caller_user_id=environment.user_id,
+    )
+    listed = environment.service.list_repository_registrations(
+        {
+            "schema_version": REPOSITORY_DISCOVERY_SCHEMA_VERSION,
+            "message_type": "repository_list_request",
+            "request_id": str(uuid4()),
+            "group_id": environment.group_id,
+        },
+        caller_user_id=environment.user_id,
+    )
+    assert registration["registration_id"] in {
+        item["registration_id"] for item in listed["repositories"]
+    }
+    environment.service.set_repository_registration_state(
+        {
+            "schema_version": REPOSITORY_ADMIN_SCHEMA_VERSION,
+            "message_type": "repository_registration_state",
+            "request_id": str(uuid4()),
+            "group_id": environment.group_id,
+            "registration_id": registration["registration_id"],
+            "active": False,
+        },
+        caller_user_id=environment.user_id,
+    )
+    inspected = environment.service.inspect_repository_registration(
+        {
+            "schema_version": REPOSITORY_DISCOVERY_SCHEMA_VERSION,
+            "message_type": "repository_inspect_request",
+            "request_id": str(uuid4()),
+            "group_id": environment.group_id,
+            "registration_id": registration["registration_id"],
+        },
+        caller_user_id=environment.user_id,
+    )
+    assert inspected["repository"]["state"] == "disabled"
 
 
 @pytest.fixture

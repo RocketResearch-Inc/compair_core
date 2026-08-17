@@ -1,4 +1,4 @@
-# Baseline local self-host runbook (blocked draft)
+# Baseline local self-host runbook (provider-blocked draft)
 
 This is the shortest currently identifiable local sequence for
 `baseline_v1`. It is an audit artifact, not a supported release runbook.
@@ -8,50 +8,53 @@ to claim release readiness or benchmark parity.
 Read the readiness audit first:
 [baseline-local-self-host-readiness.md](baseline-local-self-host-readiness.md).
 
-## Why this runbook cannot complete from a clean clone
+## Checkpoint and why this runbook still cannot complete
 
-At the audited commits:
+This draft is pinned to:
 
-- the Core clean clone lacks the control-plane worker and most current workflow
-  modules; and
-- the CLI clean clone returns `unknown command "baseline"`.
+- Core `feature/baseline-v1` at
+  `4a31a47c79a6768319433e4835edb2688d21daae`; and
+- CLI `main` at `94031136df4702d1613f0bd62467098d01b4e909`.
 
-The remaining commands in this document describe the current post-Phase source
-trees. Those files must first be reviewed, committed, packaged, and released.
-Do not copy untracked modules or temporary validation helpers into a clean
-checkout.
+Clean clones at those checkpoints contain the baseline API, migrations, worker,
+CLI scan/upload/index/run/preview commands, and protocol artifacts. The CLI
+checkpoint temporarily depends on the Core feature checkpoint's API and
+protocol behavior. This pair is a development checkpoint, not a releasable
+cross-branch combination; do not publish or automate it.
 
-The sequence then stops at repository registration. The registration contract
-requires an approved immutable authority and provider-stable repository UID.
-There is no approved rule for deriving those values for a local-only Git
-repository. A local path, remote display string, friendly name, or commit is
-not authorization. Obtain a reviewed policy before proceeding.
+Repository registration and scan-plan creation are supported after Phase
+2B2M.2. The sequence still cannot complete as a release workflow because no
+supported strict local generation service or managed BGE service is shipped.
+Local paths, remote display strings, friendly names, commits, and filesystem
+metadata are never repository authorization.
 
-## 1. Obtain and install the sources
+## 1. Obtain and install the checkpoint sources
 
-Supported legacy source-install commands are:
+Clone the paired source-of-truth branches. The checkpoint SHAs above establish
+the minimum committed baseline implementation; the branch heads must also
+contain the reviewed Phase 2B2M.1 closeout before using this draft.
 
 ```sh
-git clone https://github.com/RocketResearch-Inc/compair_core.git
-git clone https://github.com/RocketResearch-Inc/compair-cli.git
+git clone --branch feature/baseline-v1 --single-branch \
+  https://github.com/RocketResearch-Inc/compair_core.git
+git clone --branch main --single-branch \
+  https://github.com/RocketResearch-Inc/compair-cli.git
 
 cd compair_core
 python3.11 -m venv .venv
 . .venv/bin/activate
-python -m pip install -e '.[dev,postgres]'
+python -m pip install '.[dev,postgres]'
 
 cd ../compair-cli
 go build -o ./compair .
 ```
 
-**Unsupported today:** at the audited commits, the resulting `./compair` has no
-baseline command and the Core install has no `compair-core-worker` entry point.
-The remainder requires the reviewed post-Phase source tree.
-
 Check the expected help before doing anything else:
 
 ```sh
 ./compair baseline --help
+./compair baseline repository --help
+./compair baseline plan create --help
 ./compair baseline scan --help
 ./compair baseline upload --help
 ./compair baseline index --help
@@ -90,9 +93,11 @@ step outside this runbook. Normal Core startup must be the only schema writer.
 
 ## 3. Configure the control plane and worker
 
-API and worker must receive the identical environment. The current
-`.env.example` is incomplete; the values below are assembled from focused
-documents and are not yet a supported single configuration artifact.
+API and worker must receive the identical environment. `.env.example` now
+enumerates every baseline setting with safe/default-off placeholders. The
+values below illustrate the explicit local-development opt-ins needed after
+the missing providers and registration policy are supplied; copying them does
+not make the stack supported.
 
 ```sh
 export COMPAIR_EDITION=core
@@ -179,6 +184,13 @@ python scripts/smoke_baseline_embedding.py \
 entry point, or service image. The helper is not included in the Python wheel.
 Do not allow it to resolve or download a model at service startup.
 
+The helper, smoke client, live retrieval validator, and frozen validation
+requirements under `scripts/` are source-only validation tools. They are not
+installed services. The wheel intentionally contains only the Core runtime and
+`compair-core-worker`; top-level `protocol/` and `docs/` are repository-only
+specification/operator material because runtime uses packaged frozen constants
+and schemas rather than source-checkout-relative files.
+
 ## 5. Start strict local generation
 
 The Core baseline adapter requires a provider that accepts
@@ -258,50 +270,86 @@ compair group files <group-id>
 compair docs list --all-groups --own-only --json
 ```
 
+`compair track` prints `doc_id=<uuid>`. The same ID can be rediscovered with:
+
+```sh
+compair --group <group-id> docs list --own-only --all-pages --json
+```
+
 Record the exact group ID and authoritative repository-document ID returned by
-these public commands. Do not infer either from a name or path.
+these public commands. Do not infer either from a name or path. `track` is the
+existing Core/CLI document workflow; baseline does not create a second document
+concept.
 
 ## 8. Register the changed and sibling repositories
 
-The current Core API shape is documented in
-[baseline-control-plane-continuation.md](baseline-control-plane-continuation.md):
+Run these as a current administrator of the explicit group. For a loopback HTTP
+Core, the exception must be explicit on every control command:
 
-```text
-POST /baseline/control/admin/v1/repositories/register
-POST /baseline/control/admin/v1/repositories/state
+```sh
+compair baseline repository register \
+  --group <group-id> \
+  --path /path/to/changed \
+  --source-document-id <document-id> \
+  --name changed \
+  --allow-loopback-http --json
+
+compair baseline repository register \
+  --group <group-id> \
+  --path /path/to/sibling \
+  --name sibling \
+  --allow-loopback-http --json
+
+compair baseline repository list \
+  --group <group-id> --allow-loopback-http --json
+
+compair baseline repository inspect \
+  --group <group-id> \
+  --registration-id <registration-id> \
+  --allow-loopback-http --json
 ```
 
-An authenticated current group administrator must create each registration.
-The changed registration binds `source_document_id`; sibling registrations use
-`null`. The returned opaque `registration_id` becomes the scanner's
-`repository_id`.
+Registration generates a random local UID once and sends only the identity
+descriptor, explicit group, and optional source document. It never sends the
+path or remote. The server returns its opaque registration ID and the CLI
+creates the initial protected local binding.
 
-**STOP — blocked security decision and missing CLI.** There is no CLI command
-or list endpoint, and no approved local-only `authority` / `repository_uid`
-derivation. Do not use local paths, display names, remotes, or revisions as a
-substitute. The remaining sequence is conditional and cannot be claimed as a
-clean-clone run.
+To bind a moved/recloned or additional working copy, do not register implicitly:
+
+```sh
+compair baseline repository bind \
+  --group <group-id> \
+  --registration-id <registration-id> \
+  --path /new/local/working-copy \
+  --allow-loopback-http --json
+```
+
+The binding state is under
+`~/.compair/state/baseline-repositories/`, uses mode 0700/0600 on POSIX, atomic
+replacement, symlink rejection, and HMAC integrity through
+`~/.compair/state/baseline-upload-install-secret.v1`. Do not edit or copy a
+binding file independently of its installation secret.
 
 ## 9. Create and scan the immutable plan (conditional)
 
-After approved registration IDs exist, create a strict
-`baseline-scanner-inputs.v1` JSON file containing:
-
-- the explicit group ID;
-- changed repository local path, registration ID, display name, immutable head
-  revision, and authoritative source-document ID;
-- one or more sibling local paths, registration IDs, display names, and
-  immutable revisions;
-- distinct immutable base/head revisions; and
-- `dry_run: true` and `json: true`.
-
-Resolve revisions from immutable Git objects, not a dirty working tree:
+Create the exact existing `baseline-scanner-inputs.v1` plan. Base and head may
+be local refs; the command resolves them to immutable commit IDs and pins each
+sibling's current `HEAD`. It performs authorization and Git metadata checks but
+does not scan or upload:
 
 ```sh
-git -C /path/to/changed rev-parse <base-ref>^{commit}
-git -C /path/to/changed rev-parse <head-ref>^{commit}
-git -C /path/to/sibling rev-parse <snapshot-ref>^{commit}
+compair baseline plan create \
+  --group <group-id> \
+  --changed /path/to/changed \
+  --base <base-ref-or-commit> \
+  --head <head-ref-or-commit> \
+  --sibling /path/to/sibling \
+  --output /private/path/baseline-scanner-inputs.v1.json \
+  --allow-loopback-http --json
 ```
+
+Repeat `--sibling` for additional repositories. Existing output is never
+silently replaced; add `--overwrite` only after reviewing the target.
 
 Run the scanner:
 
@@ -309,14 +357,25 @@ Run the scanner:
 compair baseline scan \
   --group <group-id> \
   --plan /path/to/baseline-scanner-inputs.v1.json \
-  --dry-run --json > /path/to/scan-report.json
+  --dry-run > /path/to/scan-report.json
 ```
 
 The report is safe metadata. The scanner re-reads immutable Git objects and
 does not write source/diff bytes to its report.
 
-**Usability gap:** no supported command generates the input plan from listed
-registrations/documents, so the JSON must currently be authored by hand.
+Disable/reactivate testing is explicit and preserves audit history:
+
+```sh
+compair baseline repository state \
+  --group <group-id> --registration-id <sibling-registration-id> \
+  --active=false --allow-loopback-http --json
+
+# plan create and subsequent submission now fail closed
+
+compair baseline repository state \
+  --group <group-id> --registration-id <sibling-registration-id> \
+  --active=true --allow-loopback-http --json
+```
 
 ## 10. Upload and wait for ingestion (conditional)
 

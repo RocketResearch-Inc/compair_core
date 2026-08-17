@@ -23,6 +23,21 @@ Its public handle is an opaque UUID `registration_id`; a manifest's
 }
 ```
 
+For supported local self-hosting, the existing envelope is fixed to:
+
+```json
+{
+  "version": "repository-identity.v1",
+  "authority": "compair-local-repository.v1",
+  "repository_uid": "local_<64 lowercase hexadecimal characters>"
+}
+```
+
+The CLI generates the UID cryptographically once. It is a stable label, not
+proof of ownership. Core's opaque group-scoped `registration_id` is the only
+repository identity accepted by a snapshot. Paths, names, remotes, revisions,
+root commits, and the local sanity fingerprint never grant authority.
+
 `authority` is a normalized lowercase authority label and `repository_uid` is
 the stable identifier assigned by that authority. Neither is a local checkout
 path. Core stores the RFC 8785/JCS SHA-256 of this exact descriptor as well as
@@ -92,6 +107,17 @@ names, or revisions are rejected.
 
 This is idempotent. Both disabling and reactivation require current group-admin
 authorization.
+
+### Discover registrations
+
+`POST /baseline/control/admin/v1/repositories/list` is group-admin-only.
+`POST /baseline/control/v1/repositories/inspect` accepts one opaque
+`registration_id` from a current authorized group member. Both use
+`baseline-repository-discovery.v1`; list ordering is ascending registration ID.
+Responses contain only the immutable descriptor/hash, opaque group and
+registration IDs, active/disabled state, nullable source-document ID, and safe
+timestamps. No local path, remote URL, credentials, audit user, lease, content,
+diff, or query is returned.
 
 ### Read continuation state
 
