@@ -398,7 +398,11 @@ class Reference(Base):
     
 
     reference_id: Mapped[str] = mapped_column(String(36), primary_key=True, init=False, default=lambda: str(uuid4()))
-    source_chunk_id: Mapped[str] = mapped_column(ForeignKey("chunk.chunk_id", ondelete="CASCADE"), index=True)
+    source_chunk_id: Mapped[str | None] = mapped_column(
+        ForeignKey("chunk.chunk_id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
     reference_chunk_id: Mapped[str | None] = mapped_column(ForeignKey("chunk.chunk_id", ondelete="CASCADE"), index=True, nullable=True)
     reference_document_id: Mapped[str | None] = mapped_column(ForeignKey("document.document_id", ondelete="CASCADE"), index=True, nullable=True)
     reference_note_id: Mapped[str | None] = mapped_column(ForeignKey("note.note_id", ondelete="CASCADE"), index=True, nullable=True)
@@ -415,7 +419,11 @@ class Feedback(Base):
 
 
     feedback_id: Mapped[str] = mapped_column(String(36), primary_key=True, init=False, default=lambda: str(uuid4()))
-    source_chunk_id: Mapped[str] = mapped_column(ForeignKey("chunk.chunk_id", ondelete="CASCADE"), index=True)
+    source_chunk_id: Mapped[str | None] = mapped_column(
+        ForeignKey("chunk.chunk_id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
     feedback: Mapped[str] = mapped_column(Text)
     model: Mapped[str] = mapped_column(Text)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), init=False, default=lambda: datetime.now(timezone.utc))

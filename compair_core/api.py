@@ -1,17 +1,18 @@
+import base64
+import binascii
 import hashlib
 import io
 import json
 import logging
 import os
 import re
-import requests
-import base64
-import binascii
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional, Tuple
+from uuid import UUID
 
 import httpx
+import requests
 from celery.result import AsyncResult
 from fastapi import (
     APIRouter,
@@ -25,14 +26,139 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from fastapi.routing import APIRoute
-from sqlalchemy import distinct, func, select, or_, cast, text
+from sqlalchemy import cast, distinct, func, or_, select, text
 from sqlalchemy import inspect as sqlalchemy_inspect
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import joinedload, load_only, Session
+from sqlalchemy.orm import Session, joinedload, load_only
 
+from . import compair
+from .compair import models, schema
+from .compair.embeddings import Embedder, create_embedding
+from .compair.focus_manifest import normalize_focus_manifest
+from .compair.logger import log_event
+from .compair.retrieval import (
+    DEFAULT_RETRIEVAL_ENGINE,
+    RetrievalQueryOrigin,
+    UnknownRetrievalEngineError,
+    new_processing_run_key,
+    retrieval_query_provenance,
+    validate_processing_run_key,
+    validate_retrieval_engine_name,
+)
+from .compair.retrieval.control_plane import (
+    MAX_CONTENT_PART_REQUEST_BYTES,
+    MAX_CONTROL_REQUEST_BYTES,
+    MAX_MANIFEST_REQUEST_BYTES,
+    BaselineControlPlaneService,
+    ControlPlaneError,
+    assess_control_transport,
+    capabilities_response,
+    decode_json_object,
+    index_build_submission_available,
+    require_control_transport,
+    validate_capabilities_request,
+)
+from .compair.retrieval.control_plane_v2 import (
+    MAX_V2_CONTROL_REQUEST_BYTES,
+    MAX_V2_RUN_REQUEST_BYTES,
+    PROTOCOL_V2_SHA256,
+    PROTOCOL_V2_VERSION,
+    V2ControlPlaneError,
+    V2IndexCapability,
+    assess_index_build_capability,
+    not_ready_run_capability,
+    ready_run_capability,
+    unavailable_index_build_capability,
+    unavailable_run_capability,
+)
+from .compair.retrieval.control_plane_v2 import (
+    accepted_response as v2_index_accepted_response,
+)
+from .compair.retrieval.control_plane_v2 import (
+    capabilities_response as v2_capabilities_response,
+)
+from .compair.retrieval.control_plane_v2 import (
+    from_index_job_error as v2_from_index_job_error,
+)
+from .compair.retrieval.control_plane_v2 import (
+    parse_capabilities_request as parse_v2_capabilities_request,
+)
+from .compair.retrieval.control_plane_v2 import (
+    parse_index_build_submission as parse_v2_index_build_submission,
+)
+from .compair.retrieval.control_plane_v2 import (
+    parse_index_status_request as parse_v2_index_status_request,
+)
+from .compair.retrieval.control_plane_v2 import (
+    parse_run_status_request as parse_v2_run_status_request,
+)
+from .compair.retrieval.control_plane_v2 import (
+    parse_run_submission as parse_v2_run_submission,
+)
+from .compair.retrieval.control_plane_v2 import (
+    status_response as v2_index_status_response,
+)
+from .compair.retrieval.database_worker import assess_database_worker_readiness
+from .compair.retrieval.embedding import require_configured_baseline_embedding_adapter
+from .compair.retrieval.index_continuation import (
+    BaselineCompatibleIndexJobService,
+    IndexJobError,
+)
+from .compair.retrieval.preview import (
+    BASELINE_PREVIEW_MAX_REQUEST_BYTES,
+    BASELINE_PREVIEW_SCHEMA_VERSION,
+    BaselinePreviewError,
+    BaselinePreviewService,
+    parse_baseline_preview_request,
+)
+from .compair.retrieval.run_jobs import BaselineRunJobError, BaselineRunJobService
+from .compair.retrieval.run_operator import (
+    BaselineRunRuntime,
+    BaselineRunRuntimeError,
+)
+from .compair.retrieval.transport import (
+    REDACTED_TASK_ARGS_REPR,
+    REDACTED_TASK_KWARGS_REPR,
+    RetrievalQueryTransportPolicyError,
+    require_retrieval_query_transport,
+)
+from .compair.tasks import (
+    process_document_task as process_document_celery,
+)
+from .compair.tasks import (
+    send_deactivate_request_email,
+    send_feature_announcement_task,
+    send_help_request_email,
+    send_waitlist_signup_email,
+)
+from .compair.topic_tags import extract_topic_tags
+from .compair.utils import (
+    chunk_text,
+    generate_verification_token,
+    log_activity,
+    sanitize_text_for_database,
+    sign_compact_payload,
+    verify_compact_payload,
+)
+from .compair_email.email import EMAIL_USER, emailer
+from .compair_email.templates import (
+    ACCOUNT_VERIFY_TEMPLATE,
+    GROUP_INVITATION_TEMPLATE,
+    GROUP_JOIN_TEMPLATE,
+    INDIVIDUAL_INVITATION_TEMPLATE,
+    NOTIFICATION_DELIVERY_VERIFY_TEMPLATE,
+    PASSWORD_RESET_TEMPLATE,
+    REFERRAL_CREDIT_TEMPLATE,
+)
+from .db import engine as core_database_engine
 from .server.deps import (
     get_analytics,
     get_billing,
@@ -49,53 +175,6 @@ from .server.providers.contracts import (
 )
 from .server.resource_metrics import attach_service_resource_metrics
 from .server.settings import Settings
-
-from . import compair
-from .compair import models, schema
-from .compair.embeddings import create_embedding, Embedder
-from .compair.focus_manifest import normalize_focus_manifest
-from .compair.logger import log_event
-from .compair.retrieval import (
-    DEFAULT_RETRIEVAL_ENGINE,
-    RetrievalQueryOrigin,
-    UnknownRetrievalEngineError,
-    new_processing_run_key,
-    retrieval_query_provenance,
-    validate_processing_run_key,
-    validate_retrieval_engine_name,
-)
-from .compair.retrieval.transport import (
-    REDACTED_TASK_ARGS_REPR,
-    REDACTED_TASK_KWARGS_REPR,
-    RetrievalQueryTransportPolicyError,
-    require_retrieval_query_transport,
-)
-from .compair.topic_tags import extract_topic_tags
-from .compair.utils import (
-    chunk_text,
-    generate_verification_token,
-    log_activity,
-    sanitize_text_for_database,
-    sign_compact_payload,
-    verify_compact_payload,
-)
-from .compair_email.email import emailer, EMAIL_USER
-from .compair_email.templates import (
-    ACCOUNT_VERIFY_TEMPLATE,
-    GROUP_INVITATION_TEMPLATE,
-    GROUP_JOIN_TEMPLATE,
-    INDIVIDUAL_INVITATION_TEMPLATE,
-    NOTIFICATION_DELIVERY_VERIFY_TEMPLATE,
-    PASSWORD_RESET_TEMPLATE,
-    REFERRAL_CREDIT_TEMPLATE,
-)
-from .compair.tasks import (
-    process_document_task as process_document_celery,
-    send_feature_announcement_task,
-    send_deactivate_request_email,
-    send_help_request_email,
-    send_waitlist_signup_email,
-)
 
 try:
     import redis  # type: ignore
@@ -5540,6 +5619,1085 @@ def get_notification_events(
             ],
             "total_count": total_count,
         }
+
+
+@router.post("/baseline/preview/v1")
+@core_router.post("/baseline/preview/v1")
+async def post_baseline_preview_v1(
+    request: Request,
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return one terminal document-control result without mutating delivery."""
+
+    payload: Mapping[str, Any] | None = None
+    try:
+        require_control_transport(_control_transport_capability(request))
+        parsed = await _read_bounded_control_json(
+            request,
+            maximum_bytes=BASELINE_PREVIEW_MAX_REQUEST_BYTES,
+        )
+        payload = parsed.value
+        command = parse_baseline_preview_request(
+            payload,
+            caller_user_id=current_user.user_id,
+        )
+        preview = BaselinePreviewService(compair.Session).load(command)
+    except BaselinePreviewError as exc:
+        invalid = exc.code == "baseline_preview_request_invalid"
+        return JSONResponse(
+            {
+                "schema_version": BASELINE_PREVIEW_SCHEMA_VERSION,
+                "request_id": _safe_control_request_id(payload),
+                "code": (
+                    "preview_request_invalid" if invalid else "preview_not_found"
+                ),
+            },
+            status_code=422 if invalid else 404,
+            headers=_CONTROL_NO_STORE_HEADERS,
+        )
+    except ControlPlaneError as exc:
+        code = "preview_transport_unavailable"
+        if exc.code == "invalid_contract":
+            code = "preview_request_invalid"
+        elif exc.code == "limit_exceeded":
+            code = "preview_request_too_large"
+        return JSONResponse(
+            {
+                "schema_version": BASELINE_PREVIEW_SCHEMA_VERSION,
+                "request_id": _safe_control_request_id(payload),
+                "code": code,
+            },
+            status_code=exc.status_code,
+            headers=_CONTROL_NO_STORE_HEADERS,
+        )
+    except Exception:  # noqa: BLE001 - redact database and authorization internals
+        return JSONResponse(
+            {
+                "schema_version": BASELINE_PREVIEW_SCHEMA_VERSION,
+                "request_id": _safe_control_request_id(payload),
+                "code": "preview_unavailable",
+            },
+            status_code=503,
+            headers=_CONTROL_NO_STORE_HEADERS,
+        )
+    return JSONResponse(preview.to_dict(), headers=_CONTROL_NO_STORE_HEADERS)
+
+
+_CONTROL_NO_STORE_HEADERS = {
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+}
+
+
+def _control_plane_service() -> BaselineControlPlaneService:
+    return BaselineControlPlaneService(core_database_engine)
+
+
+def _compatible_index_job_service() -> BaselineCompatibleIndexJobService:
+    settings = get_settings_dependency()
+    return BaselineCompatibleIndexJobService(
+        core_database_engine,
+        lambda: require_configured_baseline_embedding_adapter(settings),
+    )
+
+
+def _baseline_run_runtime() -> BaselineRunRuntime:
+    return BaselineRunRuntime(core_database_engine, get_settings_dependency())
+
+
+def _baseline_run_capability(
+    *, group_id: str, caller_user_id: str
+):
+    settings = get_settings_dependency()
+    if not bool(getattr(settings, "baseline_runs_enabled", False)):
+        return unavailable_run_capability(), None
+    worker_mode = str(getattr(settings, "baseline_worker_mode", "manual"))
+    dispatch = "automatic" if worker_mode == "database" else "manual"
+    try:
+        runtime = _baseline_run_runtime()
+        capability = runtime.capability(
+            group_id=group_id,
+            caller_user_id=caller_user_id,
+        )
+        if not capability.ready:
+            return (
+                not_ready_run_capability(
+                    capability.reason_code or "capability_unavailable",
+                    dispatch=dispatch,
+                ),
+                runtime,
+            )
+        if worker_mode == "database":
+            worker = assess_database_worker_readiness(
+                core_database_engine,
+                settings,
+                required_job_types=("baseline_run", "cleanup"),
+            )
+            if not worker.ready:
+                return (
+                    not_ready_run_capability(
+                        worker.reason_code or "worker_unavailable",
+                        dispatch="automatic",
+                    ),
+                    runtime,
+                )
+            return ready_run_capability(dispatch="automatic"), runtime
+        return ready_run_capability(dispatch="manual"), runtime
+    except BaselineRunRuntimeError as exc:
+        return not_ready_run_capability(exc.code, dispatch=dispatch), None
+    except Exception:  # noqa: BLE001 - readiness output is deliberately sanitized
+        return (
+            not_ready_run_capability(
+                "capability_unavailable",
+                dispatch=dispatch,
+            ),
+            None,
+        )
+
+
+def _index_dispatch_capability(
+    capability: V2IndexCapability,
+) -> V2IndexCapability:
+    settings = get_settings_dependency()
+    if str(getattr(settings, "baseline_worker_mode", "manual")) != "database":
+        return capability
+    if not capability.ready:
+        return V2IndexCapability(
+            capability.readiness,
+            capability.reason_code,
+            capability.identity,
+            "automatic",
+        )
+    worker = assess_database_worker_readiness(
+        core_database_engine,
+        settings,
+        required_job_types=("index_build", "cleanup"),
+    )
+    if not worker.ready:
+        return V2IndexCapability(
+            "not_ready",
+            worker.reason_code or "worker_unavailable",
+            capability.identity,
+            "automatic",
+        )
+    return V2IndexCapability("ready", None, capability.identity, "automatic")
+
+
+def _control_transport_capability(request: Request):
+    settings = get_settings_dependency()
+    proxy_header_names = {
+        "cf-connecting-ip",
+        "client-ip",
+        "forwarded",
+        "true-client-ip",
+        "x-client-ip",
+        "x-cluster-client-ip",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-port",
+        "x-forwarded-proto",
+        "x-forwarded-server",
+        "x-original-forwarded-for",
+        "x-proxyuser-ip",
+        "x-real-ip",
+    }
+    return assess_control_transport(
+        connection_scheme=str(request.scope.get("scheme", "")),
+        peer_host=request.client.host if request.client is not None else None,
+        allow_insecure_loopback=bool(
+            getattr(
+                settings,
+                "baseline_control_plane_allow_insecure_loopback",
+                False,
+            )
+        ),
+        trusted_proxy_allowlist=str(
+            getattr(
+                settings,
+                "baseline_control_plane_trusted_proxy_allowlist",
+                "",
+            )
+        ),
+        forwarded_values=request.headers.getlist("forwarded"),
+        x_forwarded_proto_values=request.headers.getlist("x-forwarded-proto"),
+        proxy_headers_present=any(
+            header_name in request.headers for header_name in proxy_header_names
+        ),
+    )
+
+
+async def _read_bounded_control_json(
+    request: Request,
+    *,
+    maximum_bytes: int,
+):
+    content_type_values = request.headers.getlist("content-type")
+    if len(content_type_values) != 1:
+        raise ControlPlaneError("invalid_contract", status_code=400)
+    content_type_parts = [part.strip() for part in content_type_values[0].split(";")]
+    if not content_type_parts or content_type_parts[0].lower() != "application/json":
+        raise ControlPlaneError("invalid_contract", status_code=400)
+    for parameter in content_type_parts[1:]:
+        key, separator, value = parameter.partition("=")
+        if (
+            not separator
+            or key.strip().lower() != "charset"
+            or value.strip().strip('"').lower() not in {"utf-8", "utf8"}
+        ):
+            raise ControlPlaneError("invalid_contract", status_code=400)
+    if request.headers.get("content-encoding", "identity").lower() not in {
+        "",
+        "identity",
+    }:
+        raise ControlPlaneError("invalid_contract", status_code=400)
+    declared_length = request.headers.get("content-length")
+    if declared_length:
+        try:
+            if int(declared_length) > maximum_bytes or int(declared_length) < 0:
+                raise ControlPlaneError("limit_exceeded", status_code=413)
+        except ValueError as exc:
+            raise ControlPlaneError("invalid_contract", status_code=400) from exc
+    body = bytearray()
+    streaming_digest = hashlib.sha256()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > maximum_bytes:
+            raise ControlPlaneError("limit_exceeded", status_code=413)
+        streaming_digest.update(chunk)
+        body.extend(chunk)
+    parsed = decode_json_object(bytes(body))
+    if parsed.body_sha256 != streaming_digest.hexdigest():  # pragma: no cover
+        raise ControlPlaneError(
+            "internal_failure",
+            status_code=503,
+            stage="transport",
+            retryable=True,
+        )
+    return parsed
+
+
+def _safe_control_request_id(payload: Mapping[str, Any] | None) -> str | None:
+    if payload is None:
+        return None
+    candidate = payload.get("request_id")
+    if not isinstance(candidate, str):
+        return None
+    try:
+        parsed = UUID(candidate)
+    except ValueError:
+        return None
+    return str(parsed)
+
+
+def _control_response(payload: Mapping[str, Any], *, status_code: int = 200):
+    return JSONResponse(
+        dict(payload),
+        status_code=status_code,
+        headers=_CONTROL_NO_STORE_HEADERS,
+    )
+
+
+def _control_error_response(
+    error: ControlPlaneError,
+    *,
+    payload: Mapping[str, Any] | None,
+):
+    return _control_response(
+        error.to_dict(_safe_control_request_id(payload)),
+        status_code=error.status_code,
+    )
+
+
+def _v2_request_id(payload: Mapping[str, Any] | None) -> str | None:
+    return _safe_control_request_id(payload)
+
+
+def _v2_error_response(
+    error: V2ControlPlaneError,
+    *,
+    payload: Mapping[str, Any] | None,
+):
+    return _control_response(
+        error.as_dict(_v2_request_id(payload)),
+        status_code=error.status_code,
+    )
+
+
+def _v2_from_control_error(
+    error: ControlPlaneError,
+    *,
+    stage: str,
+) -> V2ControlPlaneError:
+    code = error.code
+    if code == "invalid_contract":
+        code = "protocol_mismatch"
+    elif code == "not_found_or_forbidden":
+        code = "job_not_found_or_forbidden"
+    elif code not in {
+        "authorization_revoked",
+        "capability_unavailable",
+        "limit_exceeded",
+        "protocol_mismatch",
+        "repository_not_authorized",
+        "source_not_authorized",
+        "transport_unavailable",
+    }:
+        code = "internal_failure"
+    status_code = error.status_code
+    if status_code not in {400, 401, 403, 404, 409, 413, 422, 429, 503}:
+        status_code = 503
+    return V2ControlPlaneError(
+        code,
+        status_code=status_code,
+        stage=stage,
+        retryable=error.retryable,
+    )
+
+
+def _v2_from_run_error(
+    error: BaselineRunJobError,
+    *,
+    stage: str,
+) -> V2ControlPlaneError:
+    if error.code in {
+        "not_found_or_forbidden",
+        "job_not_found_or_forbidden",
+        "source_not_authorized",
+        "repository_not_authorized",
+    }:
+        code = (
+            error.code
+            if error.code in {"source_not_authorized", "repository_not_authorized"}
+            and stage == "run_submission"
+            else "job_not_found_or_forbidden"
+        )
+        status = 404
+    elif error.code == "idempotency_conflict":
+        code = "idempotency_conflict"
+        status = 409
+    elif error.code == "index_publication_stale":
+        code = "index_publication_stale"
+        status = 409
+    elif error.code in {
+        "run_payload_lifetime_invalid",
+        "run_keyring_invalid",
+        "run_keyring_unavailable",
+    }:
+        code = "capability_unavailable"
+        status = 503
+    else:
+        code = "internal_failure"
+        status = 503
+    return V2ControlPlaneError(
+        code,
+        status_code=status,
+        stage=stage,
+        retryable=error.retryable,
+    )
+
+
+@router.post("/baseline/control/admin/v1/repositories/register")
+@core_router.post("/baseline/control/admin/v1/repositories/register")
+async def baseline_repository_registration_create_v1(
+    request: Request,
+    current_user: models.User = Depends(get_current_user),
+):
+    payload: Mapping[str, Any] | None = None
+    try:
+        require_control_transport(_control_transport_capability(request))
+        parsed = await _read_bounded_control_json(
+            request,
+            maximum_bytes=MAX_CONTROL_REQUEST_BYTES,
+        )
+        payload = parsed.value
+        result = _control_plane_service().register_repository(
+            payload,
+            caller_user_id=current_user.user_id,
+        )
+        return _control_response(result, status_code=201)
+    except ControlPlaneError as exc:
+        return _control_error_response(exc, payload=payload)
+    except Exception:  # noqa: BLE001 - redact database/provider internals
+        return _control_error_response(
+            ControlPlaneError(
+                "internal_failure",
+                status_code=503,
+                retryable=True,
+            ),
+            payload=payload,
+        )
+
+
+@router.post("/baseline/control/admin/v1/repositories/state")
+@core_router.post("/baseline/control/admin/v1/repositories/state")
+async def baseline_repository_registration_state_v1(
+    request: Request,
+    current_user: models.User = Depends(get_current_user),
+):
+    payload: Mapping[str, Any] | None = None
+    try:
+        require_control_transport(_control_transport_capability(request))
+        parsed = await _read_bounded_control_json(
+            request,
+            maximum_bytes=MAX_CONTROL_REQUEST_BYTES,
+        )
+        payload = parsed.value
+        result = _control_plane_service().set_repository_registration_state(
+            payload,
+            caller_user_id=current_user.user_id,
+        )
+        return _control_response(result)
+    except ControlPlaneError as exc:
+        return _control_error_response(exc, payload=payload)
+    except Exception:  # noqa: BLE001 - redact database/provider internals
+        return _control_error_response(
+            ControlPlaneError(
+                "internal_failure",
+                status_code=503,
+                retryable=True,
+            ),
+            payload=payload,
+        )
+
+
+@router.post("/baseline/control/v1/continuations/status")
+@core_router.post("/baseline/control/v1/continuations/status")
+async def baseline_snapshot_continuation_status_v1(
+    request: Request,
+    current_user: models.User = Depends(get_current_user),
+):
+    payload: Mapping[str, Any] | None = None
+    try:
+        require_control_transport(_control_transport_capability(request))
+        parsed = await _read_bounded_control_json(
+            request,
+            maximum_bytes=MAX_CONTROL_REQUEST_BYTES,
+        )
+        payload = parsed.value
+        result = _control_plane_service().continuation_status(
+            payload,
+            caller_user_id=current_user.user_id,
+        )
+        return _control_response(result)
+    except ControlPlaneError as exc:
+        return _control_error_response(exc, payload=payload)
+    except Exception:  # noqa: BLE001 - redact database/provider internals
+        return _control_error_response(
+            ControlPlaneError(
+                "internal_failure",
+                status_code=503,
+                retryable=True,
+            ),
+            payload=payload,
+        )
+
+
+@router.post("/baseline/control/v1/snapshots")
+@core_router.post("/baseline/control/v1/snapshots")
+async def baseline_snapshot_begin_v1(
+    request: Request,
+    current_user: models.User = Depends(get_current_user),
+):
+    payload: Mapping[str, Any] | None = None
+    try:
+        require_control_transport(_control_transport_capability(request))
+        parsed = await _read_bounded_control_json(
+            request,
+            maximum_bytes=MAX_MANIFEST_REQUEST_BYTES,
+        )
+        payload = parsed.value
+        result = _control_plane_service().begin_snapshot(
+            payload,
+            caller_user_id=current_user.user_id,
+        )
+        return _control_response(result, status_code=202)
+    except ControlPlaneError as exc:
+        return _control_error_response(exc, payload=payload)
+    except Exception:  # noqa: BLE001 - redact database/provider internals
+        return _control_error_response(
+            ControlPlaneError(
+                "internal_failure",
+                status_code=503,
+                retryable=True,
+            ),
+            payload=payload,
+        )
+
+
+@router.post("/baseline/control/v1/snapshots/{job_id}/parts")
+@core_router.post("/baseline/control/v1/snapshots/{job_id}/parts")
+async def baseline_snapshot_content_part_v1(
+    job_id: str,
+    request: Request,
+    current_user: models.User = Depends(get_current_user),
+):
+    payload: Mapping[str, Any] | None = None
+    try:
+        require_control_transport(_control_transport_capability(request))
+        parsed = await _read_bounded_control_json(
+            request,
+            maximum_bytes=MAX_CONTENT_PART_REQUEST_BYTES,
+        )
+        payload = parsed.value
+        result = _control_plane_service().stage_content_part(
+            payload,
+            caller_user_id=current_user.user_id,
+            request_body_sha256=parsed.body_sha256,
+            path_job_id=job_id,
+        )
+        return _control_response(result)
+    except ControlPlaneError as exc:
+        return _control_error_response(exc, payload=payload)
+    except Exception:  # noqa: BLE001 - redact database/provider internals
+        return _control_error_response(
+            ControlPlaneError(
+                "internal_failure",
+                status_code=503,
+                retryable=True,
+            ),
+            payload=payload,
+        )
+
+
+@router.post("/baseline/control/v1/snapshots/{job_id}/commit")
+@core_router.post("/baseline/control/v1/snapshots/{job_id}/commit")
+async def baseline_snapshot_commit_v1(
+    job_id: str,
+    request: Request,
+    current_user: models.User = Depends(get_current_user),
+):
+    payload: Mapping[str, Any] | None = None
+    try:
+        require_control_transport(_control_transport_capability(request))
+        parsed = await _read_bounded_control_json(
+            request,
+            maximum_bytes=MAX_CONTROL_REQUEST_BYTES,
+        )
+        payload = parsed.value
+        result = _control_plane_service().commit_snapshot(
+            payload,
+            caller_user_id=current_user.user_id,
+            path_job_id=job_id,
+        )
+        return _control_response(result)
+    except ControlPlaneError as exc:
+        return _control_error_response(exc, payload=payload)
+    except Exception:  # noqa: BLE001 - redact database/provider internals
+        return _control_error_response(
+            ControlPlaneError(
+                "internal_failure",
+                status_code=503,
+                retryable=True,
+            ),
+            payload=payload,
+        )
+
+
+@router.post("/baseline/control/v1/index-builds")
+@core_router.post("/baseline/control/v1/index-builds")
+async def baseline_index_build_submit_v1(
+    request: Request,
+    current_user: models.User = Depends(get_current_user),
+):
+    payload: Mapping[str, Any] | None = None
+    try:
+        require_control_transport(_control_transport_capability(request))
+        parsed = await _read_bounded_control_json(
+            request,
+            maximum_bytes=MAX_CONTROL_REQUEST_BYTES,
+        )
+        payload = parsed.value
+        if not index_build_submission_available():
+            raise ControlPlaneError(
+                "capability_unavailable",
+                status_code=503,
+                stage="admission",
+                retryable=False,
+            )
+        result = _compatible_index_job_service().submit(
+            payload,
+            caller_user_id=current_user.user_id,
+        )
+        return _control_response(result, status_code=202)
+    except IndexJobError as exc:
+        return _control_error_response(
+            ControlPlaneError(
+                exc.code,
+                status_code=exc.status_code,
+                stage="index_build",
+                retryable=exc.retryable,
+            ),
+            payload=payload,
+        )
+    except ControlPlaneError as exc:
+        return _control_error_response(exc, payload=payload)
+    except Exception:  # noqa: BLE001 - redact database/provider internals
+        return _control_error_response(
+            ControlPlaneError(
+                "internal_failure",
+                status_code=503,
+                stage="index_build",
+                retryable=True,
+            ),
+            payload=payload,
+        )
+
+
+@router.post("/baseline/control/v1/jobs/status")
+@core_router.post("/baseline/control/v1/jobs/status")
+async def baseline_job_status_v1(
+    request: Request,
+    current_user: models.User = Depends(get_current_user),
+):
+    payload: Mapping[str, Any] | None = None
+    try:
+        require_control_transport(_control_transport_capability(request))
+        parsed = await _read_bounded_control_json(
+            request,
+            maximum_bytes=MAX_CONTROL_REQUEST_BYTES,
+        )
+        payload = parsed.value
+        result = _control_plane_service().job_status(
+            payload,
+            caller_user_id=current_user.user_id,
+        )
+        return _control_response(result)
+    except ControlPlaneError as exc:
+        return _control_error_response(exc, payload=payload)
+    except Exception:  # noqa: BLE001 - redact database/provider internals
+        return _control_error_response(
+            ControlPlaneError(
+                "internal_failure",
+                status_code=503,
+                retryable=True,
+            ),
+            payload=payload,
+        )
+
+
+@router.post("/baseline/control/v1/capabilities")
+@core_router.post("/baseline/control/v1/capabilities")
+async def baseline_control_capabilities_v1(
+    request: Request,
+    current_user: models.User = Depends(get_current_user),
+):
+    payload: Mapping[str, Any] | None = None
+    try:
+        transport = _control_transport_capability(request)
+        require_control_transport(transport)
+        parsed = await _read_bounded_control_json(
+            request,
+            maximum_bytes=MAX_CONTROL_REQUEST_BYTES,
+        )
+        payload = parsed.value
+        request_id, group_id = validate_capabilities_request(payload)
+        service = _control_plane_service()
+        service.authorize_group(
+            caller_user_id=current_user.user_id,
+            group_id=group_id,
+        )
+        result = capabilities_response(
+            request_id=request_id,
+            group_id=group_id,
+            transport=transport,
+        )
+        return _control_response(result)
+    except ControlPlaneError as exc:
+        return _control_error_response(exc, payload=payload)
+    except Exception:  # noqa: BLE001 - redact database/provider internals
+        return _control_error_response(
+            ControlPlaneError(
+                "internal_failure",
+                status_code=503,
+                retryable=True,
+            ),
+            payload=payload,
+        )
+
+
+@router.post("/baseline/control/v2/capabilities")
+@core_router.post("/baseline/control/v2/capabilities")
+async def baseline_control_capabilities_v2(
+    request: Request,
+    current_user: models.User = Depends(get_current_user),
+):
+    payload: Mapping[str, Any] | None = None
+    try:
+        require_control_transport(_control_transport_capability(request))
+        parsed = await _read_bounded_control_json(
+            request,
+            maximum_bytes=MAX_V2_CONTROL_REQUEST_BYTES,
+        )
+        payload = parsed.value
+        request_id, group_id = parse_v2_capabilities_request(payload)
+        _control_plane_service().authorize_group(
+            caller_user_id=current_user.user_id,
+            group_id=group_id,
+        )
+        try:
+            capability = _index_dispatch_capability(
+                assess_index_build_capability(_compatible_index_job_service())
+            )
+        except Exception:  # noqa: BLE001 - capability must remain truthful/safe
+            capability = _index_dispatch_capability(
+                unavailable_index_build_capability()
+            )
+        run_capability, _runtime = _baseline_run_capability(
+            group_id=group_id,
+            caller_user_id=current_user.user_id,
+        )
+        return _control_response(
+            v2_capabilities_response(
+                request_id=request_id,
+                group_id=group_id,
+                capability=capability,
+                run_capability=run_capability,
+            )
+        )
+    except V2ControlPlaneError as exc:
+        return _v2_error_response(exc, payload=payload)
+    except ControlPlaneError as exc:
+        stage = (
+            "transport"
+            if exc.code == "transport_unavailable"
+            else (
+                "authorization" if exc.code == "not_found_or_forbidden" else "protocol"
+            )
+        )
+        return _v2_error_response(
+            _v2_from_control_error(exc, stage=stage),
+            payload=payload,
+        )
+    except Exception:  # noqa: BLE001 - redact database/provider internals
+        return _v2_error_response(
+            V2ControlPlaneError(
+                "internal_failure",
+                status_code=503,
+                stage="internal",
+                retryable=True,
+            ),
+            payload=payload,
+        )
+
+
+@router.post("/baseline/control/v2/index-builds")
+@core_router.post("/baseline/control/v2/index-builds")
+async def baseline_index_build_submit_v2(
+    request: Request,
+    current_user: models.User = Depends(get_current_user),
+):
+    payload: Mapping[str, Any] | None = None
+    try:
+        require_control_transport(_control_transport_capability(request))
+        parsed = await _read_bounded_control_json(
+            request,
+            maximum_bytes=MAX_V2_CONTROL_REQUEST_BYTES,
+        )
+        payload = parsed.value
+        submission = parse_v2_index_build_submission(payload)
+        _control_plane_service().authorize_group(
+            caller_user_id=current_user.user_id,
+            group_id=submission.group_id,
+        )
+        try:
+            service = _compatible_index_job_service()
+            capability = _index_dispatch_capability(
+                assess_index_build_capability(service)
+            )
+        except Exception:  # noqa: BLE001 - fail before any durable job write
+            service = None
+            capability = _index_dispatch_capability(
+                unavailable_index_build_capability()
+            )
+        replay_only = (
+            service is not None
+            and not capability.ready
+            and capability.reason_code == "worker_unavailable"
+            and str(
+                getattr(
+                    get_settings_dependency(),
+                    "baseline_worker_mode",
+                    "manual",
+                )
+            )
+            == "database"
+        )
+        if (not capability.ready and not replay_only) or service is None:
+            raise V2ControlPlaneError(
+                capability.reason_code or "capability_unavailable",
+                status_code=503,
+                stage="capability",
+                retryable=capability.reason_code == "embedding_unavailable",
+            )
+        accepted = service.submit_bound_v2(
+            request_id=submission.request_id,
+            group_id=submission.group_id,
+            idempotency_key=submission.idempotency_key,
+            continuation_id=submission.continuation_id,
+            generation_id=submission.generation_id,
+            corpus_manifest_hash=submission.corpus_manifest_hash,
+            ingestion_provenance_fingerprint=(
+                submission.ingestion_provenance_fingerprint
+            ),
+            index_format_version=submission.index_format_version,
+            tokenizer_version=submission.tokenizer_version,
+            retrieval_config_fingerprint=(submission.retrieval_config_fingerprint),
+            embedding_contract_version=submission.embedding_contract_version,
+            embedding=submission.embedding,
+            caller_user_id=current_user.user_id,
+            protocol_version=PROTOCOL_V2_VERSION,
+            protocol_sha256=PROTOCOL_V2_SHA256,
+            allow_new=not replay_only,
+        )
+        return _control_response(
+            v2_index_accepted_response(
+                submission=submission,
+                accepted=accepted,
+            ),
+            status_code=202,
+        )
+    except V2ControlPlaneError as exc:
+        return _v2_error_response(exc, payload=payload)
+    except IndexJobError as exc:
+        return _v2_error_response(
+            v2_from_index_job_error(exc, stage="index_submission"),
+            payload=payload,
+        )
+    except ControlPlaneError as exc:
+        stage = "transport" if exc.code == "transport_unavailable" else "protocol"
+        return _v2_error_response(
+            _v2_from_control_error(exc, stage=stage),
+            payload=payload,
+        )
+    except Exception:  # noqa: BLE001 - redact database/provider internals
+        return _v2_error_response(
+            V2ControlPlaneError(
+                "internal_failure",
+                status_code=503,
+                stage="internal",
+                retryable=True,
+            ),
+            payload=payload,
+        )
+
+
+@router.post("/baseline/control/v2/index-builds/status")
+@core_router.post("/baseline/control/v2/index-builds/status")
+async def baseline_index_build_status_v2(
+    request: Request,
+    current_user: models.User = Depends(get_current_user),
+):
+    payload: Mapping[str, Any] | None = None
+    try:
+        require_control_transport(_control_transport_capability(request))
+        parsed = await _read_bounded_control_json(
+            request,
+            maximum_bytes=MAX_V2_CONTROL_REQUEST_BYTES,
+        )
+        payload = parsed.value
+        request_id, group_id, job_id = parse_v2_index_status_request(payload)
+        snapshot = _compatible_index_job_service().read_status_snapshot(
+            caller_user_id=current_user.user_id,
+            group_id=group_id,
+            job_id=job_id,
+        )
+        return _control_response(
+            v2_index_status_response(
+                request_id=request_id,
+                snapshot=snapshot,
+            )
+        )
+    except V2ControlPlaneError as exc:
+        return _v2_error_response(exc, payload=payload)
+    except IndexJobError as exc:
+        if exc.code in {
+            "authorization_revoked",
+            "not_found_or_forbidden",
+            "repository_not_authorized",
+            "source_not_authorized",
+        }:
+            error = V2ControlPlaneError(
+                "job_not_found_or_forbidden",
+                status_code=404,
+                stage="status",
+            )
+        else:
+            error = v2_from_index_job_error(exc, stage="status")
+        return _v2_error_response(error, payload=payload)
+    except ControlPlaneError as exc:
+        stage = "transport" if exc.code == "transport_unavailable" else "protocol"
+        return _v2_error_response(
+            _v2_from_control_error(exc, stage=stage),
+            payload=payload,
+        )
+    except Exception:  # noqa: BLE001 - redact database/provider internals
+        return _v2_error_response(
+            V2ControlPlaneError(
+                "internal_failure",
+                status_code=503,
+                stage="internal",
+                retryable=True,
+            ),
+            payload=payload,
+        )
+
+
+@router.post("/baseline/control/v2/runs")
+@core_router.post("/baseline/control/v2/runs")
+async def baseline_run_submit_v2(
+    request: Request,
+    current_user: models.User = Depends(get_current_user),
+):
+    """Durably queue one protected run; execution remains operator-only."""
+
+    payload: Mapping[str, Any] | None = None
+    try:
+        require_control_transport(_control_transport_capability(request))
+        if request.url.query:
+            raise V2ControlPlaneError(
+                "protocol_mismatch",
+                status_code=400,
+                stage="protocol",
+            )
+        parsed = await _read_bounded_control_json(
+            request,
+            maximum_bytes=MAX_V2_RUN_REQUEST_BYTES,
+        )
+        payload = parsed.value
+        submission = parse_v2_run_submission(payload)
+        _control_plane_service().authorize_group(
+            caller_user_id=current_user.user_id,
+            group_id=submission.group_id,
+        )
+        capability, runtime = _baseline_run_capability(
+            group_id=submission.group_id,
+            caller_user_id=current_user.user_id,
+        )
+        if not capability.ready or runtime is None:
+            if runtime is not None:
+                replay = runtime.jobs.find_replay(
+                    submission,
+                    caller_user_id=current_user.user_id,
+                )
+                if replay is not None:
+                    return _control_response(replay, status_code=202)
+            raise V2ControlPlaneError(
+                capability.reason_code or "capability_unavailable",
+                status_code=503,
+                stage="capability",
+                retryable=capability.reason_code
+                in {"embedding_unavailable", "worker_unavailable"},
+            )
+        accepted = runtime.jobs.submit(
+            submission,
+            caller_user_id=current_user.user_id,
+        )
+        return _control_response(accepted, status_code=202)
+    except V2ControlPlaneError as exc:
+        return _v2_error_response(exc, payload=payload)
+    except BaselineRunJobError as exc:
+        return _v2_error_response(
+            _v2_from_run_error(exc, stage="run_submission"),
+            payload=payload,
+        )
+    except ControlPlaneError as exc:
+        stage = (
+            "transport"
+            if exc.code == "transport_unavailable"
+            else (
+                "authorization"
+                if exc.code == "not_found_or_forbidden"
+                else "protocol"
+            )
+        )
+        return _v2_error_response(
+            _v2_from_control_error(exc, stage=stage),
+            payload=payload,
+        )
+    except Exception:  # noqa: BLE001 - protected request details never escape
+        return _v2_error_response(
+            V2ControlPlaneError(
+                "internal_failure",
+                status_code=503,
+                stage="internal",
+                retryable=True,
+            ),
+            payload=payload,
+        )
+
+
+@router.post("/baseline/control/v2/runs/status")
+@core_router.post("/baseline/control/v2/runs/status")
+async def baseline_run_status_v2(
+    request: Request,
+    current_user: models.User = Depends(get_current_user),
+):
+    """Read one authorized run projection without touching its lifecycle."""
+
+    payload: Mapping[str, Any] | None = None
+    try:
+        require_control_transport(_control_transport_capability(request))
+        if request.url.query:
+            raise V2ControlPlaneError(
+                "protocol_mismatch",
+                status_code=400,
+                stage="protocol",
+            )
+        parsed = await _read_bounded_control_json(
+            request,
+            maximum_bytes=MAX_V2_CONTROL_REQUEST_BYTES,
+        )
+        payload = parsed.value
+        request_id, group_id, job_id = parse_v2_run_status_request(payload)
+        settings = get_settings_dependency()
+        if not bool(getattr(settings, "baseline_runs_enabled", False)):
+            raise V2ControlPlaneError(
+                "capability_unavailable",
+                status_code=503,
+                stage="capability",
+            )
+        service = BaselineRunJobService.from_settings(
+            core_database_engine,
+            settings,
+        )
+        result = service.read_status(
+            request_id=request_id,
+            group_id=group_id,
+            job_id=job_id,
+            caller_user_id=current_user.user_id,
+        )
+        return _control_response(result)
+    except V2ControlPlaneError as exc:
+        return _v2_error_response(exc, payload=payload)
+    except BaselineRunJobError as exc:
+        return _v2_error_response(
+            _v2_from_run_error(exc, stage="status"),
+            payload=payload,
+        )
+    except ControlPlaneError as exc:
+        stage = (
+            "transport"
+            if exc.code == "transport_unavailable"
+            else (
+                "authorization"
+                if exc.code == "not_found_or_forbidden"
+                else "protocol"
+            )
+        )
+        return _v2_error_response(
+            _v2_from_control_error(exc, stage=stage),
+            payload=payload,
+        )
+    except Exception:  # noqa: BLE001 - status remains non-reflective
+        return _v2_error_response(
+            V2ControlPlaneError(
+                "internal_failure",
+                status_code=503,
+                stage="internal",
+                retryable=True,
+            ),
+            payload=payload,
+        )
 
 
 @router.post("/notification_events/{event_id}/acknowledge")

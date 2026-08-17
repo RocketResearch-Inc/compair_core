@@ -21,9 +21,9 @@ from compair_core.compair.retrieval.evidence_persistence import (
     BaselineEvidencePersistenceCommand,
     BaselineEvidencePersistenceError,
     BaselineEvidencePersistenceService,
+    LegacyChunkSource,
 )
 from compair_core.compair.retrieval.generation import (
-    GENERATION_FINDING_SEPARATOR,
     BaselineGenerationService,
     BaselineGenerationState,
 )
@@ -82,12 +82,15 @@ def _outbox_rows(environment):
         )
 
 
-def _successful_generation(environment, *, enabled: bool, output: str):
-    persisted, command = _persist(environment, f"notify-{output[:12]}")
+def _successful_generation(
+    environment, *, enabled: bool, output: str | tuple[str, ...]
+):
+    findings = (output,) if isinstance(output, str) else output
+    persisted, command = _persist(environment, f"notify-{findings[0][:12]}")
     receipt = BaselineGenerationService(
         environment.sessions,
         notifications_enabled=enabled,
-    ).generate(command, CapturingProvider(output))
+    ).generate(command, CapturingProvider(*findings))
     assert receipt.state is BaselineGenerationState.SUCCEEDED
     return persisted, command, receipt
 
@@ -102,9 +105,7 @@ def test_default_off_creates_one_privacy_safe_suppressed_digest_and_replay(
     environment = _environment(tmp_path, "default-off.db")
     try:
         persisted, command = _persist(environment, "default-off")
-        provider = CapturingProvider(
-            f"first private finding{GENERATION_FINDING_SEPARATOR}second private finding"
-        )
+        provider = CapturingProvider("first private finding", "second private finding")
         service = BaselineGenerationService(environment.sessions)
         first = service.generate(command, provider)
         replay = service.generate(command, provider)
@@ -156,7 +157,7 @@ def test_enabled_dispatch_and_authenticated_read_preserve_finding_order(
         persisted, command, generated = _successful_generation(
             environment,
             enabled=True,
-            output=f"finding one{GENERATION_FINDING_SEPARATOR}finding two",
+            output=("finding one", "finding two"),
         )
         sink = CapturingSink()
         receipt = BaselineNotificationOutboxDispatcher(
@@ -319,8 +320,10 @@ def test_non_ok_retrieval_results_cannot_schedule_outbox(
             )
         command = BaselineEvidencePersistenceCommand(
             group_id=environment.group_id,
-            source_chunk_id=environment.source_chunk_id,
-            source_document_id=environment.source_document_id,
+            source=LegacyChunkSource(
+                document_id=environment.source_document_id,
+                chunk_id=environment.source_chunk_id,
+            ),
             idempotency_key=f"non-ok-{status.value}",
             retrieval_result=replace(environment.result, status=status),
             caller_user_id=caller_user_id,

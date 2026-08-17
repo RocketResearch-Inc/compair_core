@@ -117,6 +117,7 @@ class RetrievalRequest:
     corpus_scope_key: str | None = None
     changed_repository_id: str | None = None
     group_id: str | None = None
+    source_document_id: str | None = None
     schema_version: str = REQUEST_SCHEMA_VERSION
 
     def __post_init__(self) -> None:

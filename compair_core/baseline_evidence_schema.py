@@ -32,6 +32,9 @@ from sqlalchemy import (
 BRIDGE_SCHEMA_VERSION = "baseline-reference-bridge.v1"
 PROVENANCE_SCHEMA_VERSION = "baseline-evidence-provenance.v1"
 RENDERER_VERSION = "baseline-evidence-renderer.v1"
+SOURCE_SCOPE_VERSION = "baseline-source-scope.v1"
+SOURCE_SCOPE_LEGACY_CHUNK = "legacy_chunk"
+SOURCE_SCOPE_CONTROL_DOCUMENT = "control_document"
 
 BASELINE_RETRIEVAL_RUN_TABLE = "baseline_retrieval_run"
 BASELINE_EVIDENCE_ARTIFACT_TABLE = "baseline_evidence_artifact"
@@ -60,18 +63,32 @@ baseline_retrieval_run = Table(
     Column(
         "source_chunk_id",
         String(36),
-        ForeignKey("chunk.chunk_id", ondelete="CASCADE", name="fk_bl_run_source_chunk"),
-        nullable=False,
+        ForeignKey(
+            "chunk.chunk_id", ondelete="SET NULL", name="fk_bl_run_source_chunk"
+        ),
+        nullable=True,
     ),
     Column(
         "source_document_id",
         String(36),
         ForeignKey(
             "document.document_id",
-            ondelete="CASCADE",
+            ondelete="SET NULL",
             name="fk_bl_run_source_document",
         ),
         nullable=True,
+    ),
+    Column(
+        "source_scope_version",
+        String(64),
+        nullable=False,
+        server_default=SOURCE_SCOPE_VERSION,
+    ),
+    Column(
+        "source_scope",
+        String(32),
+        nullable=False,
+        server_default=SOURCE_SCOPE_LEGACY_CHUNK,
     ),
     Column("idempotency_key", String(256), nullable=False),
     Column("bridge_schema_version", String(64), nullable=False),
@@ -137,6 +154,11 @@ baseline_retrieval_run = Table(
         name="ck_bl_run_versions",
     ),
     CheckConstraint(
+        "source_scope_version = 'baseline-source-scope.v1' "
+        "AND source_scope IN ('legacy_chunk', 'control_document')",
+        name="ck_bl_run_source_scope",
+    ),
+    CheckConstraint(
         "retrieval_status = 'ok' AND query_origin = 'explicit' "
         "AND query_length > 0 AND length(query_sha256) = 64",
         name="ck_bl_run_query",
@@ -155,7 +177,7 @@ baseline_retrieval_run = Table(
         "candidate_count >= 0 AND retrieved_count >= 0 "
         "AND filtered_count >= 0 AND duplicate_count >= 0 "
         "AND refill_count >= 0 AND selected_count BETWEEN 1 AND 4 "
-        "AND evidence_character_count > 0",
+        "AND evidence_character_count BETWEEN 1 AND 16000",
         name="ck_bl_run_counts",
     ),
     CheckConstraint(
@@ -245,7 +267,9 @@ baseline_evidence_artifact = Table(
         name="ck_bl_artifact_content",
     ),
     Index("ix_bl_artifact_group_content", "group_id", "whole_file_content_hash"),
-    Index("ix_bl_artifact_repository_path", "group_id", "repository_id", "relative_path"),
+    Index(
+        "ix_bl_artifact_repository_path", "group_id", "repository_id", "relative_path"
+    ),
     Index("ix_bl_artifact_generation", "corpus_generation_id"),
     Index("ix_bl_artifact_index_document", "index_id", "index_document_id"),
 )
@@ -346,6 +370,9 @@ __all__ = [
     "BRIDGE_SCHEMA_VERSION",
     "PROVENANCE_SCHEMA_VERSION",
     "RENDERER_VERSION",
+    "SOURCE_SCOPE_CONTROL_DOCUMENT",
+    "SOURCE_SCOPE_LEGACY_CHUNK",
+    "SOURCE_SCOPE_VERSION",
     "baseline_evidence_artifact",
     "baseline_retrieval_run",
     "baseline_selected_evidence",

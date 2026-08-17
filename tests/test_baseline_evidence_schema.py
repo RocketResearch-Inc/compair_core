@@ -386,6 +386,16 @@ def test_sqlite_copied_legacy_database_upgrade_preserves_reference_order_and_byt
             "0001_baseline_evidence_bridge_v1",
             "0002_baseline_evidence_retention_v1",
             "0003_baseline_generation_state_v1",
+            "0004_baseline_notification_outbox_v1",
+            "0005_baseline_control_plane_staging_v1",
+            "0006_baseline_control_plane_continuation_v1",
+            "0007_baseline_control_plane_ingestion_worker_v1",
+            "0008_baseline_compatible_index_job_v1",
+            "0009_baseline_run_job_v1",
+            "0010_baseline_document_source_scope_v1",
+            "0011_baseline_run_executor_v1",
+            "0012_baseline_control_generation_v1",
+            "0013_baseline_database_worker_v1",
         )
         with engine.connect() as connection:
             after = connection.execute(
@@ -395,12 +405,15 @@ def test_sqlite_copied_legacy_database_upgrade_preserves_reference_order_and_byt
                     "FROM reference WHERE reference_id = 'legacy-reference'"
                 )
             ).one()
-            assert connection.execute(
-                text(
-                    "SELECT baseline_selected_evidence_id FROM reference "
-                    "WHERE reference_id = 'legacy-reference'"
-                )
-            ).scalar_one() is None
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT baseline_selected_evidence_id FROM reference "
+                        "WHERE reference_id = 'legacy-reference'"
+                    )
+                ).scalar_one()
+                is None
+            )
             assert connection.execute(
                 text(
                     "SELECT reference_chunk_id, reference_document_id, "
@@ -414,11 +427,23 @@ def test_sqlite_copied_legacy_database_upgrade_preserves_reference_order_and_byt
             "0001_baseline_evidence_bridge_v1",
             "0002_baseline_evidence_retention_v1",
             "0003_baseline_generation_state_v1",
+            "0004_baseline_notification_outbox_v1",
+            "0005_baseline_control_plane_staging_v1",
+            "0006_baseline_control_plane_continuation_v1",
+            "0007_baseline_control_plane_ingestion_worker_v1",
+            "0008_baseline_compatible_index_job_v1",
+            "0009_baseline_run_job_v1",
+            "0010_baseline_document_source_scope_v1",
+            "0011_baseline_run_executor_v1",
+            "0012_baseline_control_generation_v1",
+            "0013_baseline_database_worker_v1",
         ]
 
         forbidden = {"retrieval_query", "query_text", "raw_query", "document_id"}
         for table_name in ("baseline_retrieval_run", "baseline_evidence_artifact"):
-            columns = {column["name"] for column in inspect(engine).get_columns(table_name)}
+            columns = {
+                column["name"] for column in inspect(engine).get_columns(table_name)
+            }
             assert "source_document_id" in columns
             assert not forbidden & columns
 
@@ -431,9 +456,61 @@ def test_sqlite_copied_legacy_database_upgrade_preserves_reference_order_and_byt
             "0001_baseline_evidence_bridge_v1",
             "0002_baseline_evidence_retention_v1",
             "0003_baseline_generation_state_v1",
+            "0004_baseline_notification_outbox_v1",
+            "0005_baseline_control_plane_staging_v1",
+            "0006_baseline_control_plane_continuation_v1",
+            "0007_baseline_control_plane_ingestion_worker_v1",
+            "0008_baseline_compatible_index_job_v1",
+            "0009_baseline_run_job_v1",
+            "0010_baseline_document_source_scope_v1",
+            "0011_baseline_run_executor_v1",
+            "0012_baseline_control_generation_v1",
+            "0013_baseline_database_worker_v1",
         )
         with engine.connect() as connection:
             assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+    finally:
+        engine.dispose()
+
+
+def test_existing_retrieval_runs_migrate_deterministically_to_legacy_chunk(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path / "legacy-scope-backfill.db")
+    try:
+        _create_legacy_database(tmp_path / "legacy-scope-backfill.db")
+        run_schema_migrations(engine, CORE_SCHEMA_MIGRATIONS[:10])
+        with engine.begin() as connection:
+            group_id, document_id, chunk_id = _add_scope(connection, "scope-backfill")
+            original = _run_values(
+                "scope-backfill",
+                group_id=group_id,
+                document_id=document_id,
+                chunk_id=chunk_id,
+            )
+            connection.execute(baseline_retrieval_run.insert().values(**original))
+
+        report = run_schema_migrations(engine, CORE_SCHEMA_MIGRATIONS[:11])
+        assert report.applied == ("0010_baseline_document_source_scope_v1",)
+        with engine.connect() as connection:
+            row = (
+                connection.execute(
+                    text(
+                        "SELECT source_scope_version, source_scope, source_chunk_id, "
+                        "source_document_id FROM baseline_retrieval_run "
+                        "WHERE run_id = :run_id"
+                    ),
+                    {"run_id": original["run_id"]},
+                )
+                .mappings()
+                .one()
+            )
+        assert dict(row) == {
+            "source_scope_version": "baseline-source-scope.v1",
+            "source_scope": "legacy_chunk",
+            "source_chunk_id": chunk_id,
+            "source_document_id": document_id,
+        }
     finally:
         engine.dispose()
 
@@ -671,12 +748,15 @@ def test_sqlite_reference_feedback_and_lifecycle_constraints(tmp_path: Path) -> 
             row["referred_table"]
             for row in inspect(engine).get_foreign_keys("baseline_evidence_artifact")
         }
-        assert not {
-            "retrieval_corpus",
-            "retrieval_corpus_generation",
-            "retrieval_baseline_index_build",
-            "retrieval_baseline_index_publication",
-        } & artifact_foreign_tables
+        assert (
+            not {
+                "retrieval_corpus",
+                "retrieval_corpus_generation",
+                "retrieval_baseline_index_build",
+                "retrieval_baseline_index_publication",
+            }
+            & artifact_foreign_tables
+        )
 
         # A run with selected evidence cannot become a hidden non-group purge.
         with pytest.raises(IntegrityError), engine.begin() as connection:
@@ -694,62 +774,101 @@ def test_sqlite_reference_feedback_and_lifecycle_constraints(tmp_path: Path) -> 
                 {"document_id": document_id},
             )
         with engine.connect() as connection:
-            assert connection.execute(
-                text("SELECT count(*) FROM baseline_selected_evidence")
-            ).scalar_one() == 1
-            assert connection.execute(
-                text("SELECT count(*) FROM reference WHERE reference_id='baseline-reference'")
-            ).scalar_one() == 1
-            assert connection.execute(
-                text("SELECT count(*) FROM feedback WHERE feedback_id='baseline-feedback'")
-            ).scalar_one() == 1
-            assert connection.execute(
-                text("SELECT count(*) FROM baseline_evidence_artifact")
-            ).scalar_one() == 1
+            assert (
+                connection.execute(
+                    text("SELECT count(*) FROM baseline_selected_evidence")
+                ).scalar_one()
+                == 1
+            )
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM reference WHERE reference_id='baseline-reference'"
+                    )
+                ).scalar_one()
+                == 1
+            )
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM feedback WHERE feedback_id='baseline-feedback'"
+                    )
+                ).scalar_one()
+                == 1
+            )
+            assert (
+                connection.execute(
+                    text("SELECT count(*) FROM baseline_evidence_artifact")
+                ).scalar_one()
+                == 1
+            )
             assert connection.execute(
                 text(
                     "SELECT source_chunk_id, source_document_id "
                     "FROM baseline_retrieval_run WHERE run_id='run-life'"
                 )
             ).one() == (None, None)
-            assert connection.execute(
-                text(
-                    "SELECT source_document_id FROM baseline_evidence_artifact "
-                    "WHERE artifact_id='artifact-life'"
-                )
-            ).scalar_one() is None
-            assert connection.execute(
-                text(
-                    "SELECT source_chunk_id FROM reference "
-                    "WHERE reference_id='baseline-reference'"
-                )
-            ).scalar_one() is None
-            assert connection.execute(
-                text(
-                    "SELECT source_chunk_id FROM feedback "
-                    "WHERE feedback_id='baseline-feedback'"
-                )
-            ).scalar_one() is None
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT source_document_id FROM baseline_evidence_artifact "
+                        "WHERE artifact_id='artifact-life'"
+                    )
+                ).scalar_one()
+                is None
+            )
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT source_chunk_id FROM reference "
+                        "WHERE reference_id='baseline-reference'"
+                    )
+                ).scalar_one()
+                is None
+            )
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT source_chunk_id FROM feedback "
+                        "WHERE feedback_id='baseline-feedback'"
+                    )
+                ).scalar_one()
+                is None
+            )
 
         # Restart persistence does not depend on the removed source objects.
         engine.dispose()
         engine = _engine(tmp_path / "lifecycle.db")
         assert run_schema_migrations(engine).applied == ()
         with engine.connect() as connection:
-            assert connection.execute(
-                text("SELECT renderer_output FROM baseline_selected_evidence")
-            ).scalar_one().endswith("auditable evidence")
+            assert (
+                connection.execute(
+                    text("SELECT renderer_output FROM baseline_selected_evidence")
+                )
+                .scalar_one()
+                .endswith("auditable evidence")
+            )
 
         # Legacy source-owned rows retain their historical cascade behavior.
         with engine.begin() as connection:
             connection.execute(text("DELETE FROM chunk WHERE chunk_id='chunk-source'"))
         with engine.connect() as connection:
-            assert connection.execute(
-                text("SELECT count(*) FROM reference WHERE reference_id LIKE 'legacy-%'")
-            ).scalar_one() == 0
-            assert connection.execute(
-                text("SELECT count(*) FROM feedback WHERE feedback_id='legacy-feedback'")
-            ).scalar_one() == 0
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM reference WHERE reference_id LIKE 'legacy-%'"
+                    )
+                ).scalar_one()
+                == 0
+            )
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM feedback WHERE feedback_id='legacy-feedback'"
+                    )
+                ).scalar_one()
+                == 0
+            )
 
         # Group deletion is the privacy boundary and removes the entire scope.
         with engine.begin() as connection:
@@ -763,21 +882,30 @@ def test_sqlite_reference_feedback_and_lifecycle_constraints(tmp_path: Path) -> 
                 "baseline_evidence_artifact",
                 "baseline_selected_evidence",
             ):
-                assert connection.execute(
-                    text(f"SELECT count(*) FROM {table_name}")
-                ).scalar_one() == 0
-            assert connection.execute(
-                text(
-                    "SELECT count(*) FROM reference "
-                    "WHERE reference_id='baseline-reference'"
+                assert (
+                    connection.execute(
+                        text(f"SELECT count(*) FROM {table_name}")
+                    ).scalar_one()
+                    == 0
                 )
-            ).scalar_one() == 0
-            assert connection.execute(
-                text(
-                    "SELECT count(*) FROM feedback "
-                    "WHERE feedback_id='baseline-feedback'"
-                )
-            ).scalar_one() == 0
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM reference "
+                        "WHERE reference_id='baseline-reference'"
+                    )
+                ).scalar_one()
+                == 0
+            )
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM feedback "
+                        "WHERE feedback_id='baseline-feedback'"
+                    )
+                ).scalar_one()
+                == 0
+            )
 
         # A direct Chunk delete (without deleting its Document) clears only
         # chunk provenance and leaves document provenance intact.
@@ -843,18 +971,24 @@ def test_sqlite_reference_feedback_and_lifecycle_constraints(tmp_path: Path) -> 
                     "FROM baseline_retrieval_run WHERE run_id='run-chunk-only'"
                 )
             ).one() == (None, document_id)
-            assert connection.execute(
-                text(
-                    "SELECT source_chunk_id FROM reference "
-                    "WHERE reference_id='chunk-only-reference'"
-                )
-            ).scalar_one() is None
-            assert connection.execute(
-                text(
-                    "SELECT source_chunk_id FROM feedback "
-                    "WHERE feedback_id='chunk-only-feedback'"
-                )
-            ).scalar_one() is None
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT source_chunk_id FROM reference "
+                        "WHERE reference_id='chunk-only-reference'"
+                    )
+                ).scalar_one()
+                is None
+            )
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT source_chunk_id FROM feedback "
+                        "WHERE feedback_id='chunk-only-feedback'"
+                    )
+                ).scalar_one()
+                is None
+            )
         with engine.begin() as connection:
             connection.execute(
                 text('DELETE FROM "group" WHERE group_id=:group_id'),
@@ -864,7 +998,9 @@ def test_sqlite_reference_feedback_and_lifecycle_constraints(tmp_path: Path) -> 
         engine.dispose()
 
 
-def test_sqlite_corpus_index_rename_and_explicit_retention_purge(tmp_path: Path) -> None:
+def test_sqlite_corpus_index_rename_and_explicit_retention_purge(
+    tmp_path: Path,
+) -> None:
     engine = _migrated_legacy_engine(tmp_path / "mutable-provenance.db")
     try:
         with engine.begin() as connection:
@@ -978,12 +1114,22 @@ def test_sqlite_corpus_index_rename_and_explicit_retention_purge(tmp_path: Path)
                 )
             ).one()
             assert after == before
-            assert connection.execute(
-                text("SELECT count(*) FROM reference WHERE reference_id='mutable-reference'")
-            ).scalar_one() == 1
-            assert connection.execute(
-                text("SELECT count(*) FROM feedback WHERE feedback_id='mutable-feedback'")
-            ).scalar_one() == 1
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM reference WHERE reference_id='mutable-reference'"
+                    )
+                ).scalar_one()
+                == 1
+            )
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM feedback WHERE feedback_id='mutable-feedback'"
+                    )
+                ).scalar_one()
+                == 1
+            )
 
         # This is the schema-level ordering an authorized audited retention
         # purge must use. No ordinary lifecycle delete can substitute for it.
@@ -1010,15 +1156,28 @@ def test_sqlite_corpus_index_rename_and_explicit_retention_purge(tmp_path: Path)
                 "baseline_evidence_artifact",
                 "baseline_selected_evidence",
             ):
-                assert connection.execute(
-                    text(f"SELECT count(*) FROM {table_name}")
-                ).scalar_one() == 0
-            assert connection.execute(
-                text("SELECT count(*) FROM reference WHERE reference_id='mutable-reference'")
-            ).scalar_one() == 0
-            assert connection.execute(
-                text("SELECT count(*) FROM feedback WHERE feedback_id='mutable-feedback'")
-            ).scalar_one() == 0
+                assert (
+                    connection.execute(
+                        text(f"SELECT count(*) FROM {table_name}")
+                    ).scalar_one()
+                    == 0
+                )
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM reference WHERE reference_id='mutable-reference'"
+                    )
+                ).scalar_one()
+                == 0
+            )
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM feedback WHERE feedback_id='mutable-feedback'"
+                    )
+                ).scalar_one()
+                == 0
+            )
     finally:
         engine.dispose()
 
@@ -1093,7 +1252,9 @@ def test_core_bulk_document_delete_builds_legacy_only_predicates(monkeypatch) ->
         row
         for row in session.deletions
         if row[0] is reference_model
-        and any(str(value) == "baseline_selected_evidence_id IS NULL" for value in row[1])
+        and any(
+            str(value) == "baseline_selected_evidence_id IS NULL" for value in row[1]
+        )
     )
     assert any(
         str(value) == "baseline_retrieval_run_id IS NULL"
@@ -1105,7 +1266,9 @@ def test_core_bulk_document_delete_builds_legacy_only_predicates(monkeypatch) ->
     )
 
 
-def test_sqlite_failed_retention_copy_swap_rolls_back_and_recovers(tmp_path: Path) -> None:
+def test_sqlite_failed_retention_copy_swap_rolls_back_and_recovers(
+    tmp_path: Path,
+) -> None:
     database_path = tmp_path / "failed-retention.db"
     _create_legacy_database(database_path)
     engine = _engine(database_path)
@@ -1126,7 +1289,9 @@ def test_sqlite_failed_retention_copy_swap_rolls_back_and_recovers(tmp_path: Pat
             column["name"]: column["nullable"]
             for column in inspect(engine).get_columns("reference")
         }["source_chunk_id"] is False
-        assert [(row.migration_id, row.state) for row in read_schema_migration_state(engine)] == [
+        assert [
+            (row.migration_id, row.state) for row in read_schema_migration_state(engine)
+        ] == [
             ("0000_core_schema_baseline", "applied"),
             ("0001_baseline_evidence_bridge_v1", "applied"),
             ("0002_baseline_evidence_retention_v1", "failed"),
@@ -1141,6 +1306,16 @@ def test_sqlite_failed_retention_copy_swap_rolls_back_and_recovers(tmp_path: Pat
         assert run_schema_migrations(engine).applied == (
             "0002_baseline_evidence_retention_v1",
             "0003_baseline_generation_state_v1",
+            "0004_baseline_notification_outbox_v1",
+            "0005_baseline_control_plane_staging_v1",
+            "0006_baseline_control_plane_continuation_v1",
+            "0007_baseline_control_plane_ingestion_worker_v1",
+            "0008_baseline_compatible_index_job_v1",
+            "0009_baseline_run_job_v1",
+            "0010_baseline_document_source_scope_v1",
+            "0011_baseline_run_executor_v1",
+            "0012_baseline_control_generation_v1",
+            "0013_baseline_database_worker_v1",
         )
         assert {
             column["name"]: column["nullable"]
@@ -1173,7 +1348,9 @@ def test_sqlite_failed_generation_state_copy_swap_rolls_back_and_recovers(
             column["name"]
             for column in inspect(engine).get_columns("baseline_retrieval_run")
         }
-        assert [(row.migration_id, row.state) for row in read_schema_migration_state(engine)] == [
+        assert [
+            (row.migration_id, row.state) for row in read_schema_migration_state(engine)
+        ] == [
             ("0000_core_schema_baseline", "applied"),
             ("0001_baseline_evidence_bridge_v1", "applied"),
             ("0002_baseline_evidence_retention_v1", "applied"),
@@ -1188,6 +1365,16 @@ def test_sqlite_failed_generation_state_copy_swap_rolls_back_and_recovers(
             )
         assert run_schema_migrations(engine).applied == (
             "0003_baseline_generation_state_v1",
+            "0004_baseline_notification_outbox_v1",
+            "0005_baseline_control_plane_staging_v1",
+            "0006_baseline_control_plane_continuation_v1",
+            "0007_baseline_control_plane_ingestion_worker_v1",
+            "0008_baseline_compatible_index_job_v1",
+            "0009_baseline_run_job_v1",
+            "0010_baseline_document_source_scope_v1",
+            "0011_baseline_run_executor_v1",
+            "0012_baseline_control_generation_v1",
+            "0013_baseline_database_worker_v1",
         )
         assert "generation_lease_token" in {
             column["name"]
@@ -1219,9 +1406,9 @@ def test_sqlite_failed_bridge_migration_requires_reviewed_recovery(
         assert "baseline_selected_evidence_id" not in {
             column["name"] for column in inspect(engine).get_columns("reference")
         }
-        assert [(row.migration_id, row.state) for row in read_schema_migration_state(engine)] == [
-            ("0001_baseline_evidence_bridge_v1", "failed")
-        ]
+        assert [
+            (row.migration_id, row.state) for row in read_schema_migration_state(engine)
+        ] == [("0001_baseline_evidence_bridge_v1", "failed")]
 
         # Reviewed recovery: diagnose/backup first, then clear only the failed
         # marker and rerun the immutable production definition.
@@ -1238,6 +1425,16 @@ def test_sqlite_failed_bridge_migration_requires_reviewed_recovery(
             "0001_baseline_evidence_bridge_v1",
             "0002_baseline_evidence_retention_v1",
             "0003_baseline_generation_state_v1",
+            "0004_baseline_notification_outbox_v1",
+            "0005_baseline_control_plane_staging_v1",
+            "0006_baseline_control_plane_continuation_v1",
+            "0007_baseline_control_plane_ingestion_worker_v1",
+            "0008_baseline_compatible_index_job_v1",
+            "0009_baseline_run_job_v1",
+            "0010_baseline_document_source_scope_v1",
+            "0011_baseline_run_executor_v1",
+            "0012_baseline_control_generation_v1",
+            "0013_baseline_database_worker_v1",
         )
     finally:
         engine.dispose()

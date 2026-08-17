@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -37,7 +38,10 @@ from compair_core.compair.retrieval.corpus import CorpusFileInput
 from compair_core.compair.retrieval.evidence_persistence import (
     BaselineEvidencePersistenceService,
 )
-from compair_core.compair.retrieval.generation import BaselineGenerationService
+from compair_core.compair.retrieval.generation import (
+    GENERATION_OUTPUT_SCHEMA_VERSION,
+    BaselineGenerationService,
+)
 from compair_core.compair.retrieval.indexing import (
     BaselineEmbeddingIdentity,
     BaselineIndexBuilder,
@@ -145,7 +149,14 @@ class _FixtureGenerationProvider:
         assert [item.ordinal for item in generation_input.evidence] == list(
             range(1, len(generation_input.evidence) + 1)
         )
-        return "fixture baseline finding"
+        return json.dumps(
+            {
+                "schema_version": GENERATION_OUTPUT_SCHEMA_VERSION,
+                "outcome": "findings",
+                "findings": [{"feedback": "fixture baseline finding"}],
+            },
+            separators=(",", ":"),
+        )
 
 
 class _RevokingRetriever:
@@ -181,9 +192,7 @@ def _source_user_id(environment) -> str:
     with environment.engine.connect() as connection:
         return str(
             connection.execute(
-                text(
-                    "SELECT author_id FROM document WHERE document_id = :document_id"
-                ),
+                text("SELECT author_id FROM document WHERE document_id = :document_id"),
                 {"document_id": environment.source_document_id},
             ).scalar_one()
         )
@@ -276,9 +285,7 @@ def _run_task(
         retrieval_engine="baseline_v1",
         processing_run_key=processing_run_key,
         group_id=(
-            environment.group_id
-            if group_id is _USE_ENVIRONMENT_GROUP
-            else group_id
+            environment.group_id if group_id is _USE_ENVIRONMENT_GROUP else group_id
         ),
     )
 
@@ -435,7 +442,12 @@ def test_actual_baseline_task_path_persists_order_and_generates_without_notifica
         assert all(row.reference_document_id is None for row in rows)
         assert persistence_counts(environment.engine) == (1, 4, 4, 4, 1)
         with environment.engine.connect() as connection:
-            assert connection.execute(text("SELECT count(*) FROM notification_event")).scalar_one() == 0
+            assert (
+                connection.execute(
+                    text("SELECT count(*) FROM notification_event")
+                ).scalar_one()
+                == 0
+            )
         generation.assert_not_called()
         embedding.assert_not_called()
         assert QUERY not in repr(events)
@@ -484,7 +496,9 @@ def test_task_retry_reuses_per_chunk_intent_without_duplicates(
         environment.engine.dispose()
 
 
-@pytest.mark.parametrize("status", [RetrievalStatus.INSUFFICIENT, RetrievalStatus.ERROR])
+@pytest.mark.parametrize(
+    "status", [RetrievalStatus.INSUFFICIENT, RetrievalStatus.ERROR]
+)
 def test_non_ok_baseline_result_has_zero_writes_and_no_generation(
     tmp_path: Path,
     monkeypatch,
@@ -596,10 +610,7 @@ def test_database_authorization_mismatch_fails_before_retrieval(
     try:
         with environment.engine.begin() as connection:
             connection.execute(
-                text(
-                    "DELETE FROM document_to_group "
-                    "WHERE document_id = :document_id"
-                ),
+                text("DELETE FROM document_to_group WHERE document_id = :document_id"),
                 {"document_id": environment.source_document_id},
             )
         forbidden_retriever = _ForbiddenRetriever()
@@ -721,24 +732,21 @@ def test_document_in_two_groups_selects_only_explicit_group_publication(
             f"group:{environment.group_id}",
             f"group:{group_b}",
         ]
-        assert [row.relative_path for row in _baseline_reference_rows(
-            environment,
-            environment.group_id,
-        )] == [item.relative_path for item in environment.result.evidence]
         assert [
             row.relative_path
-            for row in _baseline_reference_rows(environment, group_b)
+            for row in _baseline_reference_rows(
+                environment,
+                environment.group_id,
+            )
+        ] == [item.relative_path for item in environment.result.evidence]
+        assert [
+            row.relative_path for row in _baseline_reference_rows(environment, group_b)
         ] == list(group_b_paths)
         with environment.engine.connect() as connection:
             run_rows = connection.execute(
-                text(
-                    "SELECT group_id, idempotency_key "
-                    "FROM baseline_retrieval_run"
-                )
+                text("SELECT group_id, idempotency_key FROM baseline_retrieval_run")
             ).all()
-            run_groups = set(
-                row.group_id for row in run_rows
-            )
+            run_groups = {row.group_id for row in run_rows}
         assert run_groups == {environment.group_id, group_b}
         assert len({row.idempotency_key for row in run_rows}) == 2
         assert persistence_counts(environment.engine) == (2, 8, 8, 8, 2)
@@ -1044,8 +1052,9 @@ def test_api_process_request_threads_explicit_group_to_task(monkeypatch) -> None
     monkeypatch.setattr(
         api,
         "_dispatch_process_document_task",
-        lambda **kwargs: dispatched.update(kwargs)
-        or SimpleNamespace(id="baseline-task"),
+        lambda **kwargs: (
+            dispatched.update(kwargs) or SimpleNamespace(id="baseline-task")
+        ),
     )
     monkeypatch.setattr(api, "log_event", lambda *args, **kwargs: None)
 

@@ -1,8 +1,9 @@
 """Application settings and feature flag definitions."""
+
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings
 
 
@@ -30,6 +31,56 @@ class Settings(BaseSettings):
     retrieval_engine: str = "legacy"
     retrieval_query_allow_insecure_local_transport: bool = False
 
+    # Staging control-plane writes require HTTPS. Plain HTTP is available only
+    # when this explicit override is set for a direct loopback peer. A reverse
+    # proxy is trusted only when its immediate peer IP matches this comma-
+    # separated IP/CIDR allowlist and it attests one unambiguous HTTPS scheme.
+    baseline_control_plane_allow_insecure_loopback: bool = False
+    baseline_control_plane_trusted_proxy_allowlist: str = ""
+
+    # Public baseline-control-plane.v2 run submission is separately gated.
+    # Enabling it permits durable submission only after runtime readiness;
+    # dispatch remains manual unless the separate database worker mode is set.
+    # The API process itself never starts a worker or Celery task.
+    baseline_runs_enabled: bool = False
+
+    # The durable database worker is a separate executable. ``manual`` keeps
+    # the existing operator-only capability and never assumes that a worker is
+    # running. ``database`` requires a recent compatible heartbeat and bounded
+    # queue capacity before protected run admission.
+    baseline_worker_mode: Literal["manual", "database"] = "manual"
+    baseline_worker_poll_interval_seconds: float = Field(
+        default=2.0,
+        ge=0.1,
+        le=60.0,
+    )
+    baseline_worker_heartbeat_interval_seconds: float = Field(
+        default=5.0,
+        ge=0.5,
+        le=60.0,
+    )
+    baseline_worker_heartbeat_ttl_seconds: int = Field(
+        default=30,
+        ge=5,
+        le=300,
+    )
+    baseline_worker_cleanup_interval_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=3600,
+    )
+    baseline_worker_max_pending_per_slot: int = Field(
+        default=8,
+        ge=1,
+        le=64,
+    )
+    baseline_worker_max_attempts: int = Field(default=5, ge=1, le=100)
+    baseline_worker_max_backoff_seconds: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=300.0,
+    )
+
     # Baseline_v1 uses a separate fail-closed embedding provider. It never
     # inherits or falls back to the legacy embedding configuration.
     baseline_embedding_provider: Literal["disabled", "http"] = "disabled"
@@ -44,6 +95,12 @@ class Settings(BaseSettings):
     )
     baseline_embedding_batch_size: int = Field(default=32, ge=1, le=256)
     baseline_embedding_allow_insecure_loopback: bool = False
+
+    # Baseline-run submissions use a separate external AES-256-GCM keyring.
+    # SecretStr prevents accidental settings/repr disclosure; the value is a
+    # strict baseline-run-keyring.v1 JSON object parsed only by the run service.
+    baseline_run_encryption_keyring: SecretStr | None = None
+    baseline_run_payload_ttl_seconds: int = Field(default=900, ge=60, le=3600)
 
     # Core/local storage defaults
     local_upload_dir: str = "~/.compair-core/data/uploads"

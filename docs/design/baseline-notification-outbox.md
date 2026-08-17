@@ -24,6 +24,11 @@ credentials, or provider response metadata. One unique row is allowed for a
 `(run_id, recipient_user_id, channel)` tuple, and a stable SHA-256 digest key is
 available as a channel-side idempotency key.
 
+Authorization follows the run's explicit source scope. `legacy_chunk` retains
+the existing chunk check. `control_document` requires a null chunk and validates
+the authoritative document, group membership, and unique control-job link; no
+replacement chunk is selected.
+
 `COMPAIR_BASELINE_NOTIFICATIONS_ENABLED` defaults to `false`. A successful run
 still records its sole digest in the terminal `suppressed` state, which makes
 the default-off policy auditable without creating a deliverable item. Setting

@@ -11,6 +11,7 @@ the stable idempotency key supplied here.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import re
@@ -25,7 +26,15 @@ import requests
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from ...baseline_evidence_schema import RENDERER_VERSION
+from ...baseline_control_plane_schema import (
+    BASELINE_CONTROL_GENERATION_CONTRACT_VERSION,
+)
+from ...baseline_evidence_schema import (
+    RENDERER_VERSION,
+    SOURCE_SCOPE_CONTROL_DOCUMENT,
+    SOURCE_SCOPE_LEGACY_CHUNK,
+    SOURCE_SCOPE_VERSION,
+)
 from .corpus import (
     BaselineIndexBuildStatus,
     CorpusGenerationStatus,
@@ -45,7 +54,13 @@ from .persistent import published_index_fingerprint
 
 GENERATION_CONTRACT_VERSION = "baseline-generation-input.v1"
 GENERATION_STATE_VERSION = "baseline-generation-state.v1"
-GENERATION_FINDING_SEPARATOR = "<<<FINDING>>>"
+GENERATION_OUTPUT_SCHEMA_VERSION = "baseline-generation-output.v2"
+GENERATION_OUTPUT_SPEC_SHA256 = (
+    "1dccd3a11ec659a5e8705f9b8acf333a64a21f056265fcd7c96e9c6ac197bb20"
+)
+GENERATION_OUTPUT_SCHEMA_SHA256 = (
+    "39f8e8eaf5e5a219e806d34f46af887d69268a88d5f1d06d45e6c56465e250ed"
+)
 DEFAULT_LEASE_SECONDS = 300
 MAX_GENERATION_OUTPUT_CHARACTERS = 100_000
 
@@ -63,6 +78,7 @@ class GenerationWriteStage(str, Enum):
     FEEDBACK = "feedback"
     STATE = "state"
     OUTBOX = "outbox"
+    CONTROL = "control"
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +110,9 @@ class BaselineGenerationEvidence:
 class BaselineGenerationInput:
     run_id: str
     group_id: str
-    source_chunk_id: str
+    source_scope_version: str
+    source_scope: str
+    source_chunk_id: str | None
     source_document_id: str
     source_text: str
     corpus_generation_id: str
@@ -123,6 +141,20 @@ class BaselineGenerationReceipt:
     input_fingerprint: str | None
     output_fingerprint: str | None
     feedback_ids: tuple[str, ...]
+    error_code: str | None = None
+    replayed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class BaselineControlGenerationReceipt:
+    job_id: str
+    run_id: str
+    state: str
+    generation_attempt_count: int
+    input_fingerprint: str | None
+    output_fingerprint: str | None
+    feedback_ids: tuple[str, ...]
+    notification_outbox_count: int
     error_code: str | None = None
     replayed: bool = False
 
@@ -220,6 +252,41 @@ def _fingerprint_parts(parts: Sequence[tuple[str, str]]) -> str:
     return digest.hexdigest()
 
 
+def _generation_output_contract(maximum_findings: int) -> dict[str, object]:
+    return {
+        "schema_version": GENERATION_OUTPUT_SCHEMA_VERSION,
+        "specification_sha256": GENERATION_OUTPUT_SPEC_SHA256,
+        "schema_sha256": GENERATION_OUTPUT_SCHEMA_SHA256,
+        "strict": True,
+        "maximum_findings": maximum_findings,
+        "allowed_outcomes": ["no_findings", "findings"],
+        "additional_properties": False,
+        "feedback_must_be_nonblank": True,
+    }
+
+
+def _provider_fingerprint(
+    provider: str,
+    model: str,
+    version: str,
+    supports_idempotency: bool,
+) -> str:
+    return _fingerprint_parts(
+        (
+            (
+                "control_generation_contract_version",
+                BASELINE_CONTROL_GENERATION_CONTRACT_VERSION,
+            ),
+            ("provider", provider),
+            ("model", model),
+            ("version", version),
+            ("supports_idempotency", "true" if supports_idempotency else "false"),
+            ("output_schema_version", GENERATION_OUTPUT_SCHEMA_VERSION),
+            ("output_schema_sha256", GENERATION_OUTPUT_SCHEMA_SHA256),
+        )
+    )
+
+
 def _begin_write(session: Session) -> None:
     if session.get_bind().dialect.name == "sqlite":
         session.connection().exec_driver_sql("BEGIN IMMEDIATE")
@@ -281,7 +348,9 @@ class BaselineGenerationInputAdapter:
         parts: list[tuple[str, str]] = [
             ("run_id", str(run["run_id"])),
             ("group_id", str(run["group_id"])),
-            ("source_chunk_id", str(run["source_chunk_id"])),
+            ("source_scope_version", str(run["source_scope_version"])),
+            ("source_scope", str(run["source_scope"])),
+            ("source_chunk_id", str(run["source_chunk_id"] or "")),
             ("source_document_id", str(run["source_document_id"])),
             ("source_text", source_text),
             ("corpus_generation_id", str(run["corpus_generation_id"])),
@@ -380,7 +449,13 @@ class BaselineGenerationInputAdapter:
         return BaselineGenerationInput(
             run_id=str(run["run_id"]),
             group_id=str(run["group_id"]),
-            source_chunk_id=str(run["source_chunk_id"]),
+            source_scope_version=str(run["source_scope_version"]),
+            source_scope=str(run["source_scope"]),
+            source_chunk_id=(
+                str(run["source_chunk_id"])
+                if run["source_chunk_id"] is not None
+                else None
+            ),
             source_document_id=str(run["source_document_id"]),
             source_text=source_text,
             corpus_generation_id=str(run["corpus_generation_id"]),
@@ -445,18 +520,22 @@ class ReviewerBaselineGenerationProvider:
                 "contract_version": GENERATION_CONTRACT_VERSION,
                 "document": generation_input.source_text,
                 "references": evidence,
-                "finding_separator": GENERATION_FINDING_SEPARATOR,
+                "output_contract": _generation_output_contract(
+                    min(4, len(generation_input.evidence))
+                ),
                 "idempotency_key": idempotency_key,
             }
             try:
                 response = requests.post(
                     endpoint,
                     json=payload,
-                    timeout=float(os.getenv("COMPAIR_BASELINE_GENERATION_TIMEOUT", "30")),
+                    timeout=float(
+                        os.getenv("COMPAIR_BASELINE_GENERATION_TIMEOUT", "30")
+                    ),
                 )
                 response.raise_for_status()
                 body = response.json()
-                output = body.get("feedback") or body.get("text")
+                output = body.get("content") if isinstance(body, dict) else None
             except Exception as exc:  # no provider details or payload in the error
                 raise BaselineGenerationProviderError(
                     "provider_unavailable",
@@ -482,8 +561,14 @@ class ReviewerBaselineGenerationProvider:
             prompt = (
                 "Changed source:\n"
                 + generation_input.source_text
-                + "\n\nOrdered baseline evidence follows. Preserve its order and return "
-                + f"findings separated by {GENERATION_FINDING_SEPARATOR}.\n\n"
+                + "\n\nOrdered baseline evidence follows. Preserve its order. Return only "
+                + "one strict JSON object conforming to this output contract: "
+                + json.dumps(
+                    _generation_output_contract(min(4, len(generation_input.evidence))),
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + ". Do not return markdown or prose outside the JSON object.\n\n"
                 + "\n\n".join(evidence)
             )
             try:
@@ -545,9 +630,7 @@ class BaselineGenerationService:
     ) -> BaselineGenerationReceipt:
         run_id = _safe_identifier(command.run_id, "run_id", 36)
         group_id = _safe_identifier(command.group_id, "group_id", 36)
-        caller_user_id = _safe_identifier(
-            command.caller_user_id, "caller_user_id", 36
-        )
+        caller_user_id = _safe_identifier(command.caller_user_id, "caller_user_id", 36)
         provider_name = _safe_provider_identity(provider.provider, "provider", 128)
         model = _safe_provider_identity(provider.model, "model", 256)
         version = _safe_provider_identity(provider.version, "version", 256)
@@ -580,7 +663,7 @@ class BaselineGenerationService:
                 retryable=exc.retryable,
                 error_class="provider",
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 - provider boundary must fail closed
             return self._record_failure(
                 command,
                 lease_token=lease_token,
@@ -635,6 +718,1045 @@ class BaselineGenerationService:
                 "database_commit_failed",
                 "baseline Feedback transaction failed",
             ) from exc
+
+    def generate_control(
+        self,
+        job_id: str,
+        provider: BaselineGenerationProvider,
+    ) -> BaselineControlGenerationReceipt:
+        """Complete generation for one durable document-level control job.
+
+        The control job is always locked before its linked retrieval run. Both
+        rows receive the same opaque lease token. Provider execution remains
+        outside the database transaction; only the existing retrieval-run
+        generation state machine owns the model lifecycle and Feedback rows.
+        """
+
+        job_id = _safe_identifier(job_id, "job_id", 36)
+        provider_name = _safe_provider_identity(provider.provider, "provider", 128)
+        model = _safe_provider_identity(provider.model, "model", 256)
+        version = _safe_provider_identity(provider.version, "version", 256)
+        supports_idempotency = provider.supports_idempotency is True
+        provider_fingerprint = _provider_fingerprint(
+            provider_name, model, version, supports_idempotency
+        )
+        claimed = self._claim_control_generation(
+            job_id,
+            provider_name=provider_name,
+            model=model,
+            version=version,
+            supports_idempotency=supports_idempotency,
+            provider_fingerprint=provider_fingerprint,
+        )
+        if isinstance(claimed, BaselineControlGenerationReceipt):
+            return claimed
+        lease_token, command, generation_input, attempt_count = claimed
+
+        before_call = self._validate_control_lease(
+            job_id,
+            command=command,
+            lease_token=lease_token,
+            expected_input=generation_input,
+            provider_fingerprint=provider_fingerprint,
+        )
+        if before_call is not None:
+            return before_call
+
+        provider_key = _sha256_text(
+            f"{GENERATION_STATE_VERSION}\x00{job_id}\x00{command.run_id}"
+            f"\x00{generation_input.input_fingerprint}"
+        )
+        try:
+            output = provider.generate(
+                generation_input,
+                idempotency_key=provider_key,
+            )
+        except BaselineGenerationProviderError as exc:
+            return self._record_control_failure(
+                job_id,
+                command=command,
+                lease_token=lease_token,
+                attempt_count=attempt_count,
+                input_fingerprint=generation_input.input_fingerprint,
+                code=exc.code,
+                target="retryable_failed" if exc.retryable else "terminal_failed",
+                error_class="provider",
+            )
+        except Exception:  # noqa: BLE001 - provider boundary must fail closed
+            return self._record_control_failure(
+                job_id,
+                command=command,
+                lease_token=lease_token,
+                attempt_count=attempt_count,
+                input_fingerprint=generation_input.input_fingerprint,
+                code="provider_unavailable",
+                target="retryable_failed",
+                error_class="provider",
+            )
+        try:
+            findings, output_fingerprint = self._parse_output(
+                output,
+                maximum_findings=len(generation_input.evidence),
+            )
+        except BaselineGenerationError:
+            return self._record_control_failure(
+                job_id,
+                command=command,
+                lease_token=lease_token,
+                attempt_count=attempt_count,
+                input_fingerprint=generation_input.input_fingerprint,
+                code="provider_malformed_output",
+                target="terminal_failed",
+                error_class="output",
+            )
+        try:
+            return self._commit_control_feedback(
+                job_id,
+                command=command,
+                lease_token=lease_token,
+                expected_input=generation_input,
+                findings=findings,
+                output_fingerprint=output_fingerprint,
+                provider_name=provider_name,
+                model=model,
+                version=version,
+                provider_fingerprint=provider_fingerprint,
+                supports_idempotency=supports_idempotency,
+            )
+        except BaselineGenerationBusyError:
+            raise
+        except Exception as exc:
+            self._record_control_failure(
+                job_id,
+                command=command,
+                lease_token=lease_token,
+                attempt_count=attempt_count,
+                input_fingerprint=generation_input.input_fingerprint,
+                code="database_commit_failed",
+                target="retryable_failed",
+                error_class="database",
+            )
+            if isinstance(exc, BaselineGenerationError):
+                raise
+            raise BaselineGenerationError(
+                "database_commit_failed",
+                "baseline Feedback transaction failed",
+            ) from exc
+
+    def cancel_control(self, job_id: str, lease_token: str) -> None:
+        """Cancel only the currently leased generation attempt."""
+
+        job_id = _safe_identifier(job_id, "job_id", 36)
+        lease_token = _safe_identifier(lease_token, "lease_token", 128)
+        with self._session_factory() as session:
+            try:
+                _begin_write(session)
+                job = self._load_control_job(session, job_id, lock=True)
+                if job["persisted_run_id"] is None:
+                    raise BaselineGenerationError(
+                        "job_state_incompatible", "control job has no retrieval run"
+                    )
+                command = BaselineGenerationCommand(
+                    str(job["persisted_run_id"]),
+                    str(job["group_id"]),
+                    str(job["submitted_by_user_id"] or ""),
+                )
+                run = self._load_run(session, command, lock=True)
+                if (
+                    job["state"] != "running"
+                    or job["failure_stage"] != "generation"
+                    or job["lease_token"] != lease_token
+                    or run["generation_state"] != "running"
+                    or run["generation_lease_token"] != lease_token
+                ):
+                    raise BaselineGenerationBusyError(
+                        "generation_lease_lost", "generation lease is unavailable"
+                    )
+                now = self._clock()
+                session.execute(
+                    text(
+                        "UPDATE baseline_retrieval_run SET generation_state = 'blocked', "
+                        "generation_lease_token = NULL, generation_lease_expires_at = NULL, "
+                        "generation_error_code = 'generation_cancelled', "
+                        "generation_error_fingerprint = :fingerprint, "
+                        "generation_updated_at = :now WHERE run_id = :run_id "
+                        "AND generation_lease_token = :token"
+                    ),
+                    {
+                        "fingerprint": _sha256_text("control:generation_cancelled"),
+                        "now": now,
+                        "run_id": command.run_id,
+                        "token": lease_token,
+                    },
+                )
+                changed = session.execute(
+                    text(
+                        "UPDATE baseline_control_run_job SET state = 'cancelled', "
+                        "lease_token = NULL, lease_expires_at = NULL, "
+                        "reason_code = 'generation_cancelled', "
+                        "failure_stage = 'generation', updated_at = :now, "
+                        "finished_at = :now WHERE job_id = :job_id "
+                        "AND state = 'running' AND lease_token = :token"
+                    ),
+                    {"now": now, "job_id": job_id, "token": lease_token},
+                )
+                if changed.rowcount != 1:
+                    raise BaselineGenerationBusyError(
+                        "generation_lease_lost", "generation lease is unavailable"
+                    )
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+
+    def _load_control_job(
+        self, session: Session, job_id: str, *, lock: bool
+    ) -> dict[str, object]:
+        sql = "SELECT * FROM baseline_control_run_job WHERE job_id = :job_id"
+        if lock and session.get_bind().dialect.name == "postgresql":
+            sql += " FOR UPDATE"
+        row = session.execute(text(sql), {"job_id": job_id}).mappings().one_or_none()
+        if row is None:
+            raise BaselineGenerationError(
+                "generation_job_absent", "baseline control job is unavailable"
+            )
+        return dict(row)
+
+    def _control_receipt(
+        self,
+        session: Session,
+        job: dict[str, object],
+        *,
+        replayed: bool = False,
+    ) -> BaselineControlGenerationReceipt:
+        run_id = str(job.get("persisted_run_id") or "")
+        feedback_ids = (
+            tuple(
+                str(value)
+                for value in session.execute(
+                    text(
+                        "SELECT feedback_id FROM feedback WHERE "
+                        "baseline_retrieval_run_id = :run_id "
+                        "ORDER BY baseline_finding_ordinal"
+                    ),
+                    {"run_id": run_id},
+                ).scalars()
+            )
+            if run_id
+            else ()
+        )
+        outbox_count = (
+            int(
+                session.execute(
+                    text(
+                        "SELECT count(*) FROM baseline_notification_outbox "
+                        "WHERE run_id = :run_id"
+                    ),
+                    {"run_id": run_id},
+                ).scalar_one()
+            )
+            if run_id
+            else 0
+        )
+        if job["state"] == "feedback_persisted" and (
+            not run_id
+            or int(job["feedback_count"]) != len(feedback_ids)
+            or int(job["notification_outbox_count"]) != outbox_count
+            or bool(job["generation_invoked"]) is not True
+            or job["generation_output_fingerprint"] is None
+            or job["generation_completed_at"] is None
+            or (not feedback_ids and outbox_count != 0)
+        ):
+            raise BaselineGenerationError(
+                "job_state_incompatible", "control generation state is inconsistent"
+            )
+        return BaselineControlGenerationReceipt(
+            job_id=str(job["job_id"]),
+            run_id=run_id,
+            state=str(job["state"]),
+            generation_attempt_count=int(job["generation_attempt_count"]),
+            input_fingerprint=(
+                str(job["generation_input_fingerprint"])
+                if job["generation_input_fingerprint"] is not None
+                else None
+            ),
+            output_fingerprint=(
+                str(job["generation_output_fingerprint"])
+                if job["generation_output_fingerprint"] is not None
+                else None
+            ),
+            feedback_ids=feedback_ids,
+            notification_outbox_count=outbox_count,
+            error_code=(
+                str(job["reason_code"]) if job["reason_code"] is not None else None
+            ),
+            replayed=replayed,
+        )
+
+    def _validate_control_relationship(
+        self,
+        session: Session,
+        job: dict[str, object],
+        run: dict[str, object],
+        command: BaselineGenerationCommand,
+    ) -> BaselineGenerationInput:
+        if (
+            job.get("persisted_run_id") != run.get("run_id")
+            or job.get("group_id") != run.get("group_id")
+            or job.get("source_document_id") is None
+            or job.get("source_document_id") != run.get("source_document_id")
+            or run.get("source_scope") != SOURCE_SCOPE_CONTROL_DOCUMENT
+            or run.get("source_scope_version") != SOURCE_SCOPE_VERSION
+            or run.get("source_chunk_id") is not None
+            or job.get("corpus_id") != run.get("corpus_id")
+            or job.get("corpus_generation_id") != run.get("corpus_generation_id")
+            or job.get("index_publication_id") != run.get("index_id")
+            or job.get("index_format_version") != run.get("index_schema_version")
+            or job.get("retrieval_config_fingerprint") != run.get("config_fingerprint")
+            or job.get("embedding_fingerprint") != run.get("embedding_fingerprint")
+            or job.get("index_fingerprint") != run.get("index_fingerprint")
+            or job.get("query_sha256") != run.get("query_sha256")
+            or not isinstance(job.get("retrieval_result_fingerprint"), str)
+            or len(str(job["retrieval_result_fingerprint"])) != 64
+            or int(job.get("evidence_count") or 0) < 1
+            or int(job.get("evidence_count") or 0) > 4
+            or job.get("evidence_count") != job.get("reference_count")
+        ):
+            raise BaselineGenerationError(
+                "job_state_incompatible", "control and retrieval run do not match"
+            )
+        payload_exists = session.execute(
+            text(
+                "SELECT 1 FROM baseline_control_run_payload WHERE "
+                "job_id = :job_id AND group_id = :group_id"
+            ),
+            {"job_id": job["job_id"], "group_id": job["group_id"]},
+        ).first()
+        if payload_exists is not None:
+            raise BaselineGenerationError(
+                "protected_payload_not_erased", "protected payload remains present"
+            )
+        counts = (
+            session.execute(
+                text(
+                    "SELECT count(*) AS evidence_count, min(ordinal) AS first_ordinal, "
+                    "max(ordinal) AS last_ordinal, "
+                    "sum(renderer_output_character_count) AS renderer_characters "
+                    "FROM baseline_selected_evidence WHERE run_id = :run_id "
+                    "AND group_id = :group_id"
+                ),
+                {"run_id": run["run_id"], "group_id": run["group_id"]},
+            )
+            .mappings()
+            .one()
+        )
+        reference_count = int(
+            session.execute(
+                text(
+                    "SELECT count(*) FROM reference r JOIN baseline_selected_evidence s "
+                    "ON s.selected_evidence_id = r.baseline_selected_evidence_id "
+                    "WHERE s.run_id = :run_id AND s.group_id = :group_id "
+                    "AND r.reference_type = 'baseline_file'"
+                ),
+                {"run_id": run["run_id"], "group_id": run["group_id"]},
+            ).scalar_one()
+        )
+        expected_count = int(job["evidence_count"])
+        if (
+            int(counts["evidence_count"]) != expected_count
+            or int(counts["first_ordinal"] or 0) != 1
+            or int(counts["last_ordinal"] or 0) != expected_count
+            or reference_count != expected_count
+            or int(counts["renderer_characters"] or 0) <= 0
+        ):
+            raise BaselineGenerationError(
+                "job_state_incompatible", "ordered evidence relationship is invalid"
+            )
+        validation = self._validate_authorization_and_provenance(session, command, run)
+        if validation[0] is not None:
+            raise BaselineGenerationError(
+                validation[0], "control generation authorization is unavailable"
+            )
+        source_text = validation[1]
+        assert source_text is not None
+        authorization = session.execute(
+            text(
+                "SELECT r.registration_id FROM "
+                "baseline_control_repository_registration r JOIN "
+                "baseline_control_repository_approval a ON "
+                "a.registration_id = r.registration_id AND a.group_id = r.group_id "
+                "JOIN baseline_compatible_index_job i ON i.job_id = :index_job_id "
+                "AND i.group_id = r.group_id JOIN baseline_control_job c ON "
+                "c.job_id = i.job_id AND c.group_id = i.group_id "
+                "WHERE r.registration_id = :registration_id "
+                "AND r.group_id = :group_id AND r.source_document_id = :document_id "
+                "AND r.enabled IS TRUE AND a.state = 'active' "
+                "AND i.corpus_id = :corpus_id AND i.generation_id = :generation_id "
+                "AND i.result_index_id = :index_id "
+                "AND i.corpus_manifest_hash = :submission_manifest_hash "
+                "AND i.corpus_file_manifest_hash = :run_manifest_hash "
+                "AND c.operation = 'index_build' "
+                "AND c.state = 'succeeded'"
+            ),
+            {
+                "index_job_id": job["index_job_id"],
+                "registration_id": job["changed_repository_registration_id"],
+                "group_id": job["group_id"],
+                "document_id": job["source_document_id"],
+                "corpus_id": job["corpus_id"],
+                "generation_id": job["corpus_generation_id"],
+                "index_id": job["index_publication_id"],
+                "submission_manifest_hash": job["corpus_manifest_hash"],
+                "run_manifest_hash": run["corpus_manifest_hash"],
+            },
+        ).first()
+        if authorization is None:
+            raise BaselineGenerationError(
+                "generation_authorization_revoked",
+                "control repository authorization is unavailable",
+            )
+        return self._input_adapter.load(session, run=run, source_text=source_text)
+
+    def _claim_control_generation(
+        self,
+        job_id: str,
+        *,
+        provider_name: str,
+        model: str,
+        version: str,
+        supports_idempotency: bool,
+        provider_fingerprint: str,
+    ) -> (
+        tuple[str, BaselineGenerationCommand, BaselineGenerationInput, int]
+        | BaselineControlGenerationReceipt
+    ):
+        with self._session_factory() as session:
+            try:
+                _begin_write(session)
+                job = self._load_control_job(session, job_id, lock=True)
+                if job["state"] == "feedback_persisted":
+                    receipt = self._control_receipt(session, job, replayed=True)
+                    session.commit()
+                    return receipt
+                if job["state"] in {"terminal_failed", "blocked", "cancelled"}:
+                    receipt = self._control_receipt(session, job, replayed=True)
+                    session.commit()
+                    return receipt
+                now = self._clock()
+                if job["state"] == "running":
+                    expiry = _as_utc(job["lease_expires_at"])
+                    if job["failure_stage"] != "generation":
+                        raise BaselineGenerationError(
+                            "job_state_incompatible",
+                            "control job is not in generation lifecycle",
+                        )
+                    if expiry is not None and expiry > now:
+                        raise BaselineGenerationBusyError(
+                            "generation_lease_active",
+                            "baseline generation is already leased",
+                        )
+                elif job["state"] == "retryable_failed":
+                    if job["failure_stage"] != "generation":
+                        raise BaselineGenerationError(
+                            "job_state_incompatible",
+                            "retrieval retry cannot enter generation",
+                        )
+                elif job["state"] != "references_persisted":
+                    raise BaselineGenerationError(
+                        "job_state_incompatible",
+                        "control job does not permit generation",
+                    )
+                if (
+                    job["persisted_run_id"] is None
+                    or job["submitted_by_user_id"] is None
+                    or job["source_document_id"] is None
+                    or bool(job["generation_invoked"])
+                    or int(job["feedback_count"]) != 0
+                    or int(job["notification_outbox_count"]) != 0
+                ):
+                    raise BaselineGenerationError(
+                        "job_state_incompatible",
+                        "control generation preconditions are inconsistent",
+                    )
+                command = BaselineGenerationCommand(
+                    str(job["persisted_run_id"]),
+                    str(job["group_id"]),
+                    str(job["submitted_by_user_id"]),
+                )
+                run = self._load_run(session, command, lock=True)
+                run_state = BaselineGenerationState(str(run["generation_state"]))
+                if run_state is BaselineGenerationState.RUNNING:
+                    expiry = _as_utc(run["generation_lease_expires_at"])
+                    if expiry is not None and expiry > now:
+                        raise BaselineGenerationBusyError(
+                            "generation_lease_active",
+                            "retrieval-run generation is already leased",
+                        )
+                elif run_state not in {
+                    BaselineGenerationState.PENDING,
+                    BaselineGenerationState.RETRYABLE_FAILED,
+                }:
+                    raise BaselineGenerationError(
+                        "job_state_incompatible",
+                        "retrieval-run generation state is incompatible",
+                    )
+                previous_provider = (
+                    job["generation_contract_version"],
+                    job["generation_provider"],
+                    job["generation_model"],
+                    job["generation_model_version"],
+                    job["generation_provider_fingerprint"],
+                    job["generation_provider_idempotency_supported"],
+                    job["generation_output_schema_version"],
+                    job["generation_output_schema_sha256"],
+                )
+                expected_provider = (
+                    BASELINE_CONTROL_GENERATION_CONTRACT_VERSION,
+                    provider_name,
+                    model,
+                    version,
+                    provider_fingerprint,
+                    supports_idempotency,
+                    GENERATION_OUTPUT_SCHEMA_VERSION,
+                    GENERATION_OUTPUT_SCHEMA_SHA256,
+                )
+                if int(job["generation_attempt_count"]) > 0 and any(
+                    actual != expected
+                    for actual, expected in zip(previous_provider, expected_provider)
+                ):
+                    self._block_control_locked(
+                        session,
+                        job,
+                        run,
+                        code="generation_provider_identity_changed",
+                    )
+                    updated = self._load_control_job(session, job_id, lock=False)
+                    receipt = self._control_receipt(session, updated)
+                    session.commit()
+                    return receipt
+                try:
+                    generation_input = self._validate_control_relationship(
+                        session, job, run, command
+                    )
+                except BaselineGenerationError as exc:
+                    self._block_control_locked(session, job, run, code=exc.code)
+                    updated = self._load_control_job(session, job_id, lock=False)
+                    receipt = self._control_receipt(session, updated)
+                    session.commit()
+                    return receipt
+                if (
+                    job["generation_input_fingerprint"] is not None
+                    and job["generation_input_fingerprint"]
+                    != generation_input.input_fingerprint
+                ):
+                    self._block_control_locked(
+                        session, job, run, code="generation_input_changed"
+                    )
+                    updated = self._load_control_job(session, job_id, lock=False)
+                    receipt = self._control_receipt(session, updated)
+                    session.commit()
+                    return receipt
+                lease_token = uuid4().hex
+                expires = now + timedelta(seconds=self._lease_seconds)
+                control_attempt = int(job["generation_attempt_count"]) + 1
+                run_attempt = int(run["generation_attempt_count"]) + 1
+                session.execute(
+                    text(
+                        "UPDATE baseline_retrieval_run SET generation_state = 'running', "
+                        "generation_lease_token = :token, generation_lease_expires_at = :expires, "
+                        "generation_started_at = :now, generation_attempt_count = :attempt, "
+                        "generation_input_fingerprint = :input_fingerprint, "
+                        "generation_provider = :provider, generation_model = :model, "
+                        "generation_model_version = :version, "
+                        "generation_output_fingerprint = NULL, generation_error_code = NULL, "
+                        "generation_error_fingerprint = NULL, generation_completed_at = NULL, "
+                        "generation_updated_at = :now WHERE run_id = :run_id"
+                    ),
+                    {
+                        "token": lease_token,
+                        "expires": expires,
+                        "now": now,
+                        "attempt": run_attempt,
+                        "input_fingerprint": generation_input.input_fingerprint,
+                        "provider": provider_name,
+                        "model": model,
+                        "version": version,
+                        "run_id": command.run_id,
+                    },
+                )
+                changed = session.execute(
+                    text(
+                        "UPDATE baseline_control_run_job SET state = 'running', "
+                        "lease_token = :token, lease_expires_at = :expires, "
+                        "generation_attempt_count = :attempt, "
+                        "generation_contract_version = :generation_contract_version, "
+                        "generation_started_at = COALESCE(generation_started_at, :now), "
+                        "generation_provider = :provider, generation_model = :model, "
+                        "generation_model_version = :version, "
+                        "generation_provider_fingerprint = :provider_fingerprint, "
+                        "generation_provider_idempotency_supported = :supports_idempotency, "
+                        "generation_output_schema_version = :output_schema_version, "
+                        "generation_output_schema_sha256 = :output_schema_sha256, "
+                        "generation_input_fingerprint = :input_fingerprint, "
+                        "generation_output_fingerprint = NULL, "
+                        "generation_completed_at = NULL, reason_code = NULL, "
+                        "failure_stage = 'generation', updated_at = :now, finished_at = NULL "
+                        "WHERE job_id = :job_id"
+                    ),
+                    {
+                        "token": lease_token,
+                        "expires": expires,
+                        "attempt": control_attempt,
+                        "generation_contract_version": (
+                            BASELINE_CONTROL_GENERATION_CONTRACT_VERSION
+                        ),
+                        "now": now,
+                        "provider": provider_name,
+                        "model": model,
+                        "version": version,
+                        "provider_fingerprint": provider_fingerprint,
+                        "supports_idempotency": supports_idempotency,
+                        "output_schema_version": GENERATION_OUTPUT_SCHEMA_VERSION,
+                        "output_schema_sha256": GENERATION_OUTPUT_SCHEMA_SHA256,
+                        "input_fingerprint": generation_input.input_fingerprint,
+                        "job_id": job_id,
+                    },
+                )
+                if changed.rowcount != 1:
+                    raise BaselineGenerationBusyError(
+                        "generation_lease_lost", "control generation lease was lost"
+                    )
+                session.commit()
+                return lease_token, command, generation_input, control_attempt
+            except Exception:
+                session.rollback()
+                raise
+
+    def _validate_control_lease(
+        self,
+        job_id: str,
+        *,
+        command: BaselineGenerationCommand,
+        lease_token: str,
+        expected_input: BaselineGenerationInput,
+        provider_fingerprint: str,
+    ) -> BaselineControlGenerationReceipt | None:
+        with self._session_factory() as session:
+            try:
+                _begin_write(session)
+                job = self._load_control_job(session, job_id, lock=True)
+                run = self._load_run(session, command, lock=True)
+                now = self._clock()
+                control_expiry = _as_utc(job["lease_expires_at"])
+                run_expiry = _as_utc(run["generation_lease_expires_at"])
+                if (
+                    job["state"] != "running"
+                    or job["failure_stage"] != "generation"
+                    or job["lease_token"] != lease_token
+                    or run["generation_state"] != "running"
+                    or run["generation_lease_token"] != lease_token
+                    or control_expiry is None
+                    or run_expiry is None
+                    or control_expiry <= now
+                    or run_expiry <= now
+                ):
+                    raise BaselineGenerationBusyError(
+                        "generation_lease_lost", "coordinated generation lease was lost"
+                    )
+                if job["generation_provider_fingerprint"] != provider_fingerprint:
+                    self._block_control_locked(
+                        session,
+                        job,
+                        run,
+                        code="generation_provider_identity_changed",
+                        lease_token=lease_token,
+                    )
+                    updated = self._load_control_job(session, job_id, lock=False)
+                    receipt = self._control_receipt(session, updated)
+                    session.commit()
+                    return receipt
+                try:
+                    current_input = self._validate_control_relationship(
+                        session, job, run, command
+                    )
+                except BaselineGenerationError as exc:
+                    self._block_control_locked(
+                        session, job, run, code=exc.code, lease_token=lease_token
+                    )
+                    updated = self._load_control_job(session, job_id, lock=False)
+                    receipt = self._control_receipt(session, updated)
+                    session.commit()
+                    return receipt
+                if current_input.input_fingerprint != expected_input.input_fingerprint:
+                    self._block_control_locked(
+                        session,
+                        job,
+                        run,
+                        code="generation_input_changed",
+                        lease_token=lease_token,
+                    )
+                    updated = self._load_control_job(session, job_id, lock=False)
+                    receipt = self._control_receipt(session, updated)
+                    session.commit()
+                    return receipt
+                session.commit()
+                return None
+            except Exception:
+                session.rollback()
+                raise
+
+    def _block_control_locked(
+        self,
+        session: Session,
+        job: dict[str, object],
+        run: dict[str, object],
+        *,
+        code: str,
+        lease_token: str | None = None,
+    ) -> None:
+        safe_code = _safe_error_code(code, "generation_blocked")
+        now = self._clock()
+        run_conditions = "run_id = :run_id"
+        job_conditions = "job_id = :job_id"
+        parameters: dict[str, object] = {
+            "run_id": run["run_id"],
+            "job_id": job["job_id"],
+            "code": safe_code,
+            "fingerprint": _sha256_text(f"blocked:{safe_code}"),
+            "now": now,
+        }
+        if lease_token is not None:
+            run_conditions += (
+                " AND generation_state = 'running' AND generation_lease_token = :token"
+            )
+            job_conditions += " AND state = 'running' AND lease_token = :token"
+            parameters["token"] = lease_token
+        run_changed = session.execute(
+            text(
+                "UPDATE baseline_retrieval_run SET generation_state = 'blocked', "
+                "generation_lease_token = NULL, generation_lease_expires_at = NULL, "
+                "generation_error_code = :code, "
+                "generation_error_fingerprint = :fingerprint, "
+                f"generation_updated_at = :now WHERE {run_conditions}"
+            ),
+            parameters,
+        )
+        job_changed = session.execute(
+            text(
+                "UPDATE baseline_control_run_job SET state = 'blocked', "
+                "lease_token = NULL, lease_expires_at = NULL, reason_code = :code, "
+                "failure_stage = 'generation', updated_at = :now, finished_at = :now "
+                f"WHERE {job_conditions}"
+            ),
+            parameters,
+        )
+        if run_changed.rowcount != 1 or job_changed.rowcount != 1:
+            raise BaselineGenerationBusyError(
+                "generation_lease_lost", "coordinated generation lease was lost"
+            )
+
+    def _record_control_failure(
+        self,
+        job_id: str,
+        *,
+        command: BaselineGenerationCommand,
+        lease_token: str,
+        attempt_count: int,
+        input_fingerprint: str,
+        code: str,
+        target: str,
+        error_class: str,
+    ) -> BaselineControlGenerationReceipt:
+        if target not in {"retryable_failed", "terminal_failed", "blocked"}:
+            raise ValueError("invalid control generation failure target")
+        safe_code = _safe_error_code(code, "generation_failed")
+        run_target = "blocked" if target == "blocked" else target
+        now = self._clock()
+        with self._session_factory() as session:
+            try:
+                _begin_write(session)
+                job = self._load_control_job(session, job_id, lock=True)
+                if job["state"] == "feedback_persisted":
+                    receipt = self._control_receipt(session, job, replayed=True)
+                    session.commit()
+                    return receipt
+                run = self._load_run(session, command, lock=True)
+                if (
+                    job["state"] != "running"
+                    or job["lease_token"] != lease_token
+                    or run["generation_state"] != "running"
+                    or run["generation_lease_token"] != lease_token
+                ):
+                    receipt = self._control_receipt(session, job, replayed=True)
+                    session.commit()
+                    return receipt
+                session.execute(
+                    text(
+                        "UPDATE baseline_retrieval_run SET generation_state = :state, "
+                        "generation_lease_token = NULL, generation_lease_expires_at = NULL, "
+                        "generation_error_code = :code, "
+                        "generation_error_fingerprint = :fingerprint, "
+                        "generation_updated_at = :now WHERE run_id = :run_id "
+                        "AND generation_lease_token = :token"
+                    ),
+                    {
+                        "state": run_target,
+                        "code": safe_code,
+                        "fingerprint": _sha256_text(f"{error_class}:{safe_code}"),
+                        "now": now,
+                        "run_id": command.run_id,
+                        "token": lease_token,
+                    },
+                )
+                changed = session.execute(
+                    text(
+                        "UPDATE baseline_control_run_job SET state = :state, "
+                        "lease_token = NULL, lease_expires_at = NULL, "
+                        "reason_code = :code, failure_stage = 'generation', "
+                        "updated_at = :now, finished_at = :finished "
+                        "WHERE job_id = :job_id AND state = 'running' "
+                        "AND lease_token = :token"
+                    ),
+                    {
+                        "state": target,
+                        "code": safe_code,
+                        "now": now,
+                        "finished": None if target == "retryable_failed" else now,
+                        "job_id": job_id,
+                        "token": lease_token,
+                    },
+                )
+                if changed.rowcount != 1:
+                    raise BaselineGenerationBusyError(
+                        "generation_lease_lost", "coordinated generation lease was lost"
+                    )
+                session.commit()
+                return BaselineControlGenerationReceipt(
+                    job_id=job_id,
+                    run_id=command.run_id,
+                    state=target,
+                    generation_attempt_count=attempt_count,
+                    input_fingerprint=input_fingerprint,
+                    output_fingerprint=None,
+                    feedback_ids=(),
+                    notification_outbox_count=0,
+                    error_code=safe_code,
+                )
+            except Exception:
+                session.rollback()
+                raise
+
+    def _commit_control_feedback(
+        self,
+        job_id: str,
+        *,
+        command: BaselineGenerationCommand,
+        lease_token: str,
+        expected_input: BaselineGenerationInput,
+        findings: tuple[str, ...],
+        output_fingerprint: str,
+        provider_name: str,
+        model: str,
+        version: str,
+        provider_fingerprint: str,
+        supports_idempotency: bool,
+    ) -> BaselineControlGenerationReceipt:
+        with self._session_factory() as session:
+            try:
+                _begin_write(session)
+                job = self._load_control_job(session, job_id, lock=True)
+                if job["state"] == "feedback_persisted":
+                    raise BaselineGenerationBusyError(
+                        "generation_lease_lost",
+                        "control generation lease was completed",
+                    )
+                run = self._load_run(session, command, lock=True)
+                now = self._clock()
+                control_expiry = _as_utc(job["lease_expires_at"])
+                run_expiry = _as_utc(run["generation_lease_expires_at"])
+                if (
+                    job["state"] != "running"
+                    or job["failure_stage"] != "generation"
+                    or job["lease_token"] != lease_token
+                    or run["generation_state"] != "running"
+                    or run["generation_lease_token"] != lease_token
+                    or control_expiry is None
+                    or run_expiry is None
+                    or control_expiry <= now
+                    or run_expiry <= now
+                ):
+                    raise BaselineGenerationBusyError(
+                        "generation_lease_lost", "coordinated generation lease was lost"
+                    )
+                if (
+                    job["generation_contract_version"]
+                    != BASELINE_CONTROL_GENERATION_CONTRACT_VERSION
+                    or job["generation_provider"] != provider_name
+                    or job["generation_model"] != model
+                    or job["generation_model_version"] != version
+                    or job["generation_provider_fingerprint"] != provider_fingerprint
+                    or bool(job["generation_provider_idempotency_supported"])
+                    != supports_idempotency
+                    or job["generation_output_schema_version"]
+                    != GENERATION_OUTPUT_SCHEMA_VERSION
+                    or job["generation_output_schema_sha256"]
+                    != GENERATION_OUTPUT_SCHEMA_SHA256
+                ):
+                    self._block_control_locked(
+                        session,
+                        job,
+                        run,
+                        code="generation_provider_identity_changed",
+                        lease_token=lease_token,
+                    )
+                    updated = self._load_control_job(session, job_id, lock=False)
+                    receipt = self._control_receipt(session, updated)
+                    session.commit()
+                    return receipt
+                try:
+                    current_input = self._validate_control_relationship(
+                        session, job, run, command
+                    )
+                except BaselineGenerationError as exc:
+                    self._block_control_locked(
+                        session, job, run, code=exc.code, lease_token=lease_token
+                    )
+                    updated = self._load_control_job(session, job_id, lock=False)
+                    receipt = self._control_receipt(session, updated)
+                    session.commit()
+                    return receipt
+                if (
+                    current_input.input_fingerprint != expected_input.input_fingerprint
+                    or job["generation_input_fingerprint"]
+                    != expected_input.input_fingerprint
+                    or len(findings) > min(4, int(job["reference_count"]))
+                ):
+                    self._block_control_locked(
+                        session,
+                        job,
+                        run,
+                        code="generation_input_changed",
+                        lease_token=lease_token,
+                    )
+                    updated = self._load_control_job(session, job_id, lock=False)
+                    receipt = self._control_receipt(session, updated)
+                    session.commit()
+                    return receipt
+                if self._feedback_rows(session, command.run_id):
+                    raise BaselineGenerationError(
+                        "feedback_state_conflict",
+                        "baseline Feedback exists before succeeded transition",
+                    )
+                feedback_ids: list[str] = []
+                for ordinal, finding in enumerate(findings, start=1):
+                    feedback_id = str(uuid4())
+                    session.execute(
+                        text(
+                            "INSERT INTO feedback "
+                            "(feedback_id, source_chunk_id, feedback, model, timestamp, "
+                            "is_hidden, baseline_retrieval_run_id, "
+                            "baseline_finding_ordinal, generation_provider, "
+                            "generation_model, generation_model_version, "
+                            "generation_input_fingerprint, generation_output_fingerprint) "
+                            "VALUES (:feedback_id, NULL, :feedback, :model, :timestamp, "
+                            "false, :run_id, :ordinal, :provider, :model, :version, "
+                            ":input_fingerprint, :output_fingerprint)"
+                        ),
+                        {
+                            "feedback_id": feedback_id,
+                            "feedback": finding,
+                            "model": model,
+                            "timestamp": now,
+                            "run_id": command.run_id,
+                            "ordinal": ordinal,
+                            "provider": provider_name,
+                            "version": version,
+                            "input_fingerprint": current_input.input_fingerprint,
+                            "output_fingerprint": output_fingerprint,
+                        },
+                    )
+                    feedback_ids.append(feedback_id)
+                session.flush()
+                self._after_stage(GenerationWriteStage.FEEDBACK)
+                run_changed = session.execute(
+                    text(
+                        "UPDATE baseline_retrieval_run SET generation_state = 'succeeded', "
+                        "generation_lease_token = NULL, generation_lease_expires_at = NULL, "
+                        "generation_output_fingerprint = :output_fingerprint, "
+                        "generation_error_code = NULL, generation_error_fingerprint = NULL, "
+                        "generation_completed_at = :now, generation_updated_at = :now "
+                        "WHERE run_id = :run_id AND generation_state = 'running' "
+                        "AND generation_lease_token = :token"
+                    ),
+                    {
+                        "output_fingerprint": output_fingerprint,
+                        "now": now,
+                        "run_id": command.run_id,
+                        "token": lease_token,
+                    },
+                )
+                if run_changed.rowcount != 1:
+                    raise BaselineGenerationBusyError(
+                        "generation_lease_lost", "retrieval generation lease was lost"
+                    )
+                session.flush()
+                self._after_stage(GenerationWriteStage.STATE)
+                outbox_count = 0
+                if feedback_ids:
+                    schedule_baseline_notification(
+                        session,
+                        run_id=command.run_id,
+                        group_id=command.group_id,
+                        recipient_user_id=command.caller_user_id,
+                        feedback_ids=feedback_ids,
+                        enabled=self._notifications_enabled,
+                        now=now,
+                        control_generation_lease_token=lease_token,
+                    )
+                    outbox_count = 1
+                session.flush()
+                self._after_stage(GenerationWriteStage.OUTBOX)
+                job_changed = session.execute(
+                    text(
+                        "UPDATE baseline_control_run_job SET "
+                        "state = 'feedback_persisted', lease_token = NULL, "
+                        "lease_expires_at = NULL, generation_invoked = true, "
+                        "generation_output_fingerprint = :output_fingerprint, "
+                        "generation_completed_at = :now, feedback_count = :feedback_count, "
+                        "notification_outbox_count = :outbox_count, reason_code = NULL, "
+                        "failure_stage = NULL, updated_at = :now, finished_at = :now "
+                        "WHERE job_id = :job_id AND state = 'running' "
+                        "AND lease_token = :token"
+                    ),
+                    {
+                        "output_fingerprint": output_fingerprint,
+                        "now": now,
+                        "feedback_count": len(feedback_ids),
+                        "outbox_count": outbox_count,
+                        "job_id": job_id,
+                        "token": lease_token,
+                    },
+                )
+                if job_changed.rowcount != 1:
+                    raise BaselineGenerationBusyError(
+                        "generation_lease_lost", "control generation lease was lost"
+                    )
+                session.flush()
+                self._after_stage(GenerationWriteStage.CONTROL)
+                session.commit()
+                return BaselineControlGenerationReceipt(
+                    job_id=job_id,
+                    run_id=command.run_id,
+                    state="feedback_persisted",
+                    generation_attempt_count=int(job["generation_attempt_count"]),
+                    input_fingerprint=current_input.input_fingerprint,
+                    output_fingerprint=output_fingerprint,
+                    feedback_ids=tuple(feedback_ids),
+                    notification_outbox_count=outbox_count,
+                )
+            except Exception:
+                session.rollback()
+                raise
 
     def _acquire_lease(
         self,
@@ -747,16 +1869,21 @@ class BaselineGenerationService:
                 _begin_write(session)
                 run = self._load_run(session, command, lock=True)
                 if run["generation_state"] != BaselineGenerationState.RUNNING.value:
-                    if run["generation_state"] == BaselineGenerationState.SUCCEEDED.value:
+                    if (
+                        run["generation_state"]
+                        == BaselineGenerationState.SUCCEEDED.value
+                    ):
                         receipt = self._receipt(session, run, replayed=True)
                         session.commit()
                         return receipt
                     raise BaselineGenerationBusyError(
-                        "generation_lease_lost", "baseline generation lease is no longer active"
+                        "generation_lease_lost",
+                        "baseline generation lease is no longer active",
                     )
                 if run["generation_lease_token"] != lease_token:
                     raise BaselineGenerationBusyError(
-                        "generation_lease_lost", "baseline generation lease token changed"
+                        "generation_lease_lost",
+                        "baseline generation lease token changed",
                     )
                 expiry = _as_utc(run["generation_lease_expires_at"])
                 if expiry is None or expiry <= self._clock():
@@ -771,7 +1898,9 @@ class BaselineGenerationService:
                             "generation_updated_at = :updated WHERE run_id = :run_id"
                         ),
                         {
-                            "fingerprint": _sha256_text("lease:generation_lease_expired"),
+                            "fingerprint": _sha256_text(
+                                "lease:generation_lease_expired"
+                            ),
                             "updated": self._clock(),
                             "run_id": command.run_id,
                         },
@@ -868,15 +1997,16 @@ class BaselineGenerationService:
                 )
                 session.flush()
                 self._after_stage(GenerationWriteStage.STATE)
-                schedule_baseline_notification(
-                    session,
-                    run_id=command.run_id,
-                    group_id=command.group_id,
-                    recipient_user_id=command.caller_user_id,
-                    feedback_ids=feedback_ids,
-                    enabled=self._notifications_enabled,
-                    now=completed,
-                )
+                if feedback_ids:
+                    schedule_baseline_notification(
+                        session,
+                        run_id=command.run_id,
+                        group_id=command.group_id,
+                        recipient_user_id=command.caller_user_id,
+                        feedback_ids=feedback_ids,
+                        enabled=self._notifications_enabled,
+                        now=completed,
+                    )
                 session.flush()
                 self._after_stage(GenerationWriteStage.OUTBOX)
                 session.commit()
@@ -962,29 +2092,49 @@ class BaselineGenerationService:
         command: BaselineGenerationCommand,
         run: dict[str, object],
     ) -> tuple[str | None, str | None]:
-        if run["source_chunk_id"] is None or run["source_document_id"] is None:
+        if run["source_document_id"] is None:
             return "generation_source_deleted", None
-        source = (
-            session.execute(
-                text(
-                    "SELECT c.content FROM chunk c "
-                    "JOIN document d ON d.document_id = c.document_id "
-                    "JOIN document_to_group dtg ON dtg.document_id = d.document_id "
-                    "JOIN user_to_group utg ON utg.group_id = dtg.group_id "
-                    "JOIN \"user\" u ON u.user_id = utg.user_id "
-                    "WHERE c.chunk_id = :chunk_id AND c.document_id = :document_id "
-                    "AND dtg.group_id = :group_id AND utg.user_id = :caller_user_id"
-                ),
-                {
-                    "chunk_id": run["source_chunk_id"],
-                    "document_id": run["source_document_id"],
-                    "group_id": command.group_id,
-                    "caller_user_id": command.caller_user_id,
-                },
+        source_scope = str(run.get("source_scope") or "")
+        if run.get("source_scope_version") != SOURCE_SCOPE_VERSION:
+            return "generation_source_scope_invalid", None
+        parameters = {
+            "run_id": run["run_id"],
+            "chunk_id": run["source_chunk_id"],
+            "document_id": run["source_document_id"],
+            "group_id": command.group_id,
+            "caller_user_id": command.caller_user_id,
+        }
+        if source_scope == SOURCE_SCOPE_LEGACY_CHUNK:
+            if run["source_chunk_id"] is None:
+                return "generation_source_deleted", None
+            source_sql = (
+                "SELECT c.content FROM chunk c "
+                "JOIN document d ON d.document_id = c.document_id "
+                "JOIN document_to_group dtg ON dtg.document_id = d.document_id "
+                "JOIN user_to_group utg ON utg.group_id = dtg.group_id "
+                'JOIN "user" u ON u.user_id = utg.user_id '
+                "WHERE c.chunk_id = :chunk_id AND c.document_id = :document_id "
+                "AND dtg.group_id = :group_id AND utg.user_id = :caller_user_id"
             )
-            .mappings()
-            .one_or_none()
-        )
+        elif source_scope == SOURCE_SCOPE_CONTROL_DOCUMENT:
+            if run["source_chunk_id"] is not None:
+                return "generation_source_scope_invalid", None
+            source_sql = (
+                "SELECT d.content FROM document d "
+                "JOIN document_to_group dtg ON dtg.document_id = d.document_id "
+                "JOIN user_to_group utg ON utg.group_id = dtg.group_id "
+                'JOIN "user" u ON u.user_id = utg.user_id '
+                "JOIN baseline_control_run_job j ON "
+                "j.persisted_run_id = :run_id AND j.group_id = dtg.group_id "
+                "AND j.source_document_id = d.document_id "
+                "WHERE d.document_id = :document_id "
+                "AND dtg.group_id = :group_id AND utg.user_id = :caller_user_id "
+                "AND j.state IN ('references_persisted', 'running', "
+                "'retryable_failed', 'feedback_persisted')"
+            )
+        else:
+            return "generation_source_scope_invalid", None
+        source = session.execute(text(source_sql), parameters).mappings().one_or_none()
         if source is None:
             return "generation_authorization_revoked", None
         expected_scope = f"group:{command.group_id}"
@@ -1006,9 +2156,7 @@ class BaselineGenerationService:
             )
         ):
             return "generation_corpus_stale", None
-        generation = session.get(
-            RetrievalCorpusGeneration, corpus.active_generation_id
-        )
+        generation = session.get(RetrievalCorpusGeneration, corpus.active_generation_id)
         if (
             generation is None
             or generation.status != CorpusGenerationStatus.ACTIVE.value
@@ -1092,28 +2240,90 @@ class BaselineGenerationService:
         *,
         maximum_findings: int,
     ) -> tuple[tuple[str, ...], str]:
-        if not isinstance(output, str) or len(output) > MAX_GENERATION_OUTPUT_CHARACTERS:
+        if (
+            not isinstance(output, str)
+            or len(output) > MAX_GENERATION_OUTPUT_CHARACTERS
+        ):
             raise BaselineGenerationError(
                 "provider_malformed_output", "baseline provider output is invalid"
             )
         output_fingerprint = _sha256_text(output)
-        stripped = output.strip()
-        if not stripped or stripped.upper() == "NONE":
+        if not output.strip():
             raise BaselineGenerationError(
-                "provider_empty_output", "baseline provider produced no finding"
+                "provider_malformed_output",
+                "baseline provider output is invalid",
             )
-        findings = tuple(
-            part.strip()
-            for part in re.split(
-                rf"\s*{re.escape(GENERATION_FINDING_SEPARATOR)}\s*", stripped
+
+        def pairs(values: list[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, value in values:
+                if key in result:
+                    raise ValueError("duplicate key")
+                result[key] = value
+            return result
+
+        try:
+            parsed = json.loads(
+                output,
+                object_pairs_hook=pairs,
+                parse_constant=lambda _value: (_ for _ in ()).throw(
+                    ValueError("non-finite number")
+                ),
             )
-            if part.strip()
-        )
-        if not findings or len(findings) > maximum_findings:
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise BaselineGenerationError(
-                "provider_malformed_output", "baseline provider finding count is invalid"
+                "provider_malformed_output",
+                "baseline provider output is invalid",
+            ) from exc
+        if not isinstance(parsed, dict) or set(parsed) != {
+            "schema_version",
+            "outcome",
+            "findings",
+        }:
+            raise BaselineGenerationError(
+                "provider_malformed_output", "baseline provider output is invalid"
             )
-        return findings, output_fingerprint
+        if parsed["schema_version"] != GENERATION_OUTPUT_SCHEMA_VERSION:
+            raise BaselineGenerationError(
+                "provider_malformed_output", "baseline provider output is invalid"
+            )
+        raw_findings = parsed["findings"]
+        if not isinstance(raw_findings, list):
+            raise BaselineGenerationError(
+                "provider_malformed_output", "baseline provider output is invalid"
+            )
+        findings: list[str] = []
+        for item in raw_findings:
+            if not isinstance(item, dict) or set(item) != {"feedback"}:
+                raise BaselineGenerationError(
+                    "provider_malformed_output", "baseline provider output is invalid"
+                )
+            feedback = item["feedback"]
+            if (
+                not isinstance(feedback, str)
+                or not feedback.strip()
+                or feedback.strip().upper() == "NONE"
+            ):
+                raise BaselineGenerationError(
+                    "provider_malformed_output", "baseline provider output is invalid"
+                )
+            findings.append(feedback)
+        outcome = parsed["outcome"]
+        if outcome == "no_findings":
+            if findings:
+                raise BaselineGenerationError(
+                    "provider_malformed_output", "baseline provider output is invalid"
+                )
+        elif outcome == "findings":
+            if not findings or len(findings) > min(4, maximum_findings):
+                raise BaselineGenerationError(
+                    "provider_malformed_output", "baseline provider output is invalid"
+                )
+        else:
+            raise BaselineGenerationError(
+                "provider_malformed_output", "baseline provider output is invalid"
+            )
+        return tuple(findings), output_fingerprint
 
     def _feedback_rows(self, session: Session, run_id: str):
         return (
@@ -1169,8 +2379,11 @@ class BaselineGenerationService:
 
 __all__ = [
     "GENERATION_CONTRACT_VERSION",
-    "GENERATION_FINDING_SEPARATOR",
+    "GENERATION_OUTPUT_SCHEMA_SHA256",
+    "GENERATION_OUTPUT_SCHEMA_VERSION",
+    "GENERATION_OUTPUT_SPEC_SHA256",
     "GENERATION_STATE_VERSION",
+    "BaselineControlGenerationReceipt",
     "BaselineGenerationBusyError",
     "BaselineGenerationCommand",
     "BaselineGenerationError",

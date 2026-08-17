@@ -5195,6 +5195,7 @@ def _process_baseline_reference_evidence(
     from .retrieval.evidence_persistence import (
         BaselineEvidencePersistenceCommand,
         BaselineEvidencePersistenceError,
+        LegacyChunkSource,
     )
     from .retrieval.generation import (
         BaselineGenerationBusyError,
@@ -5282,8 +5283,10 @@ def _process_baseline_reference_evidence(
         receipt = persistence_service.persist(
             BaselineEvidencePersistenceCommand(
                 group_id=scope.group_id,
-                source_chunk_id=scope.source_chunk_id,
-                source_document_id=scope.source_document_id,
+                source=LegacyChunkSource(
+                    document_id=scope.source_document_id,
+                    chunk_id=scope.source_chunk_id,
+                ),
                 idempotency_key=derive_baseline_persistence_idempotency_key(
                     processing_run_key,
                     scope.group_id,

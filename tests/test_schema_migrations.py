@@ -35,7 +35,9 @@ def _create_current_startup_schema(engine) -> None:
     ensure_retrieval_corpus_schema(engine)
 
 
-def _toy_relationship_migration(identifier: str = "1000_toy_relationship") -> SchemaMigration:
+def _toy_relationship_migration(
+    identifier: str = "1000_toy_relationship",
+) -> SchemaMigration:
     def upgrade(connection) -> None:
         connection.exec_driver_sql(
             "CREATE TABLE migration_evidence ("
@@ -58,11 +60,11 @@ def _toy_relationship_migration(identifier: str = "1000_toy_relationship") -> Sc
 
     def validate(connection) -> None:
         inspector = migration_registry.inspect(connection)
-        if {"migration_evidence", "migration_owner"} - set(
-            inspector.get_table_names()
-        ):
+        if {"migration_evidence", "migration_owner"} - set(inspector.get_table_names()):
             raise SchemaInvariantError("toy_table_missing")
-        owner_columns = {column["name"] for column in inspector.get_columns("migration_owner")}
+        owner_columns = {
+            column["name"] for column in inspector.get_columns("migration_owner")
+        }
         if "evidence_id" not in owner_columns:
             raise SchemaInvariantError("toy_column_missing")
         indexes = {index["name"] for index in inspector.get_indexes("migration_owner")}
@@ -88,29 +90,63 @@ def test_existing_startup_schema_gets_transactional_baseline_marker(
     try:
         _create_current_startup_schema(engine)
 
-        first = run_schema_migrations(engine)
+        staging_only = run_schema_migrations(engine, CORE_SCHEMA_MIGRATIONS[:9])
+        continuation = run_schema_migrations(engine)
         second = run_schema_migrations(engine)
         state = read_schema_migration_state(engine)
 
-        assert first.applied == (
+        assert staging_only.applied == (
             "0000_core_schema_baseline",
             "0001_baseline_evidence_bridge_v1",
             "0002_baseline_evidence_retention_v1",
             "0003_baseline_generation_state_v1",
+            "0004_baseline_notification_outbox_v1",
+            "0005_baseline_control_plane_staging_v1",
+            "0006_baseline_control_plane_continuation_v1",
+            "0007_baseline_control_plane_ingestion_worker_v1",
+            "0008_baseline_compatible_index_job_v1",
         )
-        assert first.already_applied == ()
+        assert continuation.applied == (
+            "0009_baseline_run_job_v1",
+            "0010_baseline_document_source_scope_v1",
+            "0011_baseline_run_executor_v1",
+            "0012_baseline_control_generation_v1",
+            "0013_baseline_database_worker_v1",
+        )
+        assert staging_only.already_applied == ()
+        assert continuation.already_applied == staging_only.applied
         assert second.applied == ()
         assert second.already_applied == (
             "0000_core_schema_baseline",
             "0001_baseline_evidence_bridge_v1",
             "0002_baseline_evidence_retention_v1",
             "0003_baseline_generation_state_v1",
+            "0004_baseline_notification_outbox_v1",
+            "0005_baseline_control_plane_staging_v1",
+            "0006_baseline_control_plane_continuation_v1",
+            "0007_baseline_control_plane_ingestion_worker_v1",
+            "0008_baseline_compatible_index_job_v1",
+            "0009_baseline_run_job_v1",
+            "0010_baseline_document_source_scope_v1",
+            "0011_baseline_run_executor_v1",
+            "0012_baseline_control_generation_v1",
+            "0013_baseline_database_worker_v1",
         )
         assert [(row.migration_id, row.state) for row in state] == [
             ("0000_core_schema_baseline", "applied"),
             ("0001_baseline_evidence_bridge_v1", "applied"),
             ("0002_baseline_evidence_retention_v1", "applied"),
             ("0003_baseline_generation_state_v1", "applied"),
+            ("0004_baseline_notification_outbox_v1", "applied"),
+            ("0005_baseline_control_plane_staging_v1", "applied"),
+            ("0006_baseline_control_plane_continuation_v1", "applied"),
+            ("0007_baseline_control_plane_ingestion_worker_v1", "applied"),
+            ("0008_baseline_compatible_index_job_v1", "applied"),
+            ("0009_baseline_run_job_v1", "applied"),
+            ("0010_baseline_document_source_scope_v1", "applied"),
+            ("0011_baseline_run_executor_v1", "applied"),
+            ("0012_baseline_control_generation_v1", "applied"),
+            ("0013_baseline_database_worker_v1", "applied"),
         ]
         assert [row.checksum for row in state] == [
             migration.checksum for migration in CORE_SCHEMA_MIGRATIONS
@@ -163,7 +199,9 @@ def test_failed_sqlite_batch_rolls_back_all_pending_ddl_and_records_failure(
     )
 
     def fail_after_ddl(connection) -> None:
-        connection.exec_driver_sql("CREATE TABLE second_pending (id INTEGER PRIMARY KEY)")
+        connection.exec_driver_sql(
+            "CREATE TABLE second_pending (id INTEGER PRIMARY KEY)"
+        )
         raise RuntimeError("deliberate migration failure")
 
     second = SchemaMigration(
@@ -178,8 +216,12 @@ def test_failed_sqlite_batch_rolls_back_all_pending_ddl_and_records_failure(
 
         assert error.value.migration_id == second.migration_id
         assert error.value.code == "upgrade_failed"
-        assert "first_pending" not in migration_registry.inspect(engine).get_table_names()
-        assert "second_pending" not in migration_registry.inspect(engine).get_table_names()
+        assert (
+            "first_pending" not in migration_registry.inspect(engine).get_table_names()
+        )
+        assert (
+            "second_pending" not in migration_registry.inspect(engine).get_table_names()
+        )
         state = read_schema_migration_state(engine)
         assert [(row.migration_id, row.state, row.error_code) for row in state] == [
             (second.migration_id, "failed", "upgrade_failed")
@@ -198,13 +240,17 @@ def test_partial_legacy_schema_is_rejected_without_application_ddl(
     engine = _sqlite_engine(tmp_path / "partial.db")
     try:
         with engine.begin() as connection:
-            connection.exec_driver_sql('CREATE TABLE "user" (user_id VARCHAR(36) PRIMARY KEY)')
+            connection.exec_driver_sql(
+                'CREATE TABLE "user" (user_id VARCHAR(36) PRIMARY KEY)'
+            )
 
         with pytest.raises(SchemaMigrationError) as error:
             run_schema_migrations(engine)
 
         assert error.value.code == "missing_table:document"
-        application_tables = set(migration_registry.inspect(engine).get_table_names()) - {
+        application_tables = set(
+            migration_registry.inspect(engine).get_table_names()
+        ) - {
             "core_schema_migration",
             "user",
         }
@@ -280,13 +326,18 @@ def test_sqlite_lock_serializes_concurrent_runners(tmp_path: Path) -> None:
     assert not errors
     assert all(not thread.is_alive() for thread in threads)
     assert counter == 1
-    assert sorted(report.applied for report in reports) == [(), (migration.migration_id,)]
+    assert sorted(report.applied for report in reports) == [
+        (),
+        (migration.migration_id,),
+    ]
 
 
 def test_initialize_database_propagates_registry_failure(monkeypatch) -> None:
     import compair_core.compair as application
 
-    monkeypatch.setattr(application.models.Base.metadata, "create_all", lambda _engine: None)
+    monkeypatch.setattr(
+        application.models.Base.metadata, "create_all", lambda _engine: None
+    )
     monkeypatch.setattr(application, "_ensure_pgvector_extension", lambda: None)
     monkeypatch.setattr(application, "_ensure_retrieval_corpus_tables", lambda: None)
     monkeypatch.setattr(application, "_ensure_user_retrial_count_default", lambda: None)

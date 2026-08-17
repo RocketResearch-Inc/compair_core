@@ -137,12 +137,28 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
         # migration rather than relying on create_all's current schema.
         _create_legacy_core_schema(scoped_engine)
         ensure_retrieval_corpus_schema(scoped_engine)
-        baseline = run_schema_migrations(scoped_engine)
-        assert baseline.applied == (
+        staging_baseline = run_schema_migrations(
+            scoped_engine,
+            CORE_SCHEMA_MIGRATIONS[:9],
+        )
+        assert staging_baseline.applied == (
             "0000_core_schema_baseline",
             "0001_baseline_evidence_bridge_v1",
             "0002_baseline_evidence_retention_v1",
             "0003_baseline_generation_state_v1",
+            "0004_baseline_notification_outbox_v1",
+            "0005_baseline_control_plane_staging_v1",
+            "0006_baseline_control_plane_continuation_v1",
+            "0007_baseline_control_plane_ingestion_worker_v1",
+            "0008_baseline_compatible_index_job_v1",
+        )
+        continuation_baseline = run_schema_migrations(scoped_engine)
+        assert continuation_baseline.applied == (
+            "0009_baseline_run_job_v1",
+            "0010_baseline_document_source_scope_v1",
+            "0011_baseline_run_executor_v1",
+            "0012_baseline_control_generation_v1",
+            "0013_baseline_database_worker_v1",
         )
         with scoped_engine.connect() as connection:
             assert connection.execute(
@@ -262,8 +278,7 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
         with pytest.raises(IntegrityError), scoped_engine.begin() as connection:
             connection.execute(
                 baseline_evidence_artifact.delete().where(
-                    baseline_evidence_artifact.c.artifact_id
-                    == "artifact-postgres"
+                    baseline_evidence_artifact.c.artifact_id == "artifact-postgres"
                 )
             )
 
@@ -289,24 +304,40 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
                     "FROM baseline_retrieval_run WHERE run_id='run-postgres'"
                 )
             ).one() == (None, None)
-            assert connection.execute(
-                text(
-                    "SELECT source_chunk_id FROM reference "
-                    "WHERE reference_id='baseline-reference'"
-                )
-            ).scalar_one() is None
-            assert connection.execute(
-                text(
-                    "SELECT source_chunk_id FROM feedback "
-                    "WHERE feedback_id='baseline-feedback'"
-                )
-            ).scalar_one() is None
-            assert connection.execute(
-                text("SELECT count(*) FROM reference WHERE reference_id LIKE 'legacy-%'")
-            ).scalar_one() == 0
-            assert connection.execute(
-                text("SELECT count(*) FROM feedback WHERE feedback_id='legacy-feedback'")
-            ).scalar_one() == 0
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT source_chunk_id FROM reference "
+                        "WHERE reference_id='baseline-reference'"
+                    )
+                ).scalar_one()
+                is None
+            )
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT source_chunk_id FROM feedback "
+                        "WHERE feedback_id='baseline-feedback'"
+                    )
+                ).scalar_one()
+                is None
+            )
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM reference WHERE reference_id LIKE 'legacy-%'"
+                    )
+                ).scalar_one()
+                == 0
+            )
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM feedback WHERE feedback_id='legacy-feedback'"
+                    )
+                ).scalar_one()
+                == 0
+            )
 
         # Re-ingestion/repository rename and publication/generation deletion
         # cannot reach the immutable copied evidence.
@@ -370,12 +401,22 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
                 "generation-postgres",
                 "index-postgres",
             )
-            assert connection.execute(
-                text("SELECT count(*) FROM reference WHERE reference_id='baseline-reference'")
-            ).scalar_one() == 1
-            assert connection.execute(
-                text("SELECT count(*) FROM feedback WHERE feedback_id='baseline-feedback'")
-            ).scalar_one() == 1
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM reference WHERE reference_id='baseline-reference'"
+                    )
+                ).scalar_one()
+                == 1
+            )
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM feedback WHERE feedback_id='baseline-feedback'"
+                    )
+                ).scalar_one()
+                == 1
+            )
 
         # One scope deletion cascades run, selection, Reference, Feedback, and
         # artifact through the direct group privacy boundary.
@@ -390,21 +431,30 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
                 "baseline_evidence_artifact",
                 "baseline_selected_evidence",
             ):
-                assert connection.execute(
-                    text(f"SELECT count(*) FROM {table_name}")
-                ).scalar_one() == 0
-            assert connection.execute(
-                text(
-                    "SELECT count(*) FROM reference "
-                    "WHERE reference_id = 'baseline-reference'"
+                assert (
+                    connection.execute(
+                        text(f"SELECT count(*) FROM {table_name}")
+                    ).scalar_one()
+                    == 0
                 )
-            ).scalar_one() == 0
-            assert connection.execute(
-                text(
-                    "SELECT count(*) FROM feedback "
-                    "WHERE feedback_id = 'baseline-feedback'"
-                )
-            ).scalar_one() == 0
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM reference "
+                        "WHERE reference_id = 'baseline-reference'"
+                    )
+                ).scalar_one()
+                == 0
+            )
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM feedback "
+                        "WHERE feedback_id = 'baseline-feedback'"
+                    )
+                ).scalar_one()
+                == 0
+            )
 
         def create_relationship(connection) -> None:
             connection.exec_driver_sql(
@@ -446,9 +496,12 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
         registry = (*CORE_SCHEMA_MIGRATIONS, first)
         report = run_schema_migrations(scoped_engine, registry)
         assert report.applied == (first.migration_id,)
-        assert migration_registry.inspect(scoped_engine).get_foreign_keys("migration_owner")[0][
-            "name"
-        ] == "fk_migration_owner_evidence"
+        assert (
+            migration_registry.inspect(scoped_engine).get_foreign_keys(
+                "migration_owner"
+            )[0]["name"]
+            == "fk_migration_owner_evidence"
+        )
         with scoped_engine.connect() as connection:
             legacy_value = connection.exec_driver_sql(
                 "SELECT evidence_id FROM migration_owner WHERE owner_id = 'legacy'"
@@ -467,6 +520,16 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
             "0001_baseline_evidence_bridge_v1",
             "0002_baseline_evidence_retention_v1",
             "0003_baseline_generation_state_v1",
+            "0004_baseline_notification_outbox_v1",
+            "0005_baseline_control_plane_staging_v1",
+            "0006_baseline_control_plane_continuation_v1",
+            "0007_baseline_control_plane_ingestion_worker_v1",
+            "0008_baseline_compatible_index_job_v1",
+            "0009_baseline_run_job_v1",
+            "0010_baseline_document_source_scope_v1",
+            "0011_baseline_run_executor_v1",
+            "0012_baseline_control_generation_v1",
+            "0013_baseline_database_worker_v1",
             first.migration_id,
         )
 
@@ -485,14 +548,28 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
         with pytest.raises(SchemaMigrationError) as error:
             run_schema_migrations(scoped_engine, (*registry, second))
         assert error.value.code == "upgrade_failed"
-        assert "should_rollback" not in migration_registry.inspect(
-            scoped_engine
-        ).get_table_names()
-        assert [(row.migration_id, row.state) for row in read_schema_migration_state(scoped_engine)] == [
+        assert (
+            "should_rollback"
+            not in migration_registry.inspect(scoped_engine).get_table_names()
+        )
+        assert [
+            (row.migration_id, row.state)
+            for row in read_schema_migration_state(scoped_engine)
+        ] == [
             ("0000_core_schema_baseline", "applied"),
             ("0001_baseline_evidence_bridge_v1", "applied"),
             ("0002_baseline_evidence_retention_v1", "applied"),
             ("0003_baseline_generation_state_v1", "applied"),
+            ("0004_baseline_notification_outbox_v1", "applied"),
+            ("0005_baseline_control_plane_staging_v1", "applied"),
+            ("0006_baseline_control_plane_continuation_v1", "applied"),
+            ("0007_baseline_control_plane_ingestion_worker_v1", "applied"),
+            ("0008_baseline_compatible_index_job_v1", "applied"),
+            ("0009_baseline_run_job_v1", "applied"),
+            ("0010_baseline_document_source_scope_v1", "applied"),
+            ("0011_baseline_run_executor_v1", "applied"),
+            ("0012_baseline_control_generation_v1", "applied"),
+            ("0013_baseline_database_worker_v1", "applied"),
             (first.migration_id, "applied"),
             (second.migration_id, "failed"),
         ]
@@ -514,17 +591,16 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
             )
 
         recovered = replace(second, upgrade=corrected_ddl)
-        assert run_schema_migrations(
-            scoped_engine, (*registry, recovered)
-        ).applied == (second.migration_id,)
-        assert "should_rollback" in migration_registry.inspect(
-            scoped_engine
-        ).get_table_names()
+        assert run_schema_migrations(scoped_engine, (*registry, recovered)).applied == (
+            second.migration_id,
+        )
+        assert (
+            "should_rollback"
+            in migration_registry.inspect(scoped_engine).get_table_names()
+        )
     finally:
         if scoped_engine is not None:
             scoped_engine.dispose()
         with admin_engine.begin() as connection:
-            connection.exec_driver_sql(
-                f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'
-            )
+            connection.exec_driver_sql(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
         admin_engine.dispose()

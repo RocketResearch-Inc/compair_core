@@ -12,6 +12,7 @@ import json
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import PurePosixPath
 from typing import Any
@@ -21,10 +22,22 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ...baseline_control_plane_schema import (
+    BASELINE_RUN_WORKER_CONTRACT_VERSION,
+    BASELINE_RUN_WORKER_SERVICE_ID,
+    baseline_run_payload,
+    compatible_index_job,
+    control_job,
+    repository_approval,
+    repository_registration,
+)
 from ...baseline_evidence_schema import (
     BRIDGE_SCHEMA_VERSION,
     PROVENANCE_SCHEMA_VERSION,
     RENDERER_VERSION,
+    SOURCE_SCOPE_CONTROL_DOCUMENT,
+    SOURCE_SCOPE_LEGACY_CHUNK,
+    SOURCE_SCOPE_VERSION,
     baseline_evidence_artifact,
     baseline_retrieval_run,
     baseline_selected_evidence,
@@ -79,6 +92,28 @@ class PersistenceWriteStage(str, Enum):
     ARTIFACTS = "artifacts"
     SELECTED_EVIDENCE = "selected_evidence"
     REFERENCES = "references"
+    CONTROL_RELATIONSHIP = "control_relationship"
+    PROTECTED_PAYLOAD = "protected_payload"
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyChunkSource:
+    """Authoritative chunk/document identity for the existing Core path."""
+
+    document_id: str
+    chunk_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ControlDocumentSource:
+    """Authoritative document and leased control-job identity."""
+
+    document_id: str
+    control_job_id: str
+    lease_token: str
+
+
+BaselinePersistenceSource = LegacyChunkSource | ControlDocumentSource
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,8 +121,7 @@ class BaselineEvidencePersistenceCommand:
     """Authoritative, group-scoped intent to persist one retrieval result."""
 
     group_id: str
-    source_chunk_id: str
-    source_document_id: str
+    source: BaselinePersistenceSource
     idempotency_key: str
     retrieval_result: RetrievalResult
     caller_user_id: str | None = None
@@ -130,6 +164,7 @@ class _ValidatedIntent:
     command: BaselineEvidencePersistenceCommand
     run_values: Mapping[str, object]
     selected: tuple[_SelectedIntent, ...]
+    control_job: Mapping[str, object] | None
 
 
 StageHook = Callable[[PersistenceWriteStage], None]
@@ -157,6 +192,94 @@ def _digest_json(value: object) -> str:
     return _digest_text(
         json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     )
+
+
+def retrieval_result_fingerprint(result: RetrievalResult) -> str:
+    """Hash one result without retaining query, evidence, or path text."""
+
+    query = result.query_provenance
+    return _digest_json(
+        {
+            "schema_version": result.schema_version,
+            "request_id": result.request_id,
+            "status": result.status.value,
+            "engine": result.engine,
+            "engine_version": result.engine_version,
+            "corpus_version": result.corpus_version,
+            "corpus_id": result.corpus_id,
+            "corpus_manifest_hash": result.corpus_manifest_hash,
+            "corpus_scope_key": result.corpus_scope_key,
+            "index_id": result.index_id,
+            "index_version": result.index_version,
+            "index_schema_version": result.index_schema_version,
+            "index_fingerprint": result.index_fingerprint,
+            "config_fingerprint": result.config_fingerprint,
+            "embedding_provider": result.embedding_provider,
+            "embedding_model": result.embedding_model,
+            "embedding_revision": result.embedding_revision,
+            "embedding_dimension": result.embedding_dimension,
+            "embedding_fingerprint": result.embedding_fingerprint,
+            "query": (
+                None
+                if query is None
+                else {
+                    "sha256": query.sha256,
+                    "length": query.length,
+                    "origin": query.origin.value,
+                }
+            ),
+            "counts": {
+                "candidate": result.candidate_count,
+                "retrieved": result.retrieved_count,
+                "filtered": result.filtered_count,
+                "duplicate": result.duplicate_count,
+                "refill": result.refill_count,
+                "evidence_characters": result.evidence_characters,
+                "underfilled": result.underfilled,
+            },
+            "candidates": [
+                {
+                    "document_id": item.document_id,
+                    "content_hash": item.content_hash,
+                    "byte_size": item.byte_size,
+                    "bm25_score": item.bm25_score,
+                    "bm25_rank": item.bm25_rank,
+                    "dense_score": item.dense_score,
+                    "dense_rank": item.dense_rank,
+                    "rrf_score": item.rrf_score,
+                    "fused_rank": item.fused_rank,
+                }
+                for item in result.candidates
+            ],
+            "evidence": [
+                {
+                    "document_id": item.document_id,
+                    "content_hash": item.content_hash,
+                    "fused_rank": item.fused_rank,
+                    "render_truncated": item.render_truncated,
+                    "bm25_score": item.bm25_score,
+                    "bm25_rank": item.bm25_rank,
+                    "dense_score": item.dense_score,
+                    "dense_rank": item.dense_rank,
+                    "rrf_score": item.rrf_score,
+                }
+                for item in result.evidence
+            ],
+            "error_code": result.error.code if result.error is not None else None,
+            "fallback_engine": result.fallback_engine,
+        }
+    )
+
+
+def _as_utc(value: object) -> datetime | None:
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
 def _identifier(value: object, label: str, max_length: int) -> str:
@@ -348,8 +471,23 @@ class BaselineEvidencePersistenceService:
         command: BaselineEvidencePersistenceCommand,
     ) -> _ValidatedIntent:
         group_id = _identifier(command.group_id, "group_id", 36)
-        chunk_id = _identifier(command.source_chunk_id, "source_chunk_id", 36)
-        document_id = _identifier(command.source_document_id, "source_document_id", 36)
+        source = command.source
+        control_job: Mapping[str, object] | None = None
+        if isinstance(source, LegacyChunkSource):
+            source_scope = SOURCE_SCOPE_LEGACY_CHUNK
+            chunk_id = _identifier(source.chunk_id, "source_chunk_id", 36)
+            document_id = _identifier(source.document_id, "source_document_id", 36)
+            control_job_id = None
+        elif isinstance(source, ControlDocumentSource):
+            source_scope = SOURCE_SCOPE_CONTROL_DOCUMENT
+            chunk_id = None
+            document_id = _identifier(source.document_id, "source_document_id", 36)
+            control_job_id = _identifier(source.control_job_id, "control_job_id", 36)
+            _identifier(source.lease_token, "control_job_lease_token", 128)
+        else:
+            raise BaselineEvidencePersistenceError(
+                "invalid_command", "source must use a supported typed descriptor"
+            )
         idempotency_key = _identifier(command.idempotency_key, "idempotency_key", 256)
         caller_user_id = (
             _identifier(command.caller_user_id, "caller_user_id", 36)
@@ -362,13 +500,25 @@ class BaselineEvidencePersistenceService:
                 "malformed_result", "retrieval result has an unsupported type"
             )
 
-        self._lock_and_authorize_source(
-            session,
-            group_id=group_id,
-            chunk_id=chunk_id,
-            document_id=document_id,
-            caller_user_id=caller_user_id,
-        )
+        if source_scope == SOURCE_SCOPE_LEGACY_CHUNK:
+            assert chunk_id is not None
+            self._lock_and_authorize_legacy_source(
+                session,
+                group_id=group_id,
+                chunk_id=chunk_id,
+                document_id=document_id,
+                caller_user_id=caller_user_id,
+            )
+        else:
+            assert isinstance(source, ControlDocumentSource)
+            control_job = self._lock_and_authorize_control_source(
+                session,
+                group_id=group_id,
+                document_id=document_id,
+                control_job_id=control_job_id or "",
+                lease_token=source.lease_token,
+                caller_user_id=caller_user_id,
+            )
         corpus, generation, _ingestion, publication, build = self._lock_publication(
             session,
             group_id=group_id,
@@ -376,6 +526,15 @@ class BaselineEvidencePersistenceService:
             result=result,
         )
         self._validate_result_header(result, corpus, generation, build)
+        if control_job is not None:
+            self._validate_control_job_intent(
+                session,
+                control_job,
+                result=result,
+                corpus=corpus,
+                generation=generation,
+                build=build,
+            )
 
         documents = tuple(
             session.scalars(
@@ -432,20 +591,24 @@ class BaselineEvidencePersistenceService:
                 "invalid_command",
                 "idempotency_key must be an opaque caller intent, not the query hash",
             )
-        authorization_hash = _digest_json(
-            {
-                "group_id": group_id,
-                "source_chunk_id": chunk_id,
-                "source_document_id": document_id,
-                "version": AUTHORIZATION_SCOPE_VERSION,
-            }
-        )
+        authorization_values: dict[str, object] = {
+            "group_id": group_id,
+            "source_chunk_id": chunk_id,
+            "source_document_id": document_id,
+            "version": AUTHORIZATION_SCOPE_VERSION,
+        }
+        if control_job_id is not None:
+            authorization_values["control_job_id"] = control_job_id
+            authorization_values["source_scope"] = source_scope
+        authorization_hash = _digest_json(authorization_values)
         run_id = str(uuid4())
         run_values: dict[str, object] = {
             "run_id": run_id,
             "group_id": group_id,
             "source_chunk_id": chunk_id,
             "source_document_id": document_id,
+            "source_scope_version": SOURCE_SCOPE_VERSION,
+            "source_scope": source_scope,
             "idempotency_key": idempotency_key,
             "bridge_schema_version": BRIDGE_SCHEMA_VERSION,
             "provenance_schema_version": PROVENANCE_SCHEMA_VERSION,
@@ -579,11 +742,14 @@ class BaselineEvidencePersistenceService:
                 )
             )
         return _ValidatedIntent(
-            command=command, run_values=run_values, selected=tuple(selected)
+            command=command,
+            run_values=run_values,
+            selected=tuple(selected),
+            control_job=control_job,
         )
 
     @staticmethod
-    def _lock_and_authorize_source(
+    def _lock_and_authorize_legacy_source(
         session: Session,
         *,
         group_id: str,
@@ -639,6 +805,204 @@ class BaselineEvidencePersistenceService:
                     "caller_unauthorized",
                     "caller is absent or unauthorized for the selected group",
                 )
+
+    @staticmethod
+    def _lock_and_authorize_control_source(
+        session: Session,
+        *,
+        group_id: str,
+        document_id: str,
+        control_job_id: str,
+        lease_token: str,
+        caller_user_id: str | None,
+    ) -> Mapping[str, object]:
+        sql = (
+            "SELECT j.* FROM baseline_control_run_job j "
+            "JOIN document d ON d.document_id = j.source_document_id "
+            "JOIN document_to_group dtg ON dtg.document_id = d.document_id "
+            "AND dtg.group_id = j.group_id "
+            "JOIN user_to_group submitter_group ON "
+            "submitter_group.user_id = j.submitted_by_user_id "
+            "AND submitter_group.group_id = j.group_id "
+            "WHERE j.job_id = :job_id AND j.group_id = :group_id "
+            "AND j.source_document_id = :document_id"
+        )
+        if session.get_bind().dialect.name == "postgresql":
+            sql += " FOR UPDATE OF j, d, dtg, submitter_group"
+        row = (
+            session.execute(
+                text(sql),
+                {
+                    "job_id": control_job_id,
+                    "group_id": group_id,
+                    "document_id": document_id,
+                },
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise BaselineEvidencePersistenceError(
+                "control_source_unauthorized",
+                "control job source is absent or unauthorized for the group",
+            )
+        values = dict(row)
+        if caller_user_id is not None:
+            if values.get("submitted_by_user_id") != caller_user_id:
+                raise BaselineEvidencePersistenceError(
+                    "caller_unauthorized",
+                    "caller is not authoritative for the selected control job",
+                )
+            caller_authorized = session.execute(
+                text(
+                    "SELECT 1 FROM user_to_group WHERE user_id = :user_id "
+                    "AND group_id = :group_id"
+                ),
+                {"user_id": caller_user_id, "group_id": group_id},
+            ).scalar_one_or_none()
+            if caller_authorized is None:
+                raise BaselineEvidencePersistenceError(
+                    "caller_unauthorized",
+                    "caller is absent or unauthorized for the selected group",
+                )
+        state = str(values["state"])
+        persisted_run_id = values.get("persisted_run_id")
+        if (
+            values.get("worker_service_id") != BASELINE_RUN_WORKER_SERVICE_ID
+            or values.get("worker_contract_version")
+            != BASELINE_RUN_WORKER_CONTRACT_VERSION
+            or values.get("started_at") is None
+        ):
+            raise BaselineEvidencePersistenceError(
+                "control_job_worker_invalid",
+                "control job is not owned by the required internal worker contract",
+            )
+        if state == "running":
+            expiry = _as_utc(values.get("lease_expires_at"))
+            if (
+                persisted_run_id is not None
+                or values.get("retrieval_result_fingerprint") is not None
+                or values.get("lease_token") != lease_token
+                or expiry is None
+                or expiry <= datetime.now(timezone.utc)
+            ):
+                raise BaselineEvidencePersistenceError(
+                    "control_job_lease_invalid",
+                    "control job does not hold the required active persistence lease",
+                )
+        elif state in {"references_persisted", "feedback_persisted"}:
+            if persisted_run_id is None:
+                raise BaselineEvidencePersistenceError(
+                    "control_job_state_invalid",
+                    "control job durable state has no retrieval-run relationship",
+                )
+        else:
+            raise BaselineEvidencePersistenceError(
+                "control_job_state_invalid",
+                "control job state does not permit evidence persistence",
+            )
+        return values
+
+    @staticmethod
+    def _validate_control_job_intent(
+        session: Session,
+        job: Mapping[str, object],
+        *,
+        result: RetrievalResult,
+        corpus: RetrievalCorpus,
+        generation: RetrievalCorpusGeneration,
+        build: RetrievalBaselineIndexBuild,
+    ) -> None:
+        query = result.query_provenance
+        assert query is not None
+        exact = (
+            (job.get("corpus_id"), corpus.corpus_id),
+            (job.get("corpus_generation_id"), generation.generation_id),
+            (job.get("index_publication_id"), build.index_id),
+            (job.get("index_format_version"), build.index_schema_version),
+            (job.get("tokenizer_version"), build.tokenizer_version),
+            (job.get("retrieval_config_fingerprint"), result.config_fingerprint),
+            (job.get("embedding_fingerprint"), result.embedding_fingerprint),
+            (job.get("index_fingerprint"), result.index_fingerprint),
+            (job.get("query_sha256"), query.sha256),
+            (job.get("query_length"), query.length),
+            (job.get("query_origin"), query.origin.value),
+        )
+        if any(actual != expected for actual, expected in exact):
+            raise BaselineEvidencePersistenceError(
+                "control_job_intent_mismatch",
+                "control job does not match the successful retrieval intent",
+            )
+        extension_statement = (
+            select(compatible_index_job.c.job_id)
+            .join(
+                control_job,
+                control_job.c.job_id == compatible_index_job.c.job_id,
+            )
+            .where(
+                compatible_index_job.c.job_id == job.get("index_job_id"),
+                compatible_index_job.c.group_id == job.get("group_id"),
+                compatible_index_job.c.corpus_id == corpus.corpus_id,
+                compatible_index_job.c.generation_id == generation.generation_id,
+                compatible_index_job.c.result_index_id == build.index_id,
+                compatible_index_job.c.corpus_manifest_hash
+                == job.get("corpus_manifest_hash"),
+                compatible_index_job.c.corpus_file_manifest_hash
+                == generation.manifest_hash,
+                compatible_index_job.c.index_format_version
+                == build.index_schema_version,
+                compatible_index_job.c.tokenizer_version == build.tokenizer_version,
+                compatible_index_job.c.retrieval_config_fingerprint
+                == result.config_fingerprint,
+                compatible_index_job.c.embedding_fingerprint
+                == result.embedding_fingerprint,
+                control_job.c.group_id == job.get("group_id"),
+                control_job.c.operation == "index_build",
+                control_job.c.state == "succeeded",
+            )
+        )
+        approval_statement = (
+            select(repository_registration.c.registration_id)
+            .join(
+                repository_approval,
+                (
+                    repository_approval.c.registration_id
+                    == repository_registration.c.registration_id
+                )
+                & (
+                    repository_approval.c.group_id == repository_registration.c.group_id
+                ),
+            )
+            .where(
+                repository_registration.c.registration_id
+                == job.get("changed_repository_registration_id"),
+                repository_registration.c.group_id == job.get("group_id"),
+                repository_registration.c.source_document_id
+                == job.get("source_document_id"),
+                repository_registration.c.enabled.is_(True),
+                repository_approval.c.state == "active",
+                corpus.changed_repository_id
+                == job.get("changed_repository_registration_id"),
+            )
+        )
+        if session.get_bind().dialect.name == "postgresql":
+            extension_statement = extension_statement.with_for_update()
+            approval_statement = approval_statement.with_for_update()
+        if (
+            session.execute(extension_statement).first() is None
+            or session.execute(approval_statement).first() is None
+        ):
+            raise BaselineEvidencePersistenceError(
+                "control_job_intent_mismatch",
+                "control job publication or repository authorization is no longer current",
+            )
+        expected_result_fingerprint = retrieval_result_fingerprint(result)
+        stored_result_fingerprint = job.get("retrieval_result_fingerprint")
+        if stored_result_fingerprint not in {None, expected_result_fingerprint}:
+            raise BaselineEvidencePersistenceError(
+                "control_job_result_mismatch",
+                "control job is bound to a different retrieval result",
+            )
 
     @staticmethod
     def _lock_publication(
@@ -1048,7 +1412,7 @@ class BaselineEvidencePersistenceService:
                 ),
                 {
                     "reference_id": reference_id,
-                    "source_chunk_id": intent.command.source_chunk_id,
+                    "source_chunk_id": intent.run_values["source_chunk_id"],
                     "reference_type": REFERENCE_TYPE,
                     "selected_id": selected_id,
                 },
@@ -1056,6 +1420,53 @@ class BaselineEvidencePersistenceService:
             reference_ids.append(reference_id)
         session.flush()
         self._after_stage(PersistenceWriteStage.REFERENCES)
+        if intent.control_job is not None:
+            updated = session.execute(
+                text(
+                    "UPDATE baseline_control_run_job SET "
+                    "persisted_run_id = :run_id, state = 'references_persisted', "
+                    "evidence_count = :count, reference_count = :count, "
+                    "retrieval_result_fingerprint = :result_fingerprint, "
+                    "lease_token = NULL, lease_expires_at = NULL, "
+                    "reason_code = NULL, failure_stage = NULL, "
+                    "updated_at = CURRENT_TIMESTAMP "
+                    "WHERE job_id = :job_id AND group_id = :group_id "
+                    "AND state = 'running' AND persisted_run_id IS NULL "
+                    "AND retrieval_result_fingerprint IS NULL "
+                    "AND lease_token = :lease_token "
+                    "AND lease_expires_at > CURRENT_TIMESTAMP"
+                ),
+                {
+                    "run_id": run_id,
+                    "count": len(selected_ids),
+                    "result_fingerprint": retrieval_result_fingerprint(
+                        intent.command.retrieval_result
+                    ),
+                    "job_id": intent.control_job["job_id"],
+                    "group_id": intent.command.group_id,
+                    "lease_token": intent.control_job["lease_token"],
+                },
+            )
+            if updated.rowcount != 1:
+                raise BaselineEvidencePersistenceError(
+                    "control_job_attachment_conflict",
+                    "control job changed before retrieval evidence attachment",
+                )
+            session.flush()
+            self._after_stage(PersistenceWriteStage.CONTROL_RELATIONSHIP)
+            erased = session.execute(
+                baseline_run_payload.delete().where(
+                    baseline_run_payload.c.job_id == intent.control_job["job_id"],
+                    baseline_run_payload.c.group_id == intent.command.group_id,
+                )
+            )
+            if erased.rowcount != 1:
+                raise BaselineEvidencePersistenceError(
+                    "control_job_payload_absent",
+                    "control job protected payload is unavailable for atomic erasure",
+                )
+            session.flush()
+            self._after_stage(PersistenceWriteStage.PROTECTED_PAYLOAD)
         return BaselineEvidencePersistenceReceipt(
             run_id=run_id,
             group_id=intent.command.group_id,
@@ -1077,6 +1488,15 @@ class BaselineEvidencePersistenceService:
                 "idempotency key is already bound to a different intent",
             )
         run_id = str(run["run_id"])
+        if intent.control_job is not None and (
+            intent.control_job.get("persisted_run_id") != run_id
+            or intent.control_job.get("state")
+            not in {"references_persisted", "feedback_persisted"}
+        ):
+            raise BaselineEvidencePersistenceError(
+                "control_job_attachment_conflict",
+                "control job is attached to a different retrieval run",
+            )
         rows = (
             session.execute(
                 select(
@@ -1131,7 +1551,7 @@ class BaselineEvidencePersistenceService:
             or [row["baseline_selected_evidence_id"] for row in references]
             != selected_ids
             or any(
-                row["source_chunk_id"] != intent.command.source_chunk_id
+                row["source_chunk_id"] != intent.run_values["source_chunk_id"]
                 or row["reference_chunk_id"] is not None
                 or row["reference_document_id"] is not None
                 or row["reference_note_id"] is not None
@@ -1164,6 +1584,9 @@ __all__ = [
     "BaselineEvidencePersistenceError",
     "BaselineEvidencePersistenceReceipt",
     "BaselineEvidencePersistenceService",
+    "ControlDocumentSource",
+    "LegacyChunkSource",
     "PersistenceWriteStage",
     "render_baseline_evidence",
+    "retrieval_result_fingerprint",
 ]

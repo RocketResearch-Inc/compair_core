@@ -21,6 +21,12 @@ from uuid import uuid4
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ...baseline_evidence_schema import (
+    SOURCE_SCOPE_CONTROL_DOCUMENT,
+    SOURCE_SCOPE_LEGACY_CHUNK,
+    SOURCE_SCOPE_VERSION,
+)
+
 BASELINE_NOTIFICATION_OUTBOX_TABLE = "baseline_notification_outbox"
 BASELINE_NOTIFICATION_PAYLOAD_SCHEMA_VERSION = "baseline-notification-digest.v1"
 BASELINE_NOTIFICATION_CHANNEL = "in_app"
@@ -199,6 +205,7 @@ def schedule_baseline_notification(
     feedback_ids: Sequence[str],
     enabled: bool,
     now: datetime,
+    control_generation_lease_token: str | None = None,
 ) -> str:
     """Insert one group-scoped digest inside the caller's Feedback transaction."""
 
@@ -208,20 +215,30 @@ def schedule_baseline_notification(
     authorized = session.execute(
         text(
             "SELECT 1 FROM baseline_retrieval_run r "
-            "JOIN chunk c ON c.chunk_id = r.source_chunk_id "
-            "AND c.document_id = r.source_document_id "
             "JOIN document_to_group dtg ON dtg.document_id = r.source_document_id "
             "AND dtg.group_id = r.group_id "
             "JOIN user_to_group utg ON utg.group_id = r.group_id "
             "AND utg.user_id = :recipient_user_id "
             'JOIN "user" u ON u.user_id = utg.user_id '
             "WHERE r.run_id = :run_id AND r.group_id = :group_id "
-            "AND r.generation_state = 'succeeded'"
+            "AND r.generation_state = 'succeeded' AND ("
+            "(r.source_scope = 'legacy_chunk' AND EXISTS (SELECT 1 FROM chunk c "
+            "WHERE c.chunk_id = r.source_chunk_id "
+            "AND c.document_id = r.source_document_id)) OR "
+            "(r.source_scope = 'control_document' AND r.source_chunk_id IS NULL "
+            "AND EXISTS (SELECT 1 FROM baseline_control_run_job j WHERE "
+            "j.persisted_run_id = r.run_id AND j.group_id = r.group_id "
+            "AND j.source_document_id = r.source_document_id AND ("
+            "j.state IN ('references_persisted', 'feedback_persisted') OR "
+            "(j.state = 'running' AND j.failure_stage = 'generation' "
+            "AND :control_generation_lease_token IS NOT NULL "
+            "AND j.lease_token = :control_generation_lease_token)))))"
         ),
         {
             "run_id": run_id,
             "group_id": group_id,
             "recipient_user_id": recipient_user_id,
+            "control_generation_lease_token": control_generation_lease_token,
         },
     ).scalar_one_or_none()
     if authorized is None:
@@ -400,7 +417,8 @@ class BaselineNotificationOutboxDispatcher:
                 _begin_write(session)
                 now = self._clock()
                 sql = (
-                    "SELECT o.*, r.source_chunk_id, r.source_document_id, "
+                    "SELECT o.*, r.source_scope_version, r.source_scope, "
+                    "r.source_chunk_id, r.source_document_id, "
                     "r.generation_state FROM baseline_notification_outbox o "
                     "JOIN baseline_retrieval_run r ON r.run_id = o.run_id "
                     "AND r.group_id = o.group_id "
@@ -586,7 +604,8 @@ class BaselineNotificationOutboxDispatcher:
         lock: bool,
     ) -> dict[str, object]:
         sql = (
-            "SELECT o.*, r.source_chunk_id, r.source_document_id, "
+            "SELECT o.*, r.source_scope_version, r.source_scope, "
+            "r.source_chunk_id, r.source_document_id, "
             "r.generation_state FROM baseline_notification_outbox o "
             "JOIN baseline_retrieval_run r ON r.run_id = o.run_id "
             "AND r.group_id = o.group_id "
@@ -618,6 +637,8 @@ class BaselineNotificationOutboxDispatcher:
                 "baseline_notification_run_not_succeeded",
             )
         recipient_user_id = row.get("recipient_user_id")
+        source_scope_version = row.get("source_scope_version")
+        source_scope = row.get("source_scope")
         source_chunk_id = row.get("source_chunk_id")
         source_document_id = row.get("source_document_id")
         if not recipient_user_id:
@@ -625,25 +646,40 @@ class BaselineNotificationOutboxDispatcher:
                 BaselineNotificationState.CANCELLED,
                 "baseline_notification_recipient_deleted",
             )
-        if not source_chunk_id or not source_document_id:
+        if not source_document_id:
             return (
                 BaselineNotificationState.CANCELLED,
                 "baseline_notification_source_deleted",
+            )
+        if source_scope_version != SOURCE_SCOPE_VERSION or source_scope not in {
+            SOURCE_SCOPE_LEGACY_CHUNK,
+            SOURCE_SCOPE_CONTROL_DOCUMENT,
+        }:
+            return (
+                BaselineNotificationState.TERMINAL_FAILED,
+                "baseline_notification_source_scope_invalid",
+            )
+        if source_scope == SOURCE_SCOPE_LEGACY_CHUNK and not source_chunk_id:
+            return (
+                BaselineNotificationState.CANCELLED,
+                "baseline_notification_source_deleted",
+            )
+        if source_scope == SOURCE_SCOPE_CONTROL_DOCUMENT and source_chunk_id:
+            return (
+                BaselineNotificationState.TERMINAL_FAILED,
+                "baseline_notification_source_scope_invalid",
             )
         entity_count = session.execute(
             text(
                 "SELECT "
                 '(SELECT count(*) FROM "group" WHERE group_id = :group_id), '
                 '(SELECT count(*) FROM "user" WHERE user_id = :recipient_user_id), '
-                "(SELECT count(*) FROM document WHERE document_id = :source_document_id), "
-                "(SELECT count(*) FROM chunk WHERE chunk_id = :source_chunk_id "
-                "AND document_id = :source_document_id)"
+                "(SELECT count(*) FROM document WHERE document_id = :source_document_id)"
             ),
             {
                 "group_id": row["group_id"],
                 "recipient_user_id": recipient_user_id,
                 "source_document_id": source_document_id,
-                "source_chunk_id": source_chunk_id,
             },
         ).one()
         if any(int(value) != 1 for value in entity_count):
@@ -651,6 +687,41 @@ class BaselineNotificationOutboxDispatcher:
                 BaselineNotificationState.CANCELLED,
                 "baseline_notification_scope_deleted",
             )
+        if source_scope == SOURCE_SCOPE_LEGACY_CHUNK:
+            chunk_exists = session.execute(
+                text(
+                    "SELECT 1 FROM chunk WHERE chunk_id = :source_chunk_id "
+                    "AND document_id = :source_document_id"
+                ),
+                {
+                    "source_chunk_id": source_chunk_id,
+                    "source_document_id": source_document_id,
+                },
+            ).scalar_one_or_none()
+            if chunk_exists is None:
+                return (
+                    BaselineNotificationState.CANCELLED,
+                    "baseline_notification_scope_deleted",
+                )
+        else:
+            control_link = session.execute(
+                text(
+                    "SELECT 1 FROM baseline_control_run_job WHERE "
+                    "persisted_run_id = :run_id AND group_id = :group_id "
+                    "AND source_document_id = :source_document_id "
+                    "AND state IN ('references_persisted', 'feedback_persisted')"
+                ),
+                {
+                    "run_id": row["run_id"],
+                    "group_id": row["group_id"],
+                    "source_document_id": source_document_id,
+                },
+            ).scalar_one_or_none()
+            if control_link is None:
+                return (
+                    BaselineNotificationState.CANCELLED,
+                    "baseline_notification_scope_deleted",
+                )
         authorized = session.execute(
             text(
                 "SELECT 1 FROM user_to_group utg "
@@ -821,7 +892,8 @@ def load_authorized_baseline_notification_digest(
     row = (
         session.execute(
             text(
-                "SELECT o.*, r.source_chunk_id, r.source_document_id, "
+                "SELECT o.*, r.source_scope_version, r.source_scope, "
+                "r.source_chunk_id, r.source_document_id, "
                 "r.generation_state FROM baseline_notification_outbox o "
                 "JOIN baseline_retrieval_run r ON r.run_id = o.run_id "
                 "AND r.group_id = o.group_id "

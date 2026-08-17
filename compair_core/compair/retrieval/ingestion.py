@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .corpus import (
@@ -23,6 +25,7 @@ from .corpus import (
     CorpusGenerationStatus,
     CorpusIngestionStatus,
     CorpusLifecycle,
+    RetrievalCorpus,
     RetrievalCorpusGeneration,
     RetrievalCorpusIngestion,
     validate_corpus_file_input,
@@ -85,8 +88,7 @@ class CorpusSnapshotInput:
         """Build a canonical trusted-snapshot declaration and its hash."""
 
         repositories = {
-            repository.repository_id: repository
-            for repository in sibling_repositories
+            repository.repository_id: repository for repository in sibling_repositories
         }
         inherited_files = tuple(
             replace(
@@ -136,7 +138,9 @@ class CorpusSnapshotInput:
             source_revision=source_revision,
             source_manifest_hash=source_manifest_hash,
         )
-        return replace(snapshot, declared_manifest_hash=snapshot_manifest_hash(snapshot))
+        return replace(
+            snapshot, declared_manifest_hash=snapshot_manifest_hash(snapshot)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,7 +181,9 @@ def _sha256(value: str | None, label: str, *, optional: bool = False) -> str | N
     if value is None and optional:
         return None
     normalized = (value or "").lower()
-    if len(normalized) != 64 or any(char not in "0123456789abcdef" for char in normalized):
+    if len(normalized) != 64 or any(
+        char not in "0123456789abcdef" for char in normalized
+    ):
         raise ValueError(f"{label} must be a SHA-256 hex digest")
     return normalized
 
@@ -261,7 +267,11 @@ def _validate_repository(
     )
     assert repository_id is not None
     assert repository_name is not None
-    if repository_name in {".", ".."} or "/" in repository_name or "\\" in repository_name:
+    if (
+        repository_name in {".", ".."}
+        or "/" in repository_name
+        or "\\" in repository_name
+    ):
         raise ValueError("repository_name must be a single safe path component")
     if repository.expected_file_count < 0:
         raise ValueError("expected repository file count must be non-negative")
@@ -446,7 +456,13 @@ class CorpusIngestionService:
             activate_generation or CorpusLifecycle.activate_generation
         )
 
-    def ingest(self, supplied: CorpusSnapshotInput) -> CorpusIngestionResult:
+    def ingest(
+        self,
+        supplied: CorpusSnapshotInput,
+        *,
+        _publication_callback: Callable[[Session, CorpusIngestionResult], None]
+        | None = None,
+    ) -> CorpusIngestionResult:
         validated = validate_snapshot_input(supplied)
         snapshot = validated.snapshot
 
@@ -508,9 +524,7 @@ class CorpusIngestionService:
                         ),
                     )
                 )
-                persisted_matches = len(persisted_files) == len(
-                    expected_files
-                ) and all(
+                persisted_matches = len(persisted_files) == len(expected_files) and all(
                     (
                         row.repository_id,
                         row.repository_name,
@@ -563,13 +577,206 @@ class CorpusIngestionService:
         if failure_message is not None:
             raise ValueError(failure_message)
 
-        with self._session_factory.begin() as session:
-            self._activate_generation(session, generation_id)
-
-        return CorpusIngestionResult(
+        result = CorpusIngestionResult(
             corpus_id=corpus_id,
             generation_id=generation_id,
             generation_version=snapshot.generation_version,
             manifest_hash=validated.canonical_manifest_hash,
             status=CorpusGenerationFreshness.ACTIVE,
         )
+        with self._session_factory.begin() as session:
+            self._activate_generation(session, generation_id)
+            if _publication_callback is not None:
+                _publication_callback(session, result)
+        return result
+
+    def ingest_resumable(
+        self,
+        supplied: CorpusSnapshotInput,
+        *,
+        publication_callback: Callable[[Session, CorpusIngestionResult], None],
+    ) -> CorpusIngestionResult:
+        """Ingest a stable snapshot and atomically record its publication.
+
+        This entry point is reserved for durable internal jobs. A deterministic
+        ``generation_version`` allows a retry to resume a generation staged by
+        the same immutable snapshot. The callback shares the activation
+        transaction, so corpus publication and job success either commit
+        together or both roll back.
+        """
+
+        validated = validate_snapshot_input(supplied)
+        existing = self._find_existing_generation(validated)
+        if existing is None:
+            try:
+                return self.ingest(
+                    supplied,
+                    _publication_callback=publication_callback,
+                )
+            except IntegrityError:
+                existing = self._find_existing_generation(validated)
+                if existing is None:
+                    raise
+        return self._resume_generation(
+            validated,
+            generation_id=existing,
+            publication_callback=publication_callback,
+        )
+
+    def _find_existing_generation(
+        self,
+        validated: ValidatedCorpusSnapshot,
+    ) -> str | None:
+        snapshot = validated.snapshot
+        with self._session_factory() as session:
+            corpus = session.scalar(
+                select(RetrievalCorpus).where(
+                    RetrievalCorpus.scope_key == snapshot.scope_key
+                )
+            )
+            if corpus is None:
+                return None
+            generation = session.scalar(
+                select(RetrievalCorpusGeneration).where(
+                    RetrievalCorpusGeneration.corpus_id == corpus.corpus_id,
+                    RetrievalCorpusGeneration.generation_version
+                    == snapshot.generation_version,
+                )
+            )
+            return generation.generation_id if generation is not None else None
+
+    @staticmethod
+    def _replay_matches(
+        session: Session,
+        *,
+        validated: ValidatedCorpusSnapshot,
+        generation: RetrievalCorpusGeneration,
+    ) -> bool:
+        snapshot = validated.snapshot
+        corpus = session.get(RetrievalCorpus, generation.corpus_id)
+        ingestion = session.get(RetrievalCorpusIngestion, generation.generation_id)
+        if (
+            corpus is None
+            or ingestion is None
+            or corpus.scope_key != snapshot.scope_key
+            or corpus.changed_repository_id != snapshot.changed_repository.repository_id
+            or corpus.source_document_id != snapshot.changed_repository.document_id
+            or generation.generation_version != snapshot.generation_version
+            or generation.expected_repository_count
+            != len(snapshot.sibling_repositories)
+            or generation.expected_file_count != len(snapshot.files)
+            or generation.source_revision
+            != (
+                snapshot.source_revision
+                or snapshot.changed_repository.repository_revision
+            )
+            or ingestion.snapshot_schema_version != snapshot.schema_version
+            or ingestion.ingestion_source != snapshot.ingestion_source.value
+            or ingestion.producer_id != snapshot.producer_id
+            or ingestion.canonical_manifest_hash != validated.canonical_manifest_hash
+            or ingestion.canonical_manifest_json != validated.canonical_manifest_json
+            or ingestion.repository_count != len(snapshot.sibling_repositories)
+            or ingestion.file_count != len(snapshot.files)
+            or ingestion.snapshot_id != snapshot.snapshot_id
+            or ingestion.producer_version != snapshot.producer_version
+            or ingestion.source_manifest_hash != snapshot.source_manifest_hash
+        ):
+            return False
+        rows = CorpusLifecycle.ordered_files(session, generation.generation_id)
+        expected = tuple(
+            sorted(
+                snapshot.files,
+                key=lambda item: (
+                    item.repository_name,
+                    item.relative_path,
+                    item.repository_id,
+                ),
+            )
+        )
+        return len(rows) == len(expected) and all(
+            (
+                row.repository_id,
+                row.repository_name,
+                row.relative_path,
+                row.file_state,
+                row.content_hash,
+                row.byte_size,
+                row.document_id,
+                row.content,
+                row.source_snapshot_id,
+            )
+            == (
+                item.repository_id,
+                item.repository_name,
+                item.relative_path,
+                item.file_state.value,
+                item.content_hash,
+                item.byte_size,
+                item.document_id,
+                item.content,
+                item.source_snapshot_id,
+            )
+            for row, item in zip(rows, expected)
+        )
+
+    def _resume_generation(
+        self,
+        validated: ValidatedCorpusSnapshot,
+        *,
+        generation_id: str,
+        publication_callback: Callable[[Session, CorpusIngestionResult], None],
+    ) -> CorpusIngestionResult:
+        with self._session_factory.begin() as session:
+            statement = select(RetrievalCorpusGeneration).where(
+                RetrievalCorpusGeneration.generation_id == generation_id
+            )
+            if session.get_bind().dialect.name == "postgresql":
+                statement = statement.with_for_update()
+            generation = session.scalar(statement)
+            if generation is None or not self._replay_matches(
+                session,
+                validated=validated,
+                generation=generation,
+            ):
+                raise ValueError("persisted corpus generation conflicts with snapshot")
+            if generation.status == CorpusGenerationStatus.STAGING.value:
+                validation = CorpusLifecycle.validate_generation(session, generation_id)
+                if not validation.complete:
+                    raise ValueError("persisted corpus generation is incomplete")
+            elif generation.status not in {
+                CorpusGenerationStatus.VALIDATED.value,
+                CorpusGenerationStatus.ACTIVE.value,
+            }:
+                raise ValueError("persisted corpus generation is not resumable")
+
+        snapshot = validated.snapshot
+        result = CorpusIngestionResult(
+            corpus_id="",
+            generation_id=generation_id,
+            generation_version=snapshot.generation_version,
+            manifest_hash=validated.canonical_manifest_hash,
+            status=CorpusGenerationFreshness.ACTIVE,
+        )
+        with self._session_factory.begin() as session:
+            statement = select(RetrievalCorpusGeneration).where(
+                RetrievalCorpusGeneration.generation_id == generation_id
+            )
+            if session.get_bind().dialect.name == "postgresql":
+                statement = statement.with_for_update()
+            generation = session.scalar(statement)
+            if generation is None or not self._replay_matches(
+                session,
+                validated=validated,
+                generation=generation,
+            ):
+                raise ValueError("persisted corpus generation conflicts with snapshot")
+            corpus = session.get(RetrievalCorpus, generation.corpus_id)
+            if corpus is None:
+                raise ValueError("persisted corpus generation has no corpus")
+            result = replace(result, corpus_id=corpus.corpus_id)
+            if generation.status == CorpusGenerationStatus.VALIDATED.value:
+                self._activate_generation(session, generation_id)
+            elif generation.status != CorpusGenerationStatus.ACTIVE.value:
+                raise ValueError("persisted corpus generation is not publishable")
+            publication_callback(session, result)
+        return result

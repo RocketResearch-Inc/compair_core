@@ -27,6 +27,27 @@ source text, ordered renderer bytes, evidence identities/hashes, group/source
 identity, and persisted query/corpus/index fingerprints. Raw inputs are not
 written to generation state or logs.
 
+Source authorization is scope-aware. `legacy_chunk` inputs require the retained
+authoritative chunk. `control_document` inputs require a null chunk and use the
+authoritative document, group membership, and unique control-job relationship;
+the adapter never substitutes an arbitrary document chunk.
+
+## Structured output contract
+
+Baseline providers receive the frozen `baseline-generation-output.v2` version
+and schema SHA-256 plus `maximum_findings=min(4, reference_count)`. Their
+transport envelope must return model content as a string containing exactly one
+JSON object. Core rejects plaintext, blank/`NONE`, malformed JSON, duplicate
+keys, non-finite values, unknown properties, blank findings, outcome/count
+contradictions, and excessive findings. There is no compatibility fallback to
+the former plaintext separator convention.
+
+`no_findings` with an empty array is a successful resolved generation outcome:
+the retrieval run succeeds, the control job reaches `feedback_persisted`, and
+zero Feedback/outbox rows are created. A positive `findings` array is persisted
+verbatim in array order as ordinal 1–4 and retains the existing internal outbox
+scheduling behavior. Neither outcome invokes legacy `get_feedback`.
+
 ## State machine
 
 The durable states on `baseline_retrieval_run` are:
@@ -56,6 +77,16 @@ Feedback insertion and the transition to `succeeded` are one transaction.
 uniqueness boundary, so retries cannot duplicate findings. Each baseline
 Feedback row stores provider/model/version plus input/output fingerprints.
 No Notification row or event is created in this phase.
+
+For document-level control jobs, migration
+`0012_baseline_control_generation_v1` coordinates this authoritative
+retrieval-run lifecycle with the existing control-job lease. The lock order is
+always control job, then linked retrieval run. The same opaque token and expiry
+guard both rows. Provider invocation remains outside the final transaction;
+Feedback insertion, retrieval-run success, optional positive-finding outbox,
+and control-job `feedback_persisted` completion commit atomically. The
+encrypted query payload is required to be absent and is checked only by row
+existence; generation never decrypts or reconstructs it.
 
 ## External-call duplication boundary
 

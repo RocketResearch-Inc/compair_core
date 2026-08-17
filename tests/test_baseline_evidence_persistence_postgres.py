@@ -15,15 +15,23 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import text
 from test_baseline_evidence_persistence import (
+    control_command,
     make_persistence_environment,
     persistence_counts,
+    seed_running_control_job,
 )
+from test_baseline_generation import CapturingProvider
 
 from compair_core import db as core_db
 from compair_core.compair.retrieval.evidence_persistence import (
     BaselineEvidencePersistenceError,
     BaselineEvidencePersistenceService,
     PersistenceWriteStage,
+)
+from compair_core.compair.retrieval.generation import (
+    BaselineGenerationCommand,
+    BaselineGenerationService,
+    BaselineGenerationState,
 )
 
 POSTGRES_URL = os.getenv("COMPAIR_TEST_POSTGRES_URL")
@@ -80,7 +88,16 @@ def test_postgres_transaction_idempotency_concurrency_and_retention() -> None:
         assert sum(not receipt.replayed for receipt in receipts) == 1
         assert persistence_counts(scoped_engine) == (2, 4, 8, 8, 0)
 
-        for ordinal, stage in enumerate(PersistenceWriteStage, start=1):
+        legacy_stages = tuple(
+            stage
+            for stage in PersistenceWriteStage
+            if stage
+            not in {
+                PersistenceWriteStage.CONTROL_RELATIONSHIP,
+                PersistenceWriteStage.PROTECTED_PAYLOAD,
+            }
+        )
+        for ordinal, stage in enumerate(legacy_stages, start=1):
             before = persistence_counts(scoped_engine)
 
             def fail_at(actual: PersistenceWriteStage, target=stage) -> None:
@@ -104,12 +121,78 @@ def test_postgres_transaction_idempotency_concurrency_and_retention() -> None:
             service.persist(invalid)
         assert persistence_counts(scoped_engine) == before
 
+        job_id, lease_token, caller = seed_running_control_job(environment)
+        document_command = control_command(
+            environment,
+            job_id=job_id,
+            lease_token=lease_token,
+            caller_user_id=caller,
+            key="postgres-document-scope-intent",
+        )
+        before_document = persistence_counts(scoped_engine)
+
+        def fail_control_link(stage: PersistenceWriteStage) -> None:
+            if stage is PersistenceWriteStage.CONTROL_RELATIONSHIP:
+                raise RuntimeError("postgres-injected-control-relationship")
+
+        with pytest.raises(RuntimeError, match="postgres-injected-control"):
+            BaselineEvidencePersistenceService(
+                environment.sessions, stage_hook=fail_control_link
+            ).persist(document_command)
+        assert persistence_counts(scoped_engine) == before_document
+        control_receipt = service.persist(document_command)
+        control_replay = service.persist(document_command)
+        assert control_replay.replayed is True
+        assert control_replay.run_id == control_receipt.run_id
+        generated = BaselineGenerationService(
+            environment.sessions, notifications_enabled=False
+        ).generate(
+            BaselineGenerationCommand(
+                run_id=control_receipt.run_id,
+                group_id=environment.group_id,
+                caller_user_id=caller,
+            ),
+            CapturingProvider("postgres document finding"),
+        )
+        assert generated.state is BaselineGenerationState.SUCCEEDED
+        with scoped_engine.connect() as connection:
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT source_chunk_id FROM baseline_retrieval_run "
+                        "WHERE run_id = :run_id"
+                    ),
+                    {"run_id": control_receipt.run_id},
+                ).scalar_one()
+                is None
+            )
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT source_chunk_id FROM feedback WHERE "
+                        "baseline_retrieval_run_id = :run_id"
+                    ),
+                    {"run_id": control_receipt.run_id},
+                ).scalar_one()
+                is None
+            )
+            assert (
+                connection.execute(
+                    text(
+                        "SELECT count(*) FROM baseline_notification_outbox "
+                        "WHERE run_id = :run_id"
+                    ),
+                    {"run_id": control_receipt.run_id},
+                ).scalar_one()
+                == 1
+            )
+
         with scoped_engine.begin() as connection:
             connection.execute(
                 text("DELETE FROM document WHERE document_id = :document_id"),
                 {"document_id": environment.source_document_id},
             )
-        assert persistence_counts(scoped_engine) == (2, 4, 8, 8, 0)
+        assert persistence_counts(scoped_engine) == (3, 4, 12, 12, 1)
         with scoped_engine.connect() as connection:
             assert (
                 connection.execute(
@@ -118,7 +201,7 @@ def test_postgres_transaction_idempotency_concurrency_and_retention() -> None:
                         "WHERE source_chunk_id IS NULL AND source_document_id IS NULL"
                     )
                 ).scalar_one()
-                == 2
+                == 3
             )
             assert (
                 connection.execute(
@@ -128,7 +211,7 @@ def test_postgres_transaction_idempotency_concurrency_and_retention() -> None:
                         "AND source_chunk_id IS NULL"
                     )
                 ).scalar_one()
-                == 8
+                == 12
             )
             legacy_count = connection.execute(
                 text(
@@ -146,7 +229,7 @@ def test_postgres_transaction_idempotency_concurrency_and_retention() -> None:
                 session.execute(
                     text("SELECT count(*) FROM baseline_selected_evidence")
                 ).scalar_one()
-                == 8
+                == 12
             )
     finally:
         if scoped_engine is not None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -8,14 +9,22 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import text
+from test_baseline_evidence_persistence import (
+    control_command,
+    make_persistence_environment,
+    seed_running_control_job,
+)
 
 from compair_core import db as core_db
+from compair_core.compair.retrieval import generation as generation_module
 from compair_core.compair.retrieval.evidence_persistence import (
     BaselineEvidencePersistenceCommand,
     BaselineEvidencePersistenceService,
+    LegacyChunkSource,
 )
 from compair_core.compair.retrieval.generation import (
-    GENERATION_FINDING_SEPARATOR,
+    GENERATION_OUTPUT_SCHEMA_SHA256,
+    GENERATION_OUTPUT_SCHEMA_VERSION,
     BaselineGenerationBusyError,
     BaselineGenerationCommand,
     BaselineGenerationError,
@@ -25,8 +34,6 @@ from compair_core.compair.retrieval.generation import (
     GenerationWriteStage,
     ReviewerBaselineGenerationProvider,
 )
-from compair_core.compair.retrieval import generation as generation_module
-from test_baseline_evidence_persistence import make_persistence_environment
 
 
 class CapturingProvider:
@@ -35,8 +42,17 @@ class CapturingProvider:
     version = "fixture-reviewer-r1"
     supports_idempotency = False
 
-    def __init__(self, output: str = "first finding") -> None:
-        self.output = output
+    def __init__(self, *findings: str) -> None:
+        values = findings or ("first finding",)
+        self.output = json.dumps(
+            {
+                "schema_version": GENERATION_OUTPUT_SCHEMA_VERSION,
+                "outcome": "findings",
+                "findings": [{"feedback": finding} for finding in values],
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         self.inputs = []
         self.idempotency_keys = []
 
@@ -44,6 +60,12 @@ class CapturingProvider:
         self.inputs.append(generation_input)
         self.idempotency_keys.append(idempotency_key)
         return self.output
+
+
+class RawOutputProvider(CapturingProvider):
+    def __init__(self, output: str) -> None:
+        super().__init__()
+        self.output = output
 
 
 class FailingProvider(CapturingProvider):
@@ -87,8 +109,10 @@ def _persist(environment, key: str = "generation-intent"):
     receipt = BaselineEvidencePersistenceService(environment.sessions).persist(
         BaselineEvidencePersistenceCommand(
             group_id=environment.group_id,
-            source_chunk_id=environment.source_chunk_id,
-            source_document_id=environment.source_document_id,
+            source=LegacyChunkSource(
+                document_id=environment.source_document_id,
+                chunk_id=environment.source_chunk_id,
+            ),
             idempotency_key=key,
             retrieval_result=environment.result,
             caller_user_id=caller,
@@ -103,25 +127,88 @@ def _persist(environment, key: str = "generation-intent"):
 
 def _feedback_rows(environment, run_id: str):
     with environment.engine.connect() as connection:
-        return connection.execute(
-            text(
-                "SELECT feedback_id, feedback, baseline_finding_ordinal, "
-                "generation_provider, generation_model, generation_model_version, "
-                "generation_input_fingerprint, generation_output_fingerprint "
-                "FROM feedback WHERE baseline_retrieval_run_id = :run_id "
-                "ORDER BY baseline_finding_ordinal"
+        return (
+            connection.execute(
+                text(
+                    "SELECT feedback_id, feedback, baseline_finding_ordinal, "
+                    "generation_provider, generation_model, generation_model_version, "
+                    "generation_input_fingerprint, generation_output_fingerprint "
+                    "FROM feedback WHERE baseline_retrieval_run_id = :run_id "
+                    "ORDER BY baseline_finding_ordinal"
+                ),
+                {"run_id": run_id},
+            )
+            .mappings()
+            .all()
+        )
+
+
+def test_control_document_generation_authorizes_without_source_chunk(
+    tmp_path: Path,
+) -> None:
+    environment = _environment(tmp_path, "control-document-generation.db")
+    try:
+        job_id, lease_token, caller = seed_running_control_job(environment)
+        persisted = BaselineEvidencePersistenceService(environment.sessions).persist(
+            control_command(
+                environment,
+                job_id=job_id,
+                lease_token=lease_token,
+                caller_user_id=caller,
+            )
+        )
+        provider = CapturingProvider("document finding")
+        receipt = BaselineGenerationService(
+            environment.sessions, notifications_enabled=False
+        ).generate(
+            BaselineGenerationCommand(
+                run_id=persisted.run_id,
+                group_id=environment.group_id,
+                caller_user_id=caller,
             ),
-            {"run_id": run_id},
-        ).mappings().all()
+            provider,
+        )
+        assert receipt.state is BaselineGenerationState.SUCCEEDED
+        assert len(provider.inputs) == 1
+        generation_input = provider.inputs[0]
+        assert generation_input.source_scope == "control_document"
+        assert generation_input.source_chunk_id is None
+        with environment.engine.connect() as connection:
+            expected_document = connection.execute(
+                text("SELECT content FROM document WHERE document_id = :document_id"),
+                {"document_id": environment.source_document_id},
+            ).scalar_one()
+            feedback_chunks = (
+                connection.execute(
+                    text(
+                        "SELECT source_chunk_id FROM feedback WHERE "
+                        "baseline_retrieval_run_id = :run_id "
+                        "ORDER BY baseline_finding_ordinal"
+                    ),
+                    {"run_id": persisted.run_id},
+                )
+                .scalars()
+                .all()
+            )
+            outbox_count = connection.execute(
+                text(
+                    "SELECT count(*) FROM baseline_notification_outbox "
+                    "WHERE run_id = :run_id"
+                ),
+                {"run_id": persisted.run_id},
+            ).scalar_one()
+        assert generation_input.source_text == expected_document
+        assert feedback_chunks == [None]
+        assert outbox_count == 1
+    finally:
+        environment.engine.dispose()
 
 
 def test_exact_order_renderer_bytes_success_replay_and_restart(tmp_path: Path) -> None:
     environment = _environment(tmp_path)
     try:
         persisted, command = _persist(environment)
-        provider = CapturingProvider(
-            f"first finding{GENERATION_FINDING_SEPARATOR}second finding"
-        )
+        provider = CapturingProvider("first finding", "second finding")
         service = BaselineGenerationService(environment.sessions)
 
         receipt = service.generate(command, provider)
@@ -146,9 +233,12 @@ def test_exact_order_renderer_bytes_success_replay_and_restart(tmp_path: Path) -
                 ),
                 {"run_id": persisted.run_id},
             ).all()
-            assert connection.execute(
-                text("SELECT count(*) FROM notification_event")
-            ).scalar_one() == 0
+            assert (
+                connection.execute(
+                    text("SELECT count(*) FROM notification_event")
+                ).scalar_one()
+                == 0
+            )
         assert [item.renderer_output for item in generation_input.evidence] == [
             row.renderer_output for row in stored
         ]
@@ -156,9 +246,9 @@ def test_exact_order_renderer_bytes_success_replay_and_restart(tmp_path: Path) -
             (item.repository_name, item.relative_path)
             for item in generation_input.evidence
         ] == [(row.repository_name, row.relative_path) for row in stored]
-        assert sum(len(item.renderer_output) for item in generation_input.evidence) == sum(
-            len(row.renderer_output) for row in stored
-        )
+        assert sum(
+            len(item.renderer_output) for item in generation_input.evidence
+        ) == sum(len(row.renderer_output) for row in stored)
         rows = _feedback_rows(environment, persisted.run_id)
         assert [row["feedback"] for row in rows] == ["first finding", "second finding"]
         assert [row["baseline_finding_ordinal"] for row in rows] == [1, 2]
@@ -209,7 +299,15 @@ def test_configured_http_adapter_sends_ordered_renderer_values_verbatim(
 
             @staticmethod
             def json():
-                return {"feedback": "HTTP baseline finding"}
+                return {
+                    "content": json.dumps(
+                        {
+                            "schema_version": GENERATION_OUTPUT_SCHEMA_VERSION,
+                            "outcome": "findings",
+                            "findings": [{"feedback": "HTTP baseline finding"}],
+                        }
+                    )
+                }
 
         def post(endpoint, *, json, timeout):
             captured.update(endpoint=endpoint, payload=json, timeout=timeout)
@@ -227,13 +325,17 @@ def test_configured_http_adapter_sends_ordered_renderer_values_verbatim(
         )
         assert receipt.state is BaselineGenerationState.SUCCEEDED
         with environment.engine.connect() as connection:
-            stored = connection.execute(
-                text(
-                    "SELECT renderer_output FROM baseline_selected_evidence "
-                    "WHERE run_id = :run_id ORDER BY ordinal"
-                ),
-                {"run_id": persisted.run_id},
-            ).scalars().all()
+            stored = (
+                connection.execute(
+                    text(
+                        "SELECT renderer_output FROM baseline_selected_evidence "
+                        "WHERE run_id = :run_id ORDER BY ordinal"
+                    ),
+                    {"run_id": persisted.run_id},
+                )
+                .scalars()
+                .all()
+            )
         assert captured["endpoint"] == reviewer.endpoint
         assert captured["payload"]["references"] == stored
         assert captured["payload"]["contract_version"] == (
@@ -241,6 +343,18 @@ def test_configured_http_adapter_sends_ordered_renderer_values_verbatim(
         )
         assert captured["payload"]["document"] == "authoritative source chunk"
         assert len(captured["payload"]["idempotency_key"]) == 64
+        assert captured["payload"]["output_contract"] == {
+            "schema_version": GENERATION_OUTPUT_SCHEMA_VERSION,
+            "specification_sha256": (
+                "1dccd3a11ec659a5e8705f9b8acf333a64a21f056265fcd7c96e9c6ac197bb20"
+            ),
+            "schema_sha256": GENERATION_OUTPUT_SCHEMA_SHA256,
+            "strict": True,
+            "maximum_findings": 4,
+            "allowed_outcomes": ["no_findings", "findings"],
+            "additional_properties": False,
+            "feedback_must_be_nonblank": True,
+        }
     finally:
         environment.engine.dispose()
 
@@ -316,7 +430,9 @@ def test_expired_lease_is_recovered_transactionally(tmp_path: Path) -> None:
         environment.engine.dispose()
 
 
-def test_authorization_is_rechecked_after_provider_before_feedback(tmp_path: Path) -> None:
+def test_authorization_is_rechecked_after_provider_before_feedback(
+    tmp_path: Path,
+) -> None:
     environment = _environment(tmp_path, "authorization.db")
     try:
         persisted, command = _persist(environment, "authorization")
@@ -377,10 +493,10 @@ def test_malformed_output_is_terminal_and_creates_no_feedback(tmp_path: Path) ->
     try:
         persisted, command = _persist(environment, "malformed")
         receipt = BaselineGenerationService(environment.sessions).generate(
-            command, CapturingProvider("NONE")
+            command, RawOutputProvider("NONE")
         )
         assert receipt.state is BaselineGenerationState.TERMINAL_FAILED
-        assert receipt.error_code == "provider_empty_output"
+        assert receipt.error_code == "provider_malformed_output"
         assert _feedback_rows(environment, persisted.run_id) == []
     finally:
         environment.engine.dispose()
@@ -411,7 +527,14 @@ def test_stale_publication_blocks_before_provider(tmp_path: Path) -> None:
         environment.engine.dispose()
 
 
-@pytest.mark.parametrize("stage", list(GenerationWriteStage))
+@pytest.mark.parametrize(
+    "stage",
+    (
+        GenerationWriteStage.FEEDBACK,
+        GenerationWriteStage.STATE,
+        GenerationWriteStage.OUTBOX,
+    ),
+)
 def test_injected_feedback_transaction_failure_rolls_back(
     tmp_path: Path,
     stage: GenerationWriteStage,
@@ -425,9 +548,9 @@ def test_injected_feedback_transaction_failure_rolls_back(
                 raise RuntimeError("injected database failure with sensitive details")
 
         with pytest.raises(BaselineGenerationError) as error:
-            BaselineGenerationService(
-                environment.sessions, stage_hook=fail
-            ).generate(command, CapturingProvider())
+            BaselineGenerationService(environment.sessions, stage_hook=fail).generate(
+                command, CapturingProvider()
+            )
         assert error.value.code == "database_commit_failed"
         assert _feedback_rows(environment, persisted.run_id) == []
         with environment.engine.connect() as connection:

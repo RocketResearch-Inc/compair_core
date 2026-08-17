@@ -137,6 +137,62 @@ The full state and delivery contract is in
   old FKs, drop source-column `NOT NULL`, install and validate the replacement
   `SET NULL`/restrictive/composite FKs, and create the scoped chunk trigger.
 
+### Document-scoped baseline evidence
+
+`0010_baseline_document_source_scope_v1` adds the explicit
+`baseline-source-scope.v1` discriminator and deterministically labels every
+existing retrieval run `legacy_chunk`. It enforces the one-way, one-to-one,
+group-scoped `baseline_control_run_job.persisted_run_id` relationship for new
+`control_document` runs. SQLite reconstructs only the control-run job table to
+add its composite foreign key and unique constraint, then installs creation
+guards. PostgreSQL uses additive columns/constraints and equivalent triggers.
+Source deletion can still null retained provenance; the source scope and
+control relationship remain durable.
+
+### Document-level baseline executor metadata
+
+`0011_baseline_run_executor_v1` adds the fixed internal worker identity,
+immutable first-start timestamp, and safe retrieval-result fingerprint to the
+existing control run job. Lease token, expiry, attempt count, sanitized reason,
+and update/finish timestamps already existed and are reused. SQLite installs
+insert/update guards; PostgreSQL adds named checks and an immutable-metadata
+trigger. Existing queued audit jobs remain valid with null executor metadata
+until first claim. The migration contains no evidence table, run endpoint, or
+dispatch behavior.
+
+### Document-level baseline generation coordination
+
+`0012_baseline_control_generation_v1` adds only generation-coordination
+metadata to `baseline_control_run_job`: a generation attempt counter, first
+start/completion timestamps, provider/model/version and provider-idempotency
+attestation, the frozen `baseline-generation-output.v2` version/schema hash,
+and exact input/output fingerprints. The existing control-job lease columns
+remain the control-side lease authority and receive the same opaque token as
+the linked `baseline_retrieval_run` generation lease. Workers lock the control
+job before the retrieval run on every claim, revalidation, failure, and success
+transaction.
+
+Existing jobs upgrade with `generation_attempt_count=0` and all new metadata
+null. SQLite insert/update guards and PostgreSQL named checks reject partial
+attempt metadata and contradictory `feedback_persisted` rows. A terminal
+`feedback_persisted` row requires an invoked generation, a durable output
+fingerprint and completion time, `feedback_count <= reference_count`, and—when
+the count is zero—no notification outbox effect. Completed generation metadata
+and counts are immutable. The migration adds no public endpoint, retrieval
+execution, payload access, preview, or capability enablement.
+
+### Database worker heartbeat
+
+`0013_baseline_database_worker_v1` adds only
+`baseline_database_worker_instance`, the privacy-safe operational heartbeat
+registry for the optional database-backed baseline worker. Rows contain an
+opaque instance UUID, fixed worker contract, supported job-type booleans,
+start/heartbeat timestamps, draining state, and bounded concurrency/active
+counts. They contain no hostname, path, endpoint, credential, lease token, or
+job data. SQLite enforces one recent non-draining worker; PostgreSQL permits
+multiple compatible instances. Stale rows are operational metadata and may be
+deleted after the configured heartbeat TTL.
+
 ## Failure recovery and rollback
 
 This is a forward-only runner. “Rollback” has two distinct meanings:

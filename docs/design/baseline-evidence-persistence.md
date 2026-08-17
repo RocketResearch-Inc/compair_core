@@ -5,9 +5,11 @@ API, task, CLI, retrieval, notification, or generation paths.
 
 ## Command and receipt
 
-`BaselineEvidencePersistenceCommand` carries the authoritative `group_id`,
-`source_chunk_id`, `source_document_id`, an opaque caller-generated
-`idempotency_key`, and one `RetrievalResult`. The result must be
+`BaselineEvidencePersistenceCommand` carries the authoritative `group_id`, an
+explicit typed source descriptor, an opaque caller-generated `idempotency_key`,
+and one `RetrievalResult`. `LegacyChunkSource` contains a document and required
+chunk; `ControlDocumentSource` contains a document and control-job identity but
+no chunk. The result must be
 `retrieval-result.v2`, `ok`, and produced by
 `baseline_v1.persistent.v1`. It must contain one to four evidence items in
 ascending fused-rank order. The service returns the durable run, selected
@@ -66,8 +68,14 @@ transaction:
 1. `baseline_retrieval_run`;
 2. reused or new `baseline_evidence_artifact` rows;
 3. `baseline_selected_evidence` rows in explicit ordinal order; and
-4. `Reference` rows with `reference_type=baseline_file`, a required source
-   chunk, and only `baseline_selected_evidence_id` as their target.
+4. `Reference` rows with `reference_type=baseline_file` and only
+   `baseline_selected_evidence_id` as their target. Legacy-chunk writes retain
+   the required source chunk; control-document writes keep it null.
+
+For a control-document command, the same transaction also attaches the run to
+the single matching `baseline_control_run_job` and transitions that job from
+`running` to `references_persisted`. The link and all evidence effects commit
+or roll back together.
 
 Any exception rolls the transaction back. A same-group, same-key replay first
 revalidates current authorization and publication, then compares all persisted
@@ -75,4 +83,3 @@ intent, artifacts, selections, renderer output, and References before returning
 the prior identifiers. A different intent fails with `idempotency_conflict`.
 
 No `Feedback` is created and generation remains pending and uninvoked.
-
