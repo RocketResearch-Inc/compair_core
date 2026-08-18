@@ -37,6 +37,7 @@ from .baseline_embedding.manifest import (
     BaselineModelManifestError,
     load_baseline_model_manifest,
 )
+from .config_init import add_config_init_arguments, run_config_init_command
 from .runtime_config import (
     BASELINE_GENERATION_OUTPUT_SCHEMA_SHA256,
     RUNTIME_CONFIG_CONTRACT_VERSION,
@@ -1079,11 +1080,23 @@ def _parser() -> argparse.ArgumentParser:
     doctor.add_argument("--json", action="store_true", dest="json_output")
     doctor.add_argument("--require-baseline", action="store_true")
     doctor.add_argument("--probe-generation", action="store_true")
+    config = subcommands.add_parser(
+        "config",
+        help="manage private local Core configuration",
+    )
+    config_commands = config.add_subparsers(dest="config_command", required=True)
+    config_init = config_commands.add_parser(
+        "init",
+        help="create a private baseline-run keyring secrets fragment",
+    )
+    add_config_init_arguments(config_init)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "config" and args.config_command == "init":
+        return run_config_init_command(args)
     for logger_name in ("httpx", "httpcore", "urllib3"):
         logging.getLogger(logger_name).setLevel(logging.WARNING)
     try:

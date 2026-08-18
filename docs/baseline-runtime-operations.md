@@ -39,6 +39,65 @@ automatic dispatch ready nor reaches job selection/claim. Existing per-job
 authorization, corpus, publication, provider, and fingerprint checks remain
 authoritative after this process-level gate.
 
+## First-time keyring initialization
+
+The installed POSIX initializer creates the local baseline-run secrets
+fragment without accepting or printing key material:
+
+```sh
+compair-core config init
+compair-core config init --output /private/operator/path/baseline.env
+compair-core config init --json
+```
+
+The default is `$XDG_CONFIG_HOME/compair-core/baseline.env` when
+`XDG_CONFIG_HOME` is set and absolute; otherwise macOS and Linux use
+`~/.config/compair-core/baseline.env`. An explicit output must be absolute.
+The generated fragment contains one fixed shell assignment to
+`COMPAIR_BASELINE_RUN_ENCRYPTION_KEYRING`. Apply it without displaying it:
+
+```sh
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/compair-core/baseline.env"
+set -a
+. "$CONFIG_FILE"
+set +a
+```
+
+Sourcing is supported specifically because Core generated this one-assignment
+file; this is not a general dotenv or shell-configuration parser. Load the same
+fragment into API, worker, and doctor processes. A separately initialized file
+has a different keyring and runtime fingerprint and is rejected as worker
+configuration drift.
+
+Core sets umask `077`, creates missing parents as `0700`, rejects symlinked
+destination or parent traversal, writes and fsyncs a same-directory `0600`
+temporary inode, and publishes it with an exclusive hard link. Existing paths
+are never read, repaired, chmodded, appended, or replaced. The file and
+directory are fsynced where the platform supports directory fsync. A filesystem
+without the required exclusive same-filesystem link semantics fails closed;
+network filesystem atomicity is not assumed. Concurrent attempts yield one
+publication and `destination_already_exists` for the others.
+
+`--json` emits `baseline-config-init-result.v1` with only creation state,
+keyring version, opaque active key ID, key count, `0600`, default/explicit
+destination classification, and UTC timestamp. It excludes the serialized
+keyring, secret bytes, absolute path, home/user/host data, and environment.
+
+| Code | Meaning |
+|---:|---|
+| 0 | private secrets fragment created |
+| 2 | invalid usage, non-absolute output, or invalid XDG/path |
+| 3 | destination already exists; it was not read or changed |
+| 4 | insecure/symlinked path, unsafe permissions, or unsupported platform security |
+| 5 | cryptographic random generation or production serialization failed |
+| 6 | atomic write, fsync, or exclusive publication failed |
+| 7 | sanitized internal failure |
+
+There is no `--force` or `--stdout`. On Windows this checkpoint fails closed
+with `platform_security_unsupported`; use a deployment secret manager with
+equivalent private ACL, no-overwrite, and atomic-publication guarantees. The
+command does not rotate, inspect, repair, back up, export, or recover keys.
+
 ## Supported installed commands
 
 After installing `compair-core` (and the `baseline-embedding` extra for the BGE

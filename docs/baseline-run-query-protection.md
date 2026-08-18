@@ -65,7 +65,20 @@ diagnostics or plaintext.
 
 ## External keyring
 
-`COMPAIR_BASELINE_RUN_ENCRYPTION_KEYRING` is a secret-managed JSON value:
+`COMPAIR_BASELINE_RUN_ENCRYPTION_KEYRING` is a secret-managed JSON value. For
+first-time local POSIX setup, generate the exact production shape without
+printing it:
+
+```sh
+compair-core config init
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/compair-core/baseline.env"
+set -a
+. "$CONFIG_FILE"
+set +a
+```
+
+The resulting value has this structure (the command never emits the secret
+fields shown here):
 
 ```json
 {
@@ -80,10 +93,13 @@ diagnostics or plaintext.
 }
 ```
 
-Supply it through the deployment secret manager, not a committed file or a
-command-line argument. Key IDs are opaque and are never returned through
-capabilities, status, errors, logs, reprs, or task metadata. Missing, malformed,
-duplicate, short, or unknown keys fail closed.
+The local file is `0600`, no-overwrite, and symlink-rejecting. Load the same
+fragment into API, worker, and doctor, or supply an equivalent value through a
+deployment secret manager. Never commit it or pass it as a command-line
+argument. Key IDs are opaque and may appear only in the safe local initializer
+result and runtime attestation; secret keys are never returned through
+capabilities, status, errors, logs, reprs, task metadata, or initializer output.
+Missing, malformed, duplicate, short, or unknown keys fail closed.
 
 Rotation is an add-before-remove procedure:
 

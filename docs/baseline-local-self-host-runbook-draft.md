@@ -117,29 +117,37 @@ export COMPAIR_BASELINE_EMBEDDING_BATCH_SIZE=32
 export COMPAIR_BASELINE_EMBEDDING_ALLOW_INSECURE_LOOPBACK=true
 ```
 
-Generate an independent 32-byte AES key with a trusted secret-management
-workflow and provide this JSON as a secret, not a committed file or command-line
-argument:
+Create the first local keyring with the installed command. It generates one
+independent 32-byte AES-GCM key and opaque key ID, validates the exact
+production `baseline-run-keyring.v1` contract, and writes only the fixed shell
+assignment:
 
-```json
-{
-  "version": "baseline-run-keyring.v1",
-  "active_key_id": "<opaque-rotation-id>",
-  "keys": [
-    {
-      "key_id": "<opaque-rotation-id>",
-      "key_base64": "<base64-encoded-32-byte-key>"
-    }
-  ]
-}
+```sh
+compair-core config init
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/compair-core/baseline.env"
+set -a
+. "$CONFIG_FILE"
+set +a
 ```
 
-Set the secret as `COMPAIR_BASELINE_RUN_ENCRYPTION_KEYRING` in both API and
-worker service managers. See
-[baseline-run-query-protection.md](baseline-run-query-protection.md) for the
-add-before-remove rotation rule.
+When `XDG_CONFIG_HOME` is set, the default is
+`$XDG_CONFIG_HOME/compair-core/baseline.env`; otherwise macOS and Linux use
+`~/.config/compair-core/baseline.env`. Use `compair-core config init --output
+<absolute-path>` to select another destination. The command creates private
+parents, publishes a `0600` file without overwrite, and never prints the key.
+Load the same secrets fragment into API, worker, and doctor processes. Do not
+commit it or pass its contents as an argument.
 
-**Manual gap:** no supported command proves that an inactive key has no
+The initializer is POSIX-only in this checkpoint. It rejects symlinked paths,
+unsafe parents, and filesystems that cannot provide the required exclusive
+same-directory publication rather than weakening atomicity. Windows operators
+must use a deployment secret manager with equivalent ACL and no-overwrite
+guarantees; Core fails closed with `platform_security_unsupported`.
+
+See [baseline-run-query-protection.md](baseline-run-query-protection.md) for
+the add-before-remove rotation rule.
+
+**Remaining rotation gap:** no supported command proves that an inactive key has no
 remaining protected payload references. Do not remove an old key based only on
 elapsed wall time.
 

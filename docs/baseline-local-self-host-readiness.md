@@ -75,7 +75,7 @@ phase; no Docker Compose or system-service claim is made.
 | Create/select group | **ready** | `compair group create`, `group ls`, `group show`, and `group use` expose the group ID. |
 | Create authoritative source document | **ready** | `compair track`, `group files`, and `docs list --json` expose document IDs. |
 | Register repositories | **ready** | `baseline repository register/list/inspect/state/bind` uses authenticated Core services and protected local bindings. |
-| Configure AES-GCM keyring | **documented but manual** | `.env.example` now shows a deliberately nonfunctional structure. There is still no safe inspect/drain command for rotation. |
+| Configure AES-GCM keyring | **ready for first-time POSIX initialization** | Installed `compair-core config init` generates and production-validates one random AES-256-GCM keyring, atomically publishes a private `0600` secrets fragment, and refuses overwrite. Rotation still lacks safe inspect/drain tooling. |
 | Start pinned BGE | **ready**, conditional on explicit model fetch | Installed model fetch/verify/service commands use the frozen manifest, perform no serving-time download, and default to loopback. |
 | Configure strict local generation | **ready**, conditional on an installed pinned model | `compair-core-generation verify [--probe]` attests native Ollama and the exact structured-output schema without a proxy or fallback. |
 | Start `compair-core-worker` | **ready**, deployment manual | `compair-core-worker (--once | --poll)` is installed by the wheel. The CLI development compose worker remains unsuitable. |
@@ -186,7 +186,9 @@ timing/capacity/retry values, a deliberately nonfunctional AES-GCM keyring
 shape, payload lifetime, pinned embedding identity and limits, strict generation
 provider/model/digest/transport/bounds, notification default-off behavior, and
 a commented disposable PostgreSQL test URL. All opt-in or insecure-local
-switches remain false, and no working credential is present.
+switches remain false, and no working credential is present. First-time local
+key creation instead uses installed `compair-core config init`; its private
+fragment must be loaded unchanged into API, worker, and doctor environments.
 
 The settings are distributed across focused documents, while the general
 README describes the legacy HTTP generation shape (`length_instruction` and a
@@ -241,7 +243,8 @@ must restart with the same database, keyring, and provider identities.
 
 ### Encryption-key rotation
 
-The add-before-remove algorithm is sound and documented. It is not fully
+First-time POSIX initialization is supported. The add-before-remove algorithm
+is sound and documented, but it is not fully
 operable without internal/database inspection: no supported command reports
 whether any unexpired payload still references an inactive key ID, and cleanup
 has no public one-shot operator command. Rotation is therefore **usable but

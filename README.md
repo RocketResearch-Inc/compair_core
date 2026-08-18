@@ -168,17 +168,31 @@ The installed self-hosted baseline processes have stable loopback-first entry
 points. Give the API and worker the same database and baseline environment:
 
 ```bash
+compair-core config init
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/compair-core/baseline.env"
+set -a
+. "$CONFIG_FILE"
+set +a
 compair-core-api --host 127.0.0.1 --port 8000
 compair-core-worker --poll
 compair-core doctor --require-baseline
 ```
+
+`config init` creates one `baseline-run-keyring.v1` secrets fragment with a
+cryptographically random AES-256-GCM key. It refuses overwrite and publishes a
+private `0600` file atomically; it never prints the key. Use `--output` for an
+explicit absolute path or `--json` for the privacy-safe
+`baseline-config-init-result.v1` result. Load the same generated fragment into
+the API, worker, and doctor environments. See
+[baseline runtime operations](docs/baseline-runtime-operations.md) for the
+path, exit, POSIX security, and rotation limitations.
 
 Run doctor before the worker to confirm automatic dispatch is unavailable,
 then again after the matching heartbeat to confirm readiness. The default
 doctor is read-only and performs no generation inference; add
 `--probe-generation` only for the benign Ollama schema probe. Non-loopback API
 binding requires `--allow-non-loopback` and the documented TLS reverse-proxy
-policy. See [baseline runtime operations](docs/baseline-runtime-operations.md).
+policy.
 
 ### Installing from source
 

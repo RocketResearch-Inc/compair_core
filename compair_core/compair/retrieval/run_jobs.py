@@ -10,13 +10,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import re
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from types import MappingProxyType
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -34,6 +32,11 @@ from compair_core.baseline_control_plane_schema import (
     control_job,
     repository_approval,
     repository_registration,
+)
+from compair_core.run_keyring import (
+    RUN_KEYRING_VERSION,
+    RunKeyringValidationError,
+    parse_run_keyring,
 )
 
 from .control_plane import BaselineControlPlaneService, ControlPlaneError, canonicalize
@@ -61,16 +64,13 @@ from .persistent import published_index_fingerprint
 RUN_JOB_CONTRACT_VERSION = "baseline-run-job.v1"
 RUN_PAYLOAD_SCHEMA_VERSION = "baseline-run-protected-payload.v1"
 RUN_PAYLOAD_AAD_VERSION = "baseline-run-aad.v1"
-RUN_KEYRING_VERSION = "baseline-run-keyring.v1"
 RUN_ENCRYPTION_ALGORITHM = "AES-256-GCM"
 RUN_NONCE_BYTES = 12
-RUN_KEY_BYTES = 32
 RUN_PARENT_SECRET_BYTES = 32
 DEFAULT_PAYLOAD_LIFETIME = timedelta(minutes=15)
 MIN_PAYLOAD_LIFETIME = timedelta(minutes=1)
 MAX_PAYLOAD_LIFETIME = timedelta(hours=1)
 
-_SAFE_KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$")
 _TERMINAL_STATES = frozenset(
     {
         "feedback_persisted",
@@ -193,82 +193,15 @@ class BaselineRunKeyring:
 
     @classmethod
     def from_json(cls, raw: str) -> BaselineRunKeyring:
-        if not isinstance(raw, str) or not raw:
-            raise BaselineRunJobError(
-                "run_keyring_unavailable", status_code=503, retryable=False
-            )
-
-        def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-            result: dict[str, Any] = {}
-            for key, value in pairs:
-                if key in result:
-                    raise BaselineRunJobError(
-                        "run_keyring_invalid", status_code=503, retryable=False
-                    )
-                result[key] = value
-            return result
-
         try:
-            value = json.loads(raw, object_pairs_hook=reject_duplicates)
-        except BaselineRunJobError:
-            raise
-        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = parse_run_keyring(raw)
+        except RunKeyringValidationError as exc:
             raise BaselineRunJobError(
-                "run_keyring_invalid", status_code=503, retryable=False
+                exc.code,
+                status_code=503,
+                retryable=False,
             ) from None
-        if not isinstance(value, Mapping) or set(value) != {
-            "version",
-            "active_key_id",
-            "keys",
-        }:
-            raise BaselineRunJobError(
-                "run_keyring_invalid", status_code=503, retryable=False
-            )
-        active = value["active_key_id"]
-        entries = value["keys"]
-        if (
-            value["version"] != RUN_KEYRING_VERSION
-            or not isinstance(active, str)
-            or _SAFE_KEY_ID.fullmatch(active) is None
-            or not isinstance(entries, list)
-            or not entries
-        ):
-            raise BaselineRunJobError(
-                "run_keyring_invalid", status_code=503, retryable=False
-            )
-        keys: dict[str, bytes] = {}
-        for entry in entries:
-            if not isinstance(entry, Mapping) or set(entry) != {"key_id", "key_base64"}:
-                raise BaselineRunJobError(
-                    "run_keyring_invalid", status_code=503, retryable=False
-                )
-            key_id = entry["key_id"]
-            encoded = entry["key_base64"]
-            if (
-                not isinstance(key_id, str)
-                or _SAFE_KEY_ID.fullmatch(key_id) is None
-                or key_id in keys
-                or not isinstance(encoded, str)
-            ):
-                raise BaselineRunJobError(
-                    "run_keyring_invalid", status_code=503, retryable=False
-                )
-            try:
-                key = base64.b64decode(encoded, validate=True)
-            except (ValueError, TypeError):
-                raise BaselineRunJobError(
-                    "run_keyring_invalid", status_code=503, retryable=False
-                ) from None
-            if len(key) != RUN_KEY_BYTES:
-                raise BaselineRunJobError(
-                    "run_keyring_invalid", status_code=503, retryable=False
-                )
-            keys[key_id] = key
-        if active not in keys:
-            raise BaselineRunJobError(
-                "run_keyring_invalid", status_code=503, retryable=False
-            )
-        return cls(active_key_id=active, _keys=MappingProxyType(keys))
+        return cls(active_key_id=parsed.active_key_id, _keys=parsed.keys)
 
     def active_key(self) -> bytes:
         return self._keys[self.active_key_id]

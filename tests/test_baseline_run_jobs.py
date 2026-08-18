@@ -63,6 +63,7 @@ from compair_core.compair.retrieval.run_jobs import (
     RunSubmissionStage,
     keyring_from_settings,
 )
+from compair_core.run_keyring import generate_run_keyring
 
 SCHEMA = json.loads(
     (
@@ -483,6 +484,14 @@ def test_settings_keyring_is_secret_and_fail_closed() -> None:
     assert "settings-key" not in repr(keyring)
     with pytest.raises(BaselineRunJobError, match="run_keyring_unavailable"):
         keyring_from_settings(SimpleNamespace(baseline_run_encryption_keyring=None))
+
+
+def test_generated_keyring_is_accepted_by_production_cipher_parser() -> None:
+    generated = generate_run_keyring()
+    keyring = BaselineRunKeyring.from_json(generated.serialized)
+    assert keyring.active_key_id == generated.active_key_id
+    assert len(keyring.active_key()) == 32
+    assert generated.serialized not in repr(keyring)
 
 
 def test_idempotency_conflict_member_cross_group_and_authorization_rechecks(
