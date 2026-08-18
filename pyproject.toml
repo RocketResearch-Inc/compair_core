@@ -38,6 +38,7 @@ dependencies = [
 compair-core-worker = "compair_core.worker:main"
 compair-core-models = "compair_core.baseline_embedding.model_cli:main"
 compair-core-embedding-service = "compair_core.baseline_embedding.service:main"
+compair-core-generation = "compair_core.baseline_generation.cli:main"
 
 [project.optional-dependencies]
 dev = [

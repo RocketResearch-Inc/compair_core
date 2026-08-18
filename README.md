@@ -145,6 +145,25 @@ compair-core-embedding-service --host 127.0.0.1 --port 9010
 See [the baseline embedding runbook](docs/baseline-embedding-service.md) for
 the frozen artifact hashes, cache policy, readiness states, and Core settings.
 
+Baseline generation can use a separately configured native Ollama service; it
+does not pass through legacy generation or a translation proxy. Core never
+pulls the model and accepts a configured tag only after its exact immutable
+digest is attested:
+
+```bash
+export COMPAIR_BASELINE_GENERATION_PROVIDER=ollama
+export COMPAIR_BASELINE_GENERATION_ENDPOINT=http://127.0.0.1:11434
+export COMPAIR_BASELINE_GENERATION_MODEL=qwen3:1.7b
+export COMPAIR_BASELINE_GENERATION_MODEL_DIGEST=sha256:8f68893c685c3ddff2aa3fffce2aa60a30bb2da65ca488b61fff134a4d1730e7
+export COMPAIR_BASELINE_GENERATION_ALLOW_LOOPBACK_HTTP=true
+compair-core-generation verify
+compair-core-generation verify --probe
+```
+
+The first command performs no inference. The opt-in probe uses only synthetic
+text and validates the exact packaged `baseline-generation-output.v2` schema.
+See [the native Ollama generation runbook](docs/baseline-ollama-generation.md).
+
 ### Installing from source
 
 You can also install directly from GitHub (handy for pinning to a specific commit or branch):
@@ -188,6 +207,9 @@ Key environment variables for the core edition:
 - `COMPAIR_NOW_REVIEW_MAX_OUTPUT_TOKENS` (`2200`) – maximum output-token budget used for `compair review --now` quotes and model calls.
 - Cloud-only `review --now` credit settings: `COMPAIR_REVIEW_NOW_CREDIT_PRICE_ID` configures the Stripe price used for prepaid credit checkout, `COMPAIR_REVIEW_NOW_CREDIT_PACK_CENTS` sets the credit pack value, `COMPAIR_REVIEW_NOW_MAX_QUOTE_CENTS` caps a single quoted run, `COMPAIR_REVIEW_NOW_MIN_CHARGE_CENTS` sets the minimum nonzero charge, and `COMPAIR_REVIEW_NOW_QUOTE_TTL_SEC` controls quote expiry.
 - `COMPAIR_GENERATION_ENDPOINT` – HTTP endpoint invoked when `COMPAIR_GENERATION_PROVIDER=http`; the service receives a JSON payload (`document`, `references`, `length_instruction`) and should return `{"feedback": ...}`.
+- `COMPAIR_BASELINE_GENERATION_PROVIDER` (`disabled`) – select baseline-only `ollama` or the separate strict `http` adapter. It never inherits or falls back to legacy generation.
+- `COMPAIR_BASELINE_GENERATION_ENDPOINT` / `COMPAIR_BASELINE_GENERATION_MODEL` / `COMPAIR_BASELINE_GENERATION_MODEL_DIGEST` – pin the native Ollama base URL, tag, and mandatory immutable digest. Plain HTTP is limited to an explicitly enabled literal-loopback endpoint; remote endpoints require verified HTTPS.
+- `COMPAIR_BASELINE_GENERATION_TIMEOUT_SECONDS` / `COMPAIR_BASELINE_GENERATION_CONTEXT_TOKENS` / `COMPAIR_BASELINE_GENERATION_OUTPUT_TOKENS` – bound native connect/read/total time and deterministic context/output budgets.
 - `COMPAIR_NOTIFICATION_SCORING_ENABLED` (`true`) – enable ranked notification-event scoring in Core. Set to `false` if you only want raw feedback without notification triage.
 - `COMPAIR_NOTIFICATION_SCORING_PROVIDER` (`auto`) – choose `auto`, `heuristic`, or `openai` for notification-event scoring. `auto` uses OpenAI when an API key is configured and otherwise falls back to a deterministic local heuristic.
 - `COMPAIR_NOTIFICATION_SCORING_TIMEOUT_S` (`30`) – request timeout in seconds for OpenAI-backed notification scoring. Increase this for large cross-repo review runs if scorer requests are timing out.

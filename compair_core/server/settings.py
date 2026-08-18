@@ -96,6 +96,46 @@ class Settings(BaseSettings):
     baseline_embedding_batch_size: int = Field(default=32, ge=1, le=256)
     baseline_embedding_allow_insecure_loopback: bool = False
 
+    # Baseline generation is independent of legacy generation routing. The
+    # native Ollama mode attests the configured tag's immutable digest before
+    # sending any source or evidence bytes and never falls back or pulls.
+    baseline_generation_provider: Literal["disabled", "http", "ollama"] = "disabled"
+    baseline_generation_endpoint: str | None = None
+    baseline_generation_model: str | None = None
+    baseline_generation_model_digest: str | None = None
+    baseline_generation_model_version: str | None = None
+    baseline_generation_timeout_seconds: float = Field(
+        default=60.0,
+        ge=0.1,
+        le=300.0,
+    )
+    baseline_generation_allow_loopback_http: bool = False
+    baseline_generation_max_request_bytes: int = Field(
+        default=256_000,
+        ge=4_096,
+        le=8_000_000,
+    )
+    baseline_generation_max_response_bytes: int = Field(
+        default=200_000,
+        ge=4_096,
+        le=1_000_000,
+    )
+    baseline_generation_context_tokens: int = Field(
+        default=32_768,
+        ge=2_048,
+        le=131_072,
+    )
+    baseline_generation_output_tokens: int = Field(
+        default=1_024,
+        ge=64,
+        le=4_096,
+    )
+    baseline_generation_seed: int = Field(
+        default=0,
+        ge=0,
+        le=2_147_483_647,
+    )
+
     # Baseline-run submissions use a separate external AES-256-GCM keyring.
     # SecretStr prevents accidental settings/repr disclosure; the value is a
     # strict baseline-run-keyring.v1 JSON object parsed only by the run service.

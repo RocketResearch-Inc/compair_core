@@ -1,12 +1,12 @@
 # Baseline local self-host readiness audit
 
-Status: **blocked; not release-ready**
+Status: **native model providers ready; full-stack orchestration not release-ready**
 Audit date: 2026-08-17
 Core checkpoint (`feature/baseline-v1`): `4a31a47c79a6768319433e4835edb2688d21daae`
 CLI checkpoint (`main`): `94031136df4702d1613f0bd62467098d01b4e909`
 
-This is the Phase 2B2M.0 audit updated through the Phase 2B2M.2 local
-repository-provisioning closeout for the `baseline_v1` workflow:
+This is the Phase 2B2M.0 audit updated through the Phase 2B2M.3B native Ollama
+generation closeout for the `baseline_v1` workflow:
 
 ```text
 scan -> upload -> ingestion -> index -> run -> preview
@@ -46,11 +46,9 @@ generated once by the CLI. Core's opaque group-scoped registration ID remains
 the authority used by manifests. Paths, names, remotes, revisions, root commits,
 and the local Git sanity fingerprint do not authorize anything.
 
-The remaining release blockers are a supported strict local generation service, a supported BGE
-service package/launcher, a reproducible local service stack, and operational
-discovery/diagnostics. The temporary Ollama translation proxy used during
-validation is not committed or supported, and Core cannot call native Ollama
-directly through the current strict baseline adapter.
+The native Ollama generation adapter and installed verifier remove the prior
+translation-proxy blocker. Remaining release blockers are a reproducible local
+service stack, combined supervision, and workflow-wide operational diagnostics.
 
 ## Classification
 
@@ -77,7 +75,7 @@ directly through the current strict baseline adapter.
 | Register repositories | **ready** | `baseline repository register/list/inspect/state/bind` uses authenticated Core services and protected local bindings. |
 | Configure AES-GCM keyring | **documented but manual** | `.env.example` now shows a deliberately nonfunctional structure. There is still no safe inspect/drain command for rotation. |
 | Start pinned BGE | **validation-only helper** | The source-only helper requires a pre-downloaded snapshot; there is no supported downloader, package entry point, image, or supervisor. |
-| Configure strict local generation | **missing** | Native Ollama and the bundled legacy service do not implement the strict baseline envelope; the temporary proxy is not committed. |
+| Configure strict local generation | **ready**, conditional on an installed pinned model | `compair-core-generation verify [--probe]` attests native Ollama and the exact structured-output schema without a proxy or fallback. |
 | Start `compair-core-worker` | **ready**, deployment manual | `compair-core-worker (--once | --poll)` is installed by the wheel. The CLI development compose worker remains unsuitable. |
 | Verify capabilities | **requires manual/internal action** | Commands preflight, but no standalone baseline doctor explains all not-ready causes. |
 | Create scan plan | **ready**, conditional on active registrations | `baseline plan create` resolves protected bindings, pins Git revisions, reauthorizes registrations, and writes the exact scanner-input contract. |
@@ -147,28 +145,16 @@ audit state.
 
 ### Generation and Ollama
 
-`ReviewerBaselineGenerationProvider` sends local/HTTP providers:
+`OllamaBaselineGenerationProvider` calls native nonstreaming `/api/chat` with
+the exact packaged `baseline-generation-output.v2` schema. It attests runtime,
+model tag, and immutable digest before source/evidence leaves Core, never pulls
+a model, and never falls back to generic HTTP or legacy generation.
 
-```json
-{
-  "contract_version": "baseline-generation-input.v1",
-  "document": "...",
-  "references": ["..."],
-  "output_contract": {},
-  "idempotency_key": "..."
-}
-```
-
-It requires an HTTP response whose `content` string is strict
-`baseline-generation-output.v2` JSON. Native Ollama endpoints use a different
-request and response shape; the bundled local model returns `output`, `text`,
-and `feedback`, and may return plain text or `NONE`. Neither satisfies this
-contract. Core therefore cannot point directly at Ollama today.
-
-The translation proxy used in live validation was outside the repositories and
-is not a supported artifact. A production-capable loopback adapter—or direct
-provider implementation with schema enforcement—remains missing. The baseline
-path must not use the bundled hash embedding or heuristic generation fallback.
+`compair-core-generation verify` performs static runtime/model/digest checks;
+`--probe` adds one private-data-free structured-output inference. Both produce
+one safe JSON value without endpoints, prompts, evidence, findings, raw
+responses, leases, or idempotency keys. The old development translation proxy
+is unnecessary and remains unsupported.
 
 ### FastEmbed/BGE
 
@@ -196,9 +182,9 @@ normal local startup path.
 transport exception, control-plane loopback/proxy policy, run gate, worker
 timing/capacity/retry values, a deliberately nonfunctional AES-GCM keyring
 shape, payload lifetime, pinned embedding identity and limits, strict generation
-identity/timeout, notification default-off behavior, and a commented disposable
-PostgreSQL test URL. All opt-in or insecure-local switches remain false, and no
-working credential is present.
+provider/model/digest/transport/bounds, notification default-off behavior, and
+a commented disposable PostgreSQL test URL. All opt-in or insecure-local
+switches remain false, and no working credential is present.
 
 The settings are distributed across focused documents, while the general
 README describes the legacy HTTP generation shape (`length_instruction` and a
@@ -227,10 +213,10 @@ pre-write rejection. They do not explain every not-ready condition precisely:
 - automatic worker absence, queue pressure, heartbeat expiry, or worker config
   mismatch share `worker_unavailable`.
 
-Embedding unavailable versus identity mismatch is distinguishable. The safe
-reason vocabulary is intentionally non-reflective, but an authenticated
-operator needs a separate diagnostic view that identifies the failed
-prerequisite without exposing endpoints or secrets.
+Embedding unavailable versus identity mismatch is distinguishable. The frozen
+control-plane reason vocabulary still collapses generation setup to
+`worker_unavailable`; the installed generation verifier now supplies the safe
+detailed provider diagnosis without changing that protocol.
 
 ### Resume, restart, and cleanup
 
@@ -329,7 +315,7 @@ orchestrator.
 | repository register/list/state CLI | add after local identity policy is approved | This closes the first authorization/ID-discovery gap. Restrict mutation to group admins and make descriptor provenance explicit. |
 | local initialization/bootstrap | keep narrow | Add a command that creates/prints safe group/document references and writes an example plan, but do not let it invent repository authority or hide approval. |
 | production BGE adapter | promote and package | Reuse the existing protocol/helper; add model acquisition consent, hash verification, health wait, launcher/image, and platform tests. Do not create another protocol. |
-| production Ollama adapter | add or implement direct native support | Translate to/from the frozen strict contracts, bind to loopback, redact bodies, and keep schema parsing in Core. Do not use the temporary validation proxy. |
+| production Ollama adapter | implemented | Core calls native nonstreaming `/api/chat`, supplies the exact frozen output schema, reattests the pinned digest before evidence-bearing calls, and keeps final schema parsing in Core. |
 | complete example environment | add | API and worker must consume the same reviewed settings; examples must distinguish legacy and baseline provider contracts. |
 | service launcher/Compose profile | add | Launch API, worker, PostgreSQL (optional), BGE, and strict generation with health ordering and persistent volumes. SQLite should remain a supported smaller profile. |
 | one end-to-end tutorial | add last | Generate it from the acceptance path so every command is continuously checked. |
@@ -343,8 +329,8 @@ sleep worker and hash-model service from any profile advertised for
 
 ## Highest-priority gaps
 
-1. **Supported local providers:** package the pinned BGE service and replace the
-   temporary Ollama proxy with a maintained strict adapter or direct support.
+1. **Supported local providers:** keep the packaged pinned BGE service and native
+   Ollama adapter under clean-install and live compatibility validation.
 2. **One truthful service configuration:** ship a complete service/compose
    profile, attest API/worker config agreement, and make readiness diagnostics
    actionable.
@@ -375,15 +361,15 @@ compatibility, disable/reactivate, and no-disclosure tests cover the workflow.
 
 ### M3 — production local providers and configuration
 
-The pinned BGE acquisition, verification, and loopback service are now
-installed with Core's `baseline-embedding` extra. Remaining M3 work is the
-strict local generation provider and broader service orchestration.
+The pinned BGE acquisition, verification, and loopback service are installed
+with Core's `baseline-embedding` extra. Native Ollama generation and its
+installed verifier now use the exact frozen output schema without a proxy.
+Remaining M3 work is broader service orchestration and combined configuration
+diagnostics.
 
 Remaining likely files:
 
-- a maintained Ollama adapter or native provider module;
-- `.env.example`, provider docs, health/capability checks, and compose/service
-  definitions; and
+- compose/service definitions and combined supervisor health checks; and
 - API/worker configuration-fingerprint heartbeat fields through a new reviewed
   migration if durable attestation is chosen.
 
@@ -391,8 +377,8 @@ Required tests:
 
 - exact BGE identity and float32 order on macOS arm64 and Linux amd64;
 - model download consent, cache hash, offline restart, and corrupt-cache failure;
-- positive and zero-finding strict generation output against real Ollama;
-- malformed/timeout/unavailable provider behavior and idempotency boundary;
+- clean-platform positive and zero-finding acceptance against pinned Ollama;
+- supervisor-level timeout/unavailable recovery and idempotency-boundary tests;
 - API/worker configuration mismatch is visible and pre-write fail-closed; and
 - no legacy/hash fallback.
 
@@ -508,7 +494,7 @@ retrieval or legacy behavior changes.
 Not executed:
 
 - a fresh model download;
-- a new live Ollama run, because no committed compatible adapter exists;
+- a release-grade end-to-end workflow using the native Ollama adapter;
 - Linux/amd64 validation; and
 - an end-to-end baseline workflow, because local repository authority and
   supported model-service decisions remain blocked.

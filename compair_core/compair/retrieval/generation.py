@@ -481,6 +481,13 @@ class ReviewerBaselineGenerationProvider:
 
     def __init__(self, reviewer: Any) -> None:
         self._reviewer = reviewer
+        self._timeout_seconds = float(
+            getattr(
+                reviewer,
+                "baseline_timeout_seconds",
+                os.getenv("COMPAIR_BASELINE_GENERATION_TIMEOUT", "30"),
+            )
+        )
         self.provider = _safe_provider_identity(
             getattr(reviewer, "provider", ""), "generation provider", 128
         )
@@ -492,7 +499,9 @@ class ReviewerBaselineGenerationProvider:
             )
         self.model = _safe_provider_identity(model, "generation model", 256)
         self.version = _safe_provider_identity(
-            os.getenv("COMPAIR_BASELINE_GENERATION_MODEL_VERSION") or self.model,
+            os.getenv("COMPAIR_BASELINE_GENERATION_MODEL_VERSION")
+            or getattr(reviewer, "model_version", None)
+            or self.model,
             "generation model version",
             256,
         )
@@ -529,9 +538,7 @@ class ReviewerBaselineGenerationProvider:
                 response = requests.post(
                     endpoint,
                     json=payload,
-                    timeout=float(
-                        os.getenv("COMPAIR_BASELINE_GENERATION_TIMEOUT", "30")
-                    ),
+                    timeout=self._timeout_seconds,
                 )
                 response.raise_for_status()
                 body = response.json()

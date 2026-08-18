@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
@@ -21,12 +22,16 @@ from ...baseline_control_plane_schema import (
     baseline_run_job,
     compatible_index_job,
 )
+from ...baseline_generation.ollama import (
+    OllamaBaselineGenerationProvider,
+    OllamaGenerationConfig,
+    validate_baseline_generation_endpoint,
+)
 from ...schema_migrations import (
     CORE_SCHEMA_MIGRATIONS,
     MIGRATION_TABLE_NAME,
     schema_migration_table,
 )
-from ..feedback import Reviewer
 from .control_plane_v2 import (
     V2IndexPublication,
     V2RunCapability,
@@ -231,26 +236,53 @@ class BaselineManualRunOperator:
         return self._outcome(row, replayed=receipt.replayed)
 
 
-def _configured_generation_provider() -> BaselineGenerationProvider:
-    reviewer = Reviewer()
+def _configured_generation_provider(settings: Any) -> BaselineGenerationProvider:
+    mode = str(getattr(settings, "baseline_generation_provider", "disabled"))
     try:
-        provider = ReviewerBaselineGenerationProvider(reviewer)
+        if mode == "ollama":
+            native = OllamaBaselineGenerationProvider(
+                OllamaGenerationConfig.from_settings(settings)
+            )
+            native.attest()
+            provider: BaselineGenerationProvider = native
+        elif mode == "http":
+            endpoint = getattr(settings, "baseline_generation_endpoint", None)
+            model = getattr(settings, "baseline_generation_model", None)
+            if (
+                not isinstance(endpoint, str)
+                or not endpoint
+                or not isinstance(model, str)
+            ):
+                raise ValueError("baseline HTTP generation is not configured")
+            endpoint = validate_baseline_generation_endpoint(
+                endpoint,
+                allow_loopback_http=bool(
+                    getattr(
+                        settings,
+                        "baseline_generation_allow_loopback_http",
+                        False,
+                    )
+                ),
+                require_root_path=False,
+            )
+            reviewer = SimpleNamespace(
+                provider="http",
+                custom_endpoint=endpoint,
+                model=model,
+                model_version=getattr(
+                    settings,
+                    "baseline_generation_model_version",
+                    None,
+                ),
+                baseline_timeout_seconds=float(
+                    getattr(settings, "baseline_generation_timeout_seconds", 60.0)
+                ),
+            )
+            provider = ReviewerBaselineGenerationProvider(reviewer)
+        else:
+            raise ValueError("baseline generation provider is disabled")
     except Exception:  # noqa: BLE001 - configuration boundary is sanitized
         raise BaselineRunRuntimeError("worker_unavailable") from None
-    if provider.provider in {"local", "http"}:
-        endpoint = (
-            getattr(reviewer, "endpoint", None)
-            if provider.provider == "local"
-            else getattr(reviewer, "custom_endpoint", None)
-        )
-        if not isinstance(endpoint, str) or not endpoint:
-            raise BaselineRunRuntimeError("worker_unavailable")
-    elif provider.provider == "openai":
-        client = getattr(reviewer, "_openai_client", None)
-        if client is None or not hasattr(client, "responses"):
-            raise BaselineRunRuntimeError("worker_unavailable")
-    else:
-        raise BaselineRunRuntimeError("worker_unavailable")
     if GENERATION_OUTPUT_SCHEMA_VERSION != "baseline-generation-output.v2":
         raise BaselineRunRuntimeError("worker_unavailable")
     if len(GENERATION_OUTPUT_SCHEMA_SHA256) != 64:
@@ -290,7 +322,11 @@ class BaselineRunRuntime:
                 else "embedding_unavailable"
             )
             raise BaselineRunRuntimeError(code) from None
-        self.provider = (provider_factory or _configured_generation_provider)()
+        self.provider = (
+            provider_factory()
+            if provider_factory is not None
+            else _configured_generation_provider(settings)
+        )
         executor = BaselineDocumentRunExecutor(
             engine,
             identity=InternalBaselineRunWorkerIdentity.create("manual-operator"),

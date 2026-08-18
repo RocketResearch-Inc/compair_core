@@ -1,4 +1,4 @@
-# Baseline local self-host runbook (provider-blocked draft)
+# Baseline local self-host runbook (orchestration draft)
 
 This is the shortest currently identifiable local sequence for
 `baseline_v1`. It is an audit artifact, not a supported release runbook.
@@ -22,11 +22,11 @@ checkpoint temporarily depends on the Core feature checkpoint's API and
 protocol behavior. This pair is a development checkpoint, not a releasable
 cross-branch combination; do not publish or automate it.
 
-Repository registration and scan-plan creation are supported after Phase
-2B2M.2. The sequence still cannot complete as a release workflow because no
-supported strict local generation service or managed BGE service is shipped.
-Local paths, remote display strings, friendly names, commits, and filesystem
-metadata are never repository authorization.
+Repository registration, scan-plan creation, pinned BGE, and native Ollama
+generation are supported after Phase 2B2M.3B. The sequence remains a
+development workflow until combined service orchestration and clean-machine
+acceptance are complete. Local paths, remote display strings, friendly names,
+commits, and filesystem metadata are never repository authorization.
 
 ## 1. Obtain and install the checkpoint sources
 
@@ -200,41 +200,34 @@ the wheel carries the machine-readable model manifest inside the package.
 
 ## 5. Start strict local generation
 
-The Core baseline adapter requires a provider that accepts
-`baseline-generation-input.v1` and returns:
-
-```json
-{
-  "content": "{\"schema_version\":\"baseline-generation-output.v2\",\"outcome\":\"findings\",\"findings\":[{\"feedback\":\"...\"}]}"
-}
-```
-
-The inner object may instead use `outcome: "no_findings"` with an empty
-`findings` array. Plain text, blank output, `NONE`, and malformed JSON are
-invalid.
-
-**STOP — missing supported service.** Native Ollama does not accept/return this
-envelope. The bundled local model also does not satisfy it. The temporary
-translation proxy used for development validation is not committed and must not
-be copied into this workflow. No safe command can be supplied for this step.
-
-After a production adapter exists, its expected Core settings are:
+Install Ollama separately and ensure the pinned model is already present. Core
+never pulls it. Configure the native provider with its exact immutable digest:
 
 ```sh
-export COMPAIR_GENERATION_PROVIDER=http
-export COMPAIR_GENERATION_ENDPOINT=http://127.0.0.1:<adapter-port>/<adapter-route>
-export COMPAIR_BASELINE_GENERATION_MODEL='<pinned-model-name>'
-export COMPAIR_BASELINE_GENERATION_MODEL_VERSION='<immutable-model-or-runtime-revision>'
-export COMPAIR_BASELINE_GENERATION_TIMEOUT=30
+export COMPAIR_BASELINE_GENERATION_PROVIDER=ollama
+export COMPAIR_BASELINE_GENERATION_ENDPOINT=http://127.0.0.1:11434
+export COMPAIR_BASELINE_GENERATION_MODEL=qwen3:1.7b
+export COMPAIR_BASELINE_GENERATION_MODEL_DIGEST=sha256:8f68893c685c3ddff2aa3fffce2aa60a30bb2da65ca488b61fff134a4d1730e7
+export COMPAIR_BASELINE_GENERATION_TIMEOUT_SECONDS=60
+export COMPAIR_BASELINE_GENERATION_ALLOW_LOOPBACK_HTTP=true
 ```
 
-Those settings currently share the legacy HTTP provider selector, while the
-baseline request/response shape differs from the legacy contract. A supported
-adapter and documentation must make that distinction explicit.
+Verify runtime, model, and digest without inference, then opt into one benign
+strict-schema probe:
+
+```sh
+compair-core-generation verify
+compair-core-generation verify --probe
+```
+
+Both commands emit exactly one safe JSON value. Native Core calls `/api/chat`
+directly with the exact packaged `baseline-generation-output.v2` schema; no
+translation proxy, legacy generation, automatic pull, or provider fallback is
+used. See [baseline-ollama-generation.md](baseline-ollama-generation.md).
 
 ## 6. Start API and worker
 
-Conditional on a compatible generation provider and identical environments:
+With the verified provider and identical API/worker environments:
 
 ```sh
 uvicorn compair_core.server.app:create_app \
@@ -250,9 +243,10 @@ compair-core-worker --poll
 Graceful SIGINT/SIGTERM stops new claims, drains the current call, updates the
 heartbeat, and exits. A hard stop relies on job lease expiry/reclaim.
 
-**Diagnostic gap:** there is no `compair baseline doctor`. API capabilities
-are checked internally by index/run commands, but several not-ready causes are
-reported only as `capability_unavailable` or `worker_unavailable`. Do not
+There is not yet a workflow-wide `compair baseline doctor`. API capabilities
+are checked internally by index/run commands, while
+`compair-core-generation verify` provides the detailed generation readiness
+states hidden behind the frozen `worker_unavailable` capability. Do not
 proceed if capability preflight is not `safe` and `ready` for the requested
 operation.
 
