@@ -77,7 +77,7 @@ def test_postgres_concurrent_execution_restart_and_exactly_one_effect_set(
 ) -> None:
     environment = postgres_control_environment
     assert read_schema_migration_state(environment.engine)[-1].migration_id == (
-        "0013_baseline_database_worker_v1"
+        "0014_baseline_worker_runtime_attestation_v1"
     )
     job_id = _submit(environment, "concurrent")
     barrier = threading.Barrier(2)

@@ -95,6 +95,7 @@ class Settings(BaseSettings):
     )
     baseline_embedding_batch_size: int = Field(default=32, ge=1, le=256)
     baseline_embedding_allow_insecure_loopback: bool = False
+    baseline_model_cache: str | None = None
 
     # Baseline generation is independent of legacy generation routing. The
     # native Ollama mode attests the configured tag's immutable digest before
@@ -141,6 +142,9 @@ class Settings(BaseSettings):
     # strict baseline-run-keyring.v1 JSON object parsed only by the run service.
     baseline_run_encryption_keyring: SecretStr | None = None
     baseline_run_payload_ttl_seconds: int = Field(default=900, ge=60, le=3600)
+
+    # Baseline notification delivery remains an explicit default-off setting.
+    baseline_notifications_enabled: bool = False
 
     # Core/local storage defaults
     local_upload_dir: str = "~/.compair-core/data/uploads"

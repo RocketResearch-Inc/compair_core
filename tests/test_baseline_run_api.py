@@ -38,7 +38,10 @@ from compair_core.compair.retrieval.control_plane_v2 import (
     PROTOCOL_V2_SHA256,
     PROTOCOL_V2_VERSION,
 )
-from compair_core.compair.retrieval.database_worker import DatabaseWorkerRegistry
+from compair_core.compair.retrieval.database_worker import (
+    DatabaseWorkerAttestation,
+    DatabaseWorkerRegistry,
+)
 from compair_core.compair.retrieval.generation import BaselineGenerationService
 from compair_core.compair.retrieval.persistent import PersistentBaselineV1Retriever
 from compair_core.compair.retrieval.preview import (
@@ -56,6 +59,7 @@ from compair_core.compair.retrieval.run_operator import (
     BaselineRunRuntimeError,
     process_baseline_run_job,
 )
+from compair_core.runtime_config import build_runtime_configuration
 from compair_core.server.settings import Settings
 
 SCHEMA = json.loads(
@@ -316,6 +320,12 @@ def test_database_mode_requires_recent_worker_and_admits_with_automatic_dispatch
     registry = DatabaseWorkerRegistry(
         environment.engine,
         heartbeat_ttl=timedelta(seconds=30),
+        attestation=DatabaseWorkerAttestation.from_runtime(
+            build_runtime_configuration(
+                settings,
+                database_url=environment.engine.url,
+            )
+        ),
     )
     registry.register(str(uuid4()))
     with client:

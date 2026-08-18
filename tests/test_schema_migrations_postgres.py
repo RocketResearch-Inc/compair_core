@@ -159,6 +159,7 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
             "0011_baseline_run_executor_v1",
             "0012_baseline_control_generation_v1",
             "0013_baseline_database_worker_v1",
+            "0014_baseline_worker_runtime_attestation_v1",
         )
         with scoped_engine.connect() as connection:
             assert connection.execute(
@@ -530,6 +531,7 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
             "0011_baseline_run_executor_v1",
             "0012_baseline_control_generation_v1",
             "0013_baseline_database_worker_v1",
+            "0014_baseline_worker_runtime_attestation_v1",
             first.migration_id,
         )
 
@@ -570,6 +572,7 @@ def test_postgres_publication_lock_restart_and_transactional_rollback() -> None:
             ("0011_baseline_run_executor_v1", "applied"),
             ("0012_baseline_control_generation_v1", "applied"),
             ("0013_baseline_database_worker_v1", "applied"),
+            ("0014_baseline_worker_runtime_attestation_v1", "applied"),
             (first.migration_id, "applied"),
             (second.migration_id, "failed"),
         ]

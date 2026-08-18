@@ -17,6 +17,7 @@ from datetime import timedelta
 from typing import Any
 from uuid import uuid4
 
+from pydantic import ValidationError
 from sqlalchemy.orm import sessionmaker
 
 from .compair.retrieval.continuation_worker import BaselineContinuationWorker
@@ -24,6 +25,7 @@ from .compair.retrieval.control_plane import BaselineControlPlaneService
 from .compair.retrieval.database_worker import (
     BaselineDatabaseWorker,
     DatabaseJobScheduler,
+    DatabaseWorkerAttestation,
     DatabaseWorkerError,
     DatabaseWorkerRegistry,
     ExistingServiceDispatcher,
@@ -37,6 +39,7 @@ from .compair.retrieval.index_continuation import (
 from .compair.retrieval.ingestion import CorpusIngestionService
 from .compair.retrieval.run_operator import BaselineRunRuntime
 from .db import engine
+from .runtime_config import validate_runtime_configuration
 from .server.settings import Settings, get_settings
 
 _LOGGER = logging.getLogger("compair_core.worker")
@@ -49,6 +52,14 @@ def build_database_worker(
     selected = settings or get_settings()
     if selected.baseline_worker_mode != "database":
         raise DatabaseWorkerError("worker_mode_manual")
+    try:
+        runtime_attestation = validate_runtime_configuration(
+            selected,
+            database_url=engine.url,
+            require_worker_baseline=True,
+        )
+    except Exception:  # noqa: BLE001 - startup failure is deliberately sanitized
+        raise DatabaseWorkerError("worker_configuration_invalid") from None
     sessions = sessionmaker(engine, expire_on_commit=False)
     continuation = BaselineContinuationWorker(
         engine,
@@ -64,6 +75,7 @@ def build_database_worker(
         heartbeat_ttl=timedelta(
             seconds=int(selected.baseline_worker_heartbeat_ttl_seconds)
         ),
+        attestation=DatabaseWorkerAttestation.from_runtime(runtime_attestation),
     )
     scheduler = DatabaseJobScheduler(
         engine,
@@ -126,11 +138,16 @@ def main(
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         stream=sys.stderr,
     )
+    for logger_name in ("httpx", "httpcore", "urllib3"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
     try:
         worker = worker_factory()
         worker.start()
     except DatabaseWorkerError as exc:
         _LOGGER.error("baseline_worker event=start_failed reason=%s", exc.code)
+        return 2
+    except ValidationError:
+        _LOGGER.error("baseline_worker event=start_failed reason=configuration_invalid")
         return 2
 
     stop_event = threading.Event()
@@ -140,20 +157,24 @@ def main(
         stop_event.set()
 
     previous: dict[int, Any] = {}
+    exit_code = 0
     try:
         if args.poll:
             for signum in (signal.SIGINT, signal.SIGTERM):
                 previous[signum] = signal.signal(signum, drain)
             worker.poll(stop_event)
-            return 0
-        result = worker.run_once()
-        if result is None:
-            return 0
-        return 1 if result.state in {"failed", "retryable_failed"} else 0
+        else:
+            result = worker.run_once()
+            if result is not None and result.state in {"failed", "retryable_failed"}:
+                exit_code = 1
+    except DatabaseWorkerError as exc:
+        _LOGGER.error("baseline_worker event=runtime_failed reason=%s", exc.code)
+        exit_code = 2
     finally:
         worker.close()
         for signum, handler in previous.items():
             signal.signal(signum, handler)
+    return exit_code
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised by entry-point smoke

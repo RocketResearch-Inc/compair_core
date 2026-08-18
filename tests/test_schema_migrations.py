@@ -112,6 +112,7 @@ def test_existing_startup_schema_gets_transactional_baseline_marker(
             "0011_baseline_run_executor_v1",
             "0012_baseline_control_generation_v1",
             "0013_baseline_database_worker_v1",
+            "0014_baseline_worker_runtime_attestation_v1",
         )
         assert staging_only.already_applied == ()
         assert continuation.already_applied == staging_only.applied
@@ -131,6 +132,7 @@ def test_existing_startup_schema_gets_transactional_baseline_marker(
             "0011_baseline_run_executor_v1",
             "0012_baseline_control_generation_v1",
             "0013_baseline_database_worker_v1",
+            "0014_baseline_worker_runtime_attestation_v1",
         )
         assert [(row.migration_id, row.state) for row in state] == [
             ("0000_core_schema_baseline", "applied"),
@@ -147,6 +149,7 @@ def test_existing_startup_schema_gets_transactional_baseline_marker(
             ("0011_baseline_run_executor_v1", "applied"),
             ("0012_baseline_control_generation_v1", "applied"),
             ("0013_baseline_database_worker_v1", "applied"),
+            ("0014_baseline_worker_runtime_attestation_v1", "applied"),
         ]
         assert [row.checksum for row in state] == [
             migration.checksum for migration in CORE_SCHEMA_MIGRATIONS

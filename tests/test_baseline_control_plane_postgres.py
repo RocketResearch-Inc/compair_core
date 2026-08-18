@@ -150,7 +150,7 @@ def test_postgres_migration_concurrent_staging_rollback_and_restart(
 ) -> None:
     environment = postgres_control_environment
     state = read_schema_migration_state(environment.engine)
-    assert state[-1].migration_id == "0013_baseline_database_worker_v1"
+    assert state[-1].migration_id == ("0014_baseline_worker_runtime_attestation_v1")
     assert state[-1].state == "applied"
 
     begin, content = _begin_payload(environment)

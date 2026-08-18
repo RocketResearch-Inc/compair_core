@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import ipaddress
 import json
+import logging
 import math
 import os
 import threading
@@ -399,6 +400,8 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    for logger_name in ("httpx", "httpcore", "urllib3"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
     runtime = BaselineEmbeddingRuntime(
         cache_root=args.cache_dir,
         threads=args.threads,
@@ -420,6 +423,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         workers=1,
         access_log=False,
         server_header=False,
+        log_level="warning",
         timeout_graceful_shutdown=10,
     )
     return 0

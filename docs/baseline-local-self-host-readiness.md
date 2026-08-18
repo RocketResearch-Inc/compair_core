@@ -47,8 +47,10 @@ the authority used by manifests. Paths, names, remotes, revisions, root commits,
 and the local Git sanity fingerprint do not authorize anything.
 
 The native Ollama generation adapter and installed verifier remove the prior
-translation-proxy blocker. Remaining release blockers are a reproducible local
-service stack, combined supervision, and workflow-wide operational diagnostics.
+translation-proxy blocker. Installed API, BGE service, database worker,
+runtime attestation, and workflow-wide doctor now provide reproducible
+individual-process operations. Combined supervision remains outside this
+phase; no Docker Compose or system-service claim is made.
 
 ## Classification
 
@@ -66,25 +68,25 @@ service stack, combined supervision, and workflow-wide operational diagnostics.
 | --- | --- | --- |
 | Install Core | **ready** | A clean Python 3.11 install with declared `dev,postgres` extras builds wheel/sdist; a fresh wheel install exposes `compair-core-worker`. |
 | Install CLI | **ready** | A clean Go build exposes baseline scan/upload/index/run/preview. It is temporarily paired to the Core feature checkpoint above. |
-| Initialize SQLite | **ready** | Import/startup creates the SQLite database and runs migrations `0000` through `0013`. No separate command inspects migration readiness. |
+| Initialize SQLite | **ready** | API/worker startup applies migrations `0000` through `0014`; read-only doctor reports pending/mismatched state without applying it. |
 | Initialize PostgreSQL | **requires manual/internal action** | PostgreSQL is supported and tested, but there is no supported baseline-ready compose profile. |
-| Start Core API | **ready from source or wheel** | `uvicorn compair_core.server.app:create_app --factory` uses only packaged runtime modules. |
+| Start Core API | **ready from source or wheel** | Installed `compair-core-api` defaults to loopback, disables access logging/proxy trust, and requires explicit non-loopback opt-in. |
 | Create/authenticate user | **ready** | Single-user mode auto-provisions a user/session; account mode has CLI signup/login. Baseline endpoints still require an authenticated identity. |
 | Create/select group | **ready** | `compair group create`, `group ls`, `group show`, and `group use` expose the group ID. |
 | Create authoritative source document | **ready** | `compair track`, `group files`, and `docs list --json` expose document IDs. |
 | Register repositories | **ready** | `baseline repository register/list/inspect/state/bind` uses authenticated Core services and protected local bindings. |
 | Configure AES-GCM keyring | **documented but manual** | `.env.example` now shows a deliberately nonfunctional structure. There is still no safe inspect/drain command for rotation. |
-| Start pinned BGE | **validation-only helper** | The source-only helper requires a pre-downloaded snapshot; there is no supported downloader, package entry point, image, or supervisor. |
+| Start pinned BGE | **ready**, conditional on explicit model fetch | Installed model fetch/verify/service commands use the frozen manifest, perform no serving-time download, and default to loopback. |
 | Configure strict local generation | **ready**, conditional on an installed pinned model | `compair-core-generation verify [--probe]` attests native Ollama and the exact structured-output schema without a proxy or fallback. |
 | Start `compair-core-worker` | **ready**, deployment manual | `compair-core-worker (--once | --poll)` is installed by the wheel. The CLI development compose worker remains unsuitable. |
-| Verify capabilities | **requires manual/internal action** | Commands preflight, but no standalone baseline doctor explains all not-ready causes. |
+| Verify capabilities | **ready** | `compair-core doctor [--json] [--require-baseline] [--probe-generation]` reports safe component reasons and exact API/worker runtime agreement. |
 | Create scan plan | **ready**, conditional on active registrations | `baseline plan create` resolves protected bindings, pins Git revisions, reauthorizes registrations, and writes the exact scanner-input contract. |
 | Scan | **ready**, conditional | `compair baseline scan --dry-run` emits JSON, is local-only, and fails closed. |
 | Upload and ingest | **ready**, conditional | Upload is resumable and the database worker can execute the continuation. |
 | Build index | **ready**, conditional | Requires a live, pinned BGE adapter and worker. |
 | Run | **ready**, conditional | Requires strict generation, keyring, worker, authorization, and the exact publication; there is no fallback. |
 | Preview | **ready**, conditional | Findings are returned in durable ordinal order. |
-| Shutdown/restart | **usable but undocumented as one stack** | Individual leases recover; no supported launcher verifies a common configuration. |
+| Shutdown/restart | **ready per process** | API and worker have stable installed launchers and deterministic graceful shutdown; combined supervision remains intentionally absent. |
 
 ## Identifier discovery
 
@@ -192,13 +194,12 @@ README describes the legacy HTTP generation shape (`length_instruction` and a
 response). A user following only the main setup material will configure an
 incompatible endpoint.
 
-API and worker processes independently construct settings from their own
-environments. A database heartbeat attests worker contract/job-type flags,
-capacity, and timestamps, but not a hash of database URL, embedding identity,
-generation identity, keyring availability, or relevant runtime configuration.
-Pinned job intent catches some mismatches later and fails closed; capabilities
-can still say a worker is present while its configuration differs from the API.
-That is safe against fallback but operationally silent drift.
+API and worker independently construct `baseline-runtime-config.v1` from their
+effective environments. Migration `0014` stores the worker's safe runtime,
+embedding, and generation fingerprints beside its heartbeat. Automatic
+readiness requires an exact API fingerprint match, and each worker re-attests
+before selecting work. `compair-core doctor` reports safe mismatch, stale,
+drain, and capacity causes while omitting DSNs, URLs, paths, and secrets.
 
 ### Capability truthfulness
 
@@ -254,13 +255,15 @@ this audit. The BGE validation environment is pinned to Python 3.11 but has no
 documented macOS-arm64 versus Linux-amd64 compatibility matrix. The exact
 snapshot ran previously on this macOS host; a clean Linux run was not executed.
 
-Checkpoint package checks found:
+Checkpoint package checks, updated by the current M4 implementation, found:
 
 - the clean CLI builds with baseline scan/upload/index/run/preview commands;
-- the clean Core wheel contains API startup, migrations `0000` through `0013`,
+- the Core wheel contains installed API/doctor startup, migrations `0000`
+  through `0014`,
   control-plane v1/v2, database worker, corpus ingestion, index publication,
   run execution, evidence persistence, generation coordination, notification
-  outbox, preview, and the `compair-core-worker` entry point;
+  outbox, preview, and the API, worker, BGE, Ollama-verifier, and doctor entry
+  points;
 - runtime code does not open top-level `protocol/`, `docs/`, or `scripts/` paths;
   protocol identities and schemas used at runtime are frozen in package modules,
   while repository tests enforce byte/hash identity against Core and CLI copies;
@@ -311,7 +314,7 @@ orchestrator.
 
 | Proposed addition | Recommendation | Why |
 | --- | --- | --- |
-| `compair baseline doctor` | add | One authenticated read should report protocol pins and each prerequisite separately, including API/worker configuration identity agreement. It must not print endpoints or secrets. |
+| `compair-core doctor` | implemented | The installed read-only command reports protocol/provider pins and each prerequisite separately, including exact API/worker runtime identity agreement, without endpoints or secrets. |
 | repository register/list/state CLI | add after local identity policy is approved | This closes the first authorization/ID-discovery gap. Restrict mutation to group admins and make descriptor provenance explicit. |
 | local initialization/bootstrap | keep narrow | Add a command that creates/prints safe group/document references and writes an example plan, but do not let it invent repository authority or hide approval. |
 | production BGE adapter | promote and package | Reuse the existing protocol/helper; add model acquisition consent, hash verification, health wait, launcher/image, and platform tests. Do not create another protocol. |
@@ -320,20 +323,18 @@ orchestrator.
 | service launcher/Compose profile | add | Launch API, worker, PostgreSQL (optional), BGE, and strict generation with health ordering and persistent volumes. SQLite should remain a supported smaller profile. |
 | one end-to-end tutorial | add last | Generate it from the acceptance path so every command is continuously checked. |
 
-`compair doctor` and the proposed baseline doctor should be consolidated where
-possible: baseline checks can be a versioned section/subcommand rather than a
-second unrelated diagnostic framework. Likewise, promote the existing BGE
-adapter instead of adding a second embedding protocol. Remove the placeholder
-sleep worker and hash-model service from any profile advertised for
-`baseline_v1`; they may remain clearly labeled legacy/demo services.
+The Core-only diagnostic is exposed as `compair-core doctor` with the stable
+`baseline-doctor-result.v1` JSON contract. It does not add a competing CLI
+workflow command. The existing BGE protocol is reused. Placeholder sleep/hash
+services must not appear in any profile advertised for `baseline_v1`; they may
+remain clearly labeled legacy/demo services.
 
 ## Highest-priority gaps
 
 1. **Supported local providers:** keep the packaged pinned BGE service and native
    Ollama adapter under clean-install and live compatibility validation.
-2. **One truthful service configuration:** ship a complete service/compose
-   profile, attest API/worker config agreement, and make readiness diagnostics
-   actionable.
+2. **One truthful service configuration:** runtime attestation and doctor are
+   implemented; a future complete service/Compose profile may consume them.
 3. **Operations and retention:** add stale-resume inspection/cleanup, safe
    key-rotation inspection, and an authorized/audited retention purge policy.
 
@@ -364,14 +365,13 @@ compatibility, disable/reactivate, and no-disclosure tests cover the workflow.
 The pinned BGE acquisition, verification, and loopback service are installed
 with Core's `baseline-embedding` extra. Native Ollama generation and its
 installed verifier now use the exact frozen output schema without a proxy.
-Remaining M3 work is broader service orchestration and combined configuration
-diagnostics.
+Remaining M3 work is broader service orchestration. Combined configuration
+attestation and diagnostics are implemented by `baseline-runtime-config.v1`
+and `compair-core doctor`.
 
 Remaining likely files:
 
-- compose/service definitions and combined supervisor health checks; and
-- API/worker configuration-fingerprint heartbeat fields through a new reviewed
-  migration if durable attestation is chosen.
+- compose/service definitions and combined supervisor health checks.
 
 Required tests:
 
@@ -382,14 +382,18 @@ Required tests:
 - API/worker configuration mismatch is visible and pre-write fail-closed; and
 - no legacy/hash fallback.
 
-### M4 — operations, acceptance, and tutorial
+### M4 — operations and acceptance (current implementation)
 
-Likely files:
+Implemented here:
 
-- baseline doctor, resume-state inspect/prune, keyring reference inspection, and
-  authorized retention tooling;
-- SQLite/PostgreSQL launcher profiles and shutdown/backup documentation; and
-- one generated/checked self-host tutorial plus clean-machine CI harness.
+- stable installed API startup and deterministic worker/API shutdown behavior;
+- `baseline-runtime-config.v1`, migration-owned matching worker heartbeats, and
+  read-only `baseline-doctor-result.v1`; and
+- per-process startup/readiness/privacy documentation.
+
+Still outside this phase are resume-state prune, key rotation or retention
+mutation, Compose/system-service definitions, and a generated clean-machine
+tutorial/CI harness.
 
 Required tests are the acceptance plan below, plus interrupted startup,
 shutdown, replay, key rotation, retention authorization/audit, and proxy-log
@@ -464,7 +468,7 @@ documentation.
   directory and confirmed the starting checkpoint SHAs above;
 - installed Core on Python 3.11 with declared `dev,postgres` extras, built wheel
   and sdist, installed the wheel non-editably, imported API/worker modules, and
-  enumerated migrations `0000` through `0013`;
+  enumerated migrations `0000` through `0014`;
 - ran installed `compair-core-worker --help`: exit 0;
 - built the clean CLI and ran baseline plus scan/upload/index/run/preview help:
   every command exited 0;

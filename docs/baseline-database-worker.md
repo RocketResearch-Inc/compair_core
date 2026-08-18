@@ -48,6 +48,13 @@ ID, `baseline-database-worker.v1`, supported job-type flags, safe timestamps,
 draining state, and bounded capacity counts. They deliberately contain no host,
 path, endpoint, environment value, credential, lease, or job payload.
 
+Forward migration `0014_baseline_worker_runtime_attestation_v1` adds the
+one-to-one `baseline_database_worker_attestation` row. It records only the
+`baseline-runtime-config.v1` version and exact runtime, embedding-identity, and
+generation-identity SHA-256 fingerprints. Instance deletion cascades this
+operational row. No environment value, URL, DSN, path, key, payload, or job
+identity is stored.
+
 The defaults are a five-second heartbeat and 30-second health TTL. SQLite
 permits one recent active worker/concurrency slot. PostgreSQL permits multiple
 workers; readiness sums their advertised one-process slots. Automatic run or
@@ -55,8 +62,13 @@ index submission is ready only when the application runtime is ready, migration
 and database validators pass, a recent non-draining worker supports the job and
 cleanup types, and pending work is below the capacity threshold. Missing or
 full automatic dispatch is `not_ready/worker_unavailable`; there is no fallback
-to manual. Existing exact run submission replays remain read-only and never
-extend protected payload expiry.
+to manual. The API computes its own canonical runtime fingerprint and requires
+an exact recent heartbeat match. A healthy but differently configured worker
+is counted as mismatched, does not make readiness safe, and re-attests before
+selecting any job. Existing exact run submission replays remain read-only and
+never extend protected payload expiry. See
+[baseline runtime operations](baseline-runtime-operations.md) for the canonical
+field and doctor contracts.
 
 ## Scheduling and backpressure
 
@@ -96,7 +108,8 @@ and recoverable post-commit continuation. Stale worker heartbeats are deleted
 after the TTL. Cleanup failures and service failures are logged only with
 opaque IDs and frozen safe reason codes.
 
-Worker logs may contain worker/job UUIDs, job type/state, attempts, safe counts,
-elapsed time, and already-permitted fingerprints. They must never contain raw
+Worker logs may contain job type/state, attempts, safe counts, elapsed time,
+and already-permitted fingerprints. They do not contain worker/job UUIDs and
+must never contain raw
 queries, encrypted fields, source paths/content, evidence, prompts/responses,
 Feedback, credentials, idempotency material, nonces, keys, or lease tokens.

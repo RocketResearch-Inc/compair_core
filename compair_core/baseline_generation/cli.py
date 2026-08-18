@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from collections.abc import Sequence
 
 from ..server.settings import Settings
@@ -30,6 +31,8 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    for logger_name in ("httpx", "httpcore", "urllib3"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
     try:
         result = verify_ollama_generation(Settings(), probe=bool(args.probe))
     except Exception:  # noqa: BLE001 - command output must remain sanitized JSON

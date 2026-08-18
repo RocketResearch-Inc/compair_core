@@ -225,3 +225,8 @@ python scripts/live_baseline_retrieval_validation.py \
 The script prints only corpus/index identifiers, attested identity, selected
 paths, and query provenance hash/length/origin. Its in-memory sentinel query is
 asserted absent from the retrieval result representation and serialized output.
+
+For workflow-wide inspection, `compair-core doctor` verifies the packaged
+model manifest/cache and the service's exact health identity. It reports only
+safe fingerprints, dimension/dtype, and reason codes—never the cache path or
+endpoint URL. Doctor does not fetch models or embed private text.

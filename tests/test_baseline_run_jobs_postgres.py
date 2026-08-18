@@ -52,7 +52,7 @@ def test_postgres_run_job_migration_concurrency_restart_rollback_and_erasure(
 ) -> None:
     environment = postgres_control_environment
     assert read_schema_migration_state(environment.engine)[-1].migration_id == (
-        "0013_baseline_database_worker_v1"
+        "0014_baseline_worker_runtime_attestation_v1"
     )
     payload = _run_payload(environment)
     submission = parse_run_submission(payload)

@@ -54,13 +54,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             allow_headers=["*"],
         )
 
-    from ..api import core_router, router as legacy_router
+    from ..api import core_router
+    from ..api import router as legacy_router
 
     if edition == "cloud":
         app.include_router(legacy_router)
         try:
             from compair_cloud.api.billing_routes import router as cloud_billing_router
-            from compair_cloud.api.google_oauth_routes import router as cloud_google_oauth_router
+            from compair_cloud.api.google_oauth_routes import (
+                router as cloud_google_oauth_router,
+            )
         except ImportError as exc:  # pragma: no cover - only triggered in misconfigured builds
             raise RuntimeError(
                 "Cloud edition requires the private 'compair_cloud' package to be installed."
@@ -153,7 +156,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             base_url=resolved_settings.local_upload_base_url,
         )
         app.dependency_overrides[get_storage] = _constant_dependency(storage_provider)
-        start_usage_telemetry(resolved_settings)
+        # Optional telemetry begins only at ASGI startup. Importing the app
+        # factory never creates a background thread.
+        app.router.add_event_handler(
+            "startup",
+            lambda: start_usage_telemetry(resolved_settings),
+        )
 
     return app
 

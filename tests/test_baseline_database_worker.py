@@ -9,7 +9,8 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import inspect, select, text
+from sqlalchemy import inspect, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from test_baseline_control_generation import _structured
 from test_baseline_control_plane import (
@@ -37,6 +38,7 @@ from compair_core import worker as worker_module
 from compair_core.baseline_control_plane_schema import (
     baseline_run_job,
     baseline_run_payload,
+    baseline_worker_attestation,
     baseline_worker_instance,
     compatible_index_job,
 )
@@ -48,11 +50,13 @@ from compair_core.compair.retrieval.control_plane_v2 import (
 )
 from compair_core.compair.retrieval.corpus import RetrievalBaselineIndexBuild
 from compair_core.compair.retrieval.database_worker import (
+    DATABASE_WORKER_ATTESTATION_MIGRATION_ID,
     DATABASE_WORKER_CONTRACT_VERSION,
     DATABASE_WORKER_MIGRATION_ID,
     MAXIMUM_URGENT_RUN_BURST,
     BaselineDatabaseWorker,
     DatabaseJobScheduler,
+    DatabaseWorkerAttestation,
     DatabaseWorkerCandidate,
     DatabaseWorkerDispatchResult,
     DatabaseWorkerError,
@@ -62,6 +66,7 @@ from compair_core.compair.retrieval.database_worker import (
 )
 from compair_core.compair.retrieval.persistent import published_index_fingerprint
 from compair_core.compair.retrieval.run_jobs import BaselineRunJobService
+from compair_core.runtime_config import build_runtime_configuration
 from compair_core.schema_migrations import read_schema_migration_state
 from compair_core.server.settings import Settings
 from compair_core.worker import main as worker_main
@@ -192,11 +197,12 @@ def test_worker_settings_default_manual_and_entrypoint_surface() -> None:
     assert "import redis" not in source.lower()
 
 
-def test_migration_0013_owns_privacy_safe_heartbeat_table(
+def test_migrations_0013_and_0014_own_privacy_safe_worker_state(
     environment: ControlEnvironment,
 ) -> None:
     state = read_schema_migration_state(environment.engine)
-    assert state[-1].migration_id == DATABASE_WORKER_MIGRATION_ID
+    assert state[-2].migration_id == DATABASE_WORKER_MIGRATION_ID
+    assert state[-1].migration_id == DATABASE_WORKER_ATTESTATION_MIGRATION_ID
     assert state[-1].state == "applied"
     columns = {
         column["name"]
@@ -228,6 +234,30 @@ def test_migration_0013_owns_privacy_safe_heartbeat_table(
             "query",
         }
         & columns
+    )
+    attestation_columns = {
+        column["name"]
+        for column in inspect(environment.engine).get_columns(
+            "baseline_database_worker_attestation"
+        )
+    }
+    assert attestation_columns == {
+        "worker_instance_id",
+        "runtime_config_contract_version",
+        "runtime_config_fingerprint",
+        "embedding_identity_fingerprint",
+        "generation_identity_fingerprint",
+    }
+    assert (
+        not {
+            "hostname",
+            "path",
+            "endpoint",
+            "credential",
+            "payload",
+            "query",
+        }
+        & attestation_columns
     )
 
 
@@ -285,6 +315,109 @@ def test_bounded_backpressure_is_fail_closed(
     assert not full.ready
     assert full.reason_code == "worker_unavailable"
     assert full.maximum_pending == 1
+
+
+def test_runtime_mismatch_cannot_satisfy_readiness_or_reach_selection(
+    environment: ControlEnvironment,
+) -> None:
+    settings = SimpleNamespace()
+    runtime = build_runtime_configuration(
+        settings,
+        database_url=environment.engine.url,
+    )
+    registry = DatabaseWorkerRegistry(
+        environment.engine,
+        heartbeat_ttl=timedelta(seconds=30),
+        attestation=DatabaseWorkerAttestation.from_runtime(runtime),
+    )
+    worker_id = str(uuid4())
+    registry.register(worker_id)
+    mismatch = registry.readiness(
+        required_job_types=("baseline_run",),
+        pending_count=0,
+        maximum_pending_per_slot=8,
+        required_runtime_config_fingerprint="0" * 64,
+    )
+    assert not mismatch.ready
+    assert mismatch.mismatched_workers == 1
+
+    scheduler = FixedScheduler([_candidate()])
+    worker = BaselineDatabaseWorker(
+        registry=registry,
+        scheduler=scheduler,
+        dispatcher=RecordingDispatcher(),
+        cleanup_callbacks=(),
+        worker_instance_id=worker_id,
+        heartbeat_interval_seconds=60,
+    )
+    worker.start()
+    with environment.engine.begin() as connection:
+        connection.execute(
+            update(baseline_worker_attestation)
+            .where(baseline_worker_attestation.c.worker_instance_id == worker_id)
+            .values(runtime_config_fingerprint="0" * 64)
+        )
+    with pytest.raises(DatabaseWorkerError, match="worker_configuration_mismatch"):
+        worker.run_once()
+    assert scheduler.calls == 0
+    worker.close()
+    assert worker._heartbeat_thread is not None
+    assert not worker._heartbeat_thread.is_alive()
+
+
+def test_entrypoint_runtime_drift_is_sanitized_and_exits_cleanly(
+    environment: ControlEnvironment,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    worker = _worker(
+        environment,
+        scheduler=FixedScheduler([_candidate()]),
+        dispatcher=RecordingDispatcher(),
+    )
+
+    original_start = worker.start
+
+    def start_with_drift() -> None:
+        original_start()
+        with environment.engine.begin() as connection:
+            connection.execute(
+                update(baseline_worker_attestation)
+                .where(
+                    baseline_worker_attestation.c.worker_instance_id
+                    == worker.worker_instance_id
+                )
+                .values(runtime_config_fingerprint="0" * 64)
+            )
+
+    worker.start = start_with_drift  # type: ignore[method-assign]
+    caplog.set_level(logging.INFO)
+    assert worker_main(["--once"], worker_factory=lambda: worker) == 2
+    assert worker._heartbeat_thread is not None
+    assert not worker._heartbeat_thread.is_alive()
+    assert "worker_configuration_mismatch" in caplog.text
+    assert worker.worker_instance_id not in caplog.text
+
+
+def test_database_rejects_worker_with_incomplete_job_type_support(
+    environment: ControlEnvironment,
+) -> None:
+    now = datetime.now(timezone.utc)
+    with pytest.raises(IntegrityError), environment.engine.begin() as connection:
+        connection.execute(
+            baseline_worker_instance.insert().values(
+                worker_instance_id=str(uuid4()),
+                worker_contract_version=DATABASE_WORKER_CONTRACT_VERSION,
+                supports_corpus_ingestion=True,
+                supports_index_build=True,
+                supports_baseline_run=False,
+                supports_cleanup=True,
+                started_at=now,
+                last_heartbeat_at=now,
+                draining=False,
+                concurrency_limit=1,
+                active_count=0,
+            )
+        )
 
 
 def test_scheduler_is_oldest_first_across_lanes_with_bounded_run_urgency(
@@ -404,7 +537,8 @@ def test_once_uses_opaque_candidate_invokes_cleanup_and_exits_draining(
         )
     assert heartbeat["draining"] is True
     assert heartbeat["active_count"] == 0
-    assert candidate.job_id in caplog.text
+    assert candidate.job_id not in caplog.text
+    assert worker.worker_instance_id not in caplog.text
     for forbidden in (
         "retrieval_query",
         "ciphertext",
@@ -476,7 +610,15 @@ def test_readiness_helper_reports_missing_then_recent_worker(
         required_job_types=("index_build",),
     )
     assert not missing.ready
-    _registry(environment).register(str(uuid4()))
+    runtime = build_runtime_configuration(
+        settings,
+        database_url=environment.engine.url,
+    )
+    DatabaseWorkerRegistry(
+        environment.engine,
+        heartbeat_ttl=timedelta(seconds=30),
+        attestation=DatabaseWorkerAttestation.from_runtime(runtime),
+    ).register(str(uuid4()))
     ready = assess_database_worker_readiness(
         environment.engine,
         settings,

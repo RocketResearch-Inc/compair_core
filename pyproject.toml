@@ -35,6 +35,8 @@ dependencies = [
 ]
 
 [project.scripts]
+compair-core = "compair_core.doctor:main"
+compair-core-api = "compair_core.api_cli:main"
 compair-core-worker = "compair_core.worker:main"
 compair-core-models = "compair_core.baseline_embedding.model_cli:main"
 compair-core-embedding-service = "compair_core.baseline_embedding.service:main"

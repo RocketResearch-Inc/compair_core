@@ -36,10 +36,12 @@ from compair_core.baseline_control_plane_schema import (
     BASELINE_RUN_PAYLOAD_TABLE,
     BASELINE_RUN_WORKER_CONTRACT_VERSION,
     BASELINE_RUN_WORKER_SERVICE_ID,
+    BASELINE_WORKER_ATTESTATION_TABLE,
     BASELINE_WORKER_INSTANCE_TABLE,
     COMPATIBLE_INDEX_JOB_TABLE,
     CONTINUATION_CONTROL_PLANE_TABLES,
     CONTROL_JOB_TABLE,
+    DATABASE_WORKER_ATTESTATION_TABLES,
     DATABASE_WORKER_TABLES,
     INDEX_CONTROL_PLANE_TABLES,
     REPOSITORY_APPROVAL_TABLE,
@@ -3607,6 +3609,44 @@ def _validate_baseline_database_worker(connection: Connection) -> None:
         raise SchemaInvariantError("baseline_database_worker_index_missing")
 
 
+def _upgrade_baseline_worker_runtime_attestation(connection: Connection) -> None:
+    for table in DATABASE_WORKER_ATTESTATION_TABLES:
+        connection.execute(CreateTable(table, if_not_exists=True))
+        for index in sorted(table.indexes, key=lambda candidate: candidate.name or ""):
+            connection.execute(CreateIndex(index, if_not_exists=True))
+
+
+def _validate_baseline_worker_runtime_attestation(connection: Connection) -> None:
+    if BASELINE_WORKER_ATTESTATION_TABLE not in set(
+        inspect(connection).get_table_names()
+    ):
+        raise SchemaInvariantError("baseline_worker_attestation_table_missing")
+    table = DATABASE_WORKER_ATTESTATION_TABLES[0]
+    if not {column.name for column in table.columns} <= _column_names(
+        connection, BASELINE_WORKER_ATTESTATION_TABLE
+    ):
+        raise SchemaInvariantError("baseline_worker_attestation_column_missing")
+    if "ck_bl_db_worker_attestation_contract" not in _constraint_names(
+        connection,
+        BASELINE_WORKER_ATTESTATION_TABLE,
+        "check",
+    ):
+        raise SchemaInvariantError("baseline_worker_attestation_check_missing")
+    if "ix_bl_db_worker_attestation_runtime" not in _index_names(
+        connection,
+        BASELINE_WORKER_ATTESTATION_TABLE,
+    ):
+        raise SchemaInvariantError("baseline_worker_attestation_index_missing")
+    foreign_keys = {
+        str(item.get("name"))
+        for item in inspect(connection).get_foreign_keys(
+            BASELINE_WORKER_ATTESTATION_TABLE
+        )
+    }
+    if "fk_bl_db_worker_attestation_instance" not in foreign_keys:
+        raise SchemaInvariantError("baseline_worker_attestation_foreign_key_missing")
+
+
 CORE_SCHEMA_MIGRATIONS: tuple[SchemaMigration, ...] = (
     SchemaMigration(
         migration_id="0000_core_schema_baseline",
@@ -3827,6 +3867,19 @@ CORE_SCHEMA_MIGRATIONS: tuple[SchemaMigration, ...] = (
         ),
         upgrade=_upgrade_baseline_database_worker,
         validate=_validate_baseline_database_worker,
+    ),
+    SchemaMigration(
+        migration_id="0014_baseline_worker_runtime_attestation_v1",
+        description=("Add privacy-safe worker runtime configuration attestation"),
+        checksum_material=(
+            "baseline-runtime-config.v1; one-to-one cascade extension of "
+            "baseline_database_worker_instance; exact runtime, embedding and "
+            "generation SHA-256 fingerprints; no endpoint, DSN, path, secret, "
+            "payload or job identity; runtime fingerprint lookup index; SQLite "
+            "and PostgreSQL additive portable DDL; ddl-v1"
+        ),
+        upgrade=_upgrade_baseline_worker_runtime_attestation,
+        validate=_validate_baseline_worker_runtime_attestation,
     ),
 )
 

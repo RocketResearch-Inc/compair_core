@@ -193,6 +193,15 @@ job data. SQLite enforces one recent non-draining worker; PostgreSQL permits
 multiple compatible instances. Stale rows are operational metadata and may be
 deleted after the configured heartbeat TTL.
 
+`0014_baseline_worker_runtime_attestation_v1` additively creates
+`baseline_database_worker_attestation` without changing migration `0013`.
+Each row is a one-to-one, cascading extension of a worker instance and stores
+the exact `baseline-runtime-config.v1`, embedding identity, and generation
+identity SHA-256 fingerprints. The migration validates its contract check,
+foreign key, and runtime lookup index on SQLite and PostgreSQL. Failed DDL or
+validation rolls back with the migration batch; it stores no endpoint, DSN,
+path, secret, protected payload, or job identity.
+
 ## Failure recovery and rollback
 
 This is a forward-only runner. “Rollback” has two distinct meanings:

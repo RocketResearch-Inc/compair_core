@@ -396,6 +396,7 @@ def test_sqlite_copied_legacy_database_upgrade_preserves_reference_order_and_byt
             "0011_baseline_run_executor_v1",
             "0012_baseline_control_generation_v1",
             "0013_baseline_database_worker_v1",
+            "0014_baseline_worker_runtime_attestation_v1",
         )
         with engine.connect() as connection:
             after = connection.execute(
@@ -437,6 +438,7 @@ def test_sqlite_copied_legacy_database_upgrade_preserves_reference_order_and_byt
             "0011_baseline_run_executor_v1",
             "0012_baseline_control_generation_v1",
             "0013_baseline_database_worker_v1",
+            "0014_baseline_worker_runtime_attestation_v1",
         ]
 
         forbidden = {"retrieval_query", "query_text", "raw_query", "document_id"}
@@ -466,6 +468,7 @@ def test_sqlite_copied_legacy_database_upgrade_preserves_reference_order_and_byt
             "0011_baseline_run_executor_v1",
             "0012_baseline_control_generation_v1",
             "0013_baseline_database_worker_v1",
+            "0014_baseline_worker_runtime_attestation_v1",
         )
         with engine.connect() as connection:
             assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
@@ -1316,6 +1319,7 @@ def test_sqlite_failed_retention_copy_swap_rolls_back_and_recovers(
             "0011_baseline_run_executor_v1",
             "0012_baseline_control_generation_v1",
             "0013_baseline_database_worker_v1",
+            "0014_baseline_worker_runtime_attestation_v1",
         )
         assert {
             column["name"]: column["nullable"]
@@ -1375,6 +1379,7 @@ def test_sqlite_failed_generation_state_copy_swap_rolls_back_and_recovers(
             "0011_baseline_run_executor_v1",
             "0012_baseline_control_generation_v1",
             "0013_baseline_database_worker_v1",
+            "0014_baseline_worker_runtime_attestation_v1",
         )
         assert "generation_lease_token" in {
             column["name"]
@@ -1435,6 +1440,7 @@ def test_sqlite_failed_bridge_migration_requires_reviewed_recovery(
             "0011_baseline_run_executor_v1",
             "0012_baseline_control_generation_v1",
             "0013_baseline_database_worker_v1",
+            "0014_baseline_worker_runtime_attestation_v1",
         )
     finally:
         engine.dispose()

@@ -230,8 +230,7 @@ used. See [baseline-ollama-generation.md](baseline-ollama-generation.md).
 With the verified provider and identical API/worker environments:
 
 ```sh
-uvicorn compair_core.server.app:create_app \
-  --factory --host 127.0.0.1 --port 8000
+compair-core-api --host 127.0.0.1 --port 8000
 ```
 
 Then start the durable worker from the same Core checkout/environment:
@@ -243,12 +242,24 @@ compair-core-worker --poll
 Graceful SIGINT/SIGTERM stops new claims, drains the current call, updates the
 heartbeat, and exits. A hard stop relies on job lease expiry/reclaim.
 
-There is not yet a workflow-wide `compair baseline doctor`. API capabilities
-are checked internally by index/run commands, while
-`compair-core-generation verify` provides the detailed generation readiness
-states hidden behind the frozen `worker_unavailable` capability. Do not
-proceed if capability preflight is not `safe` and `ready` for the requested
-operation.
+Before starting the worker, inspect the common environment and database:
+
+```sh
+compair-core doctor --json
+```
+
+Automatic dispatch must be not ready until a matching worker heartbeat exists.
+After starting the worker, require complete baseline readiness:
+
+```sh
+compair-core doctor --require-baseline
+```
+
+Add `--probe-generation` only when explicitly choosing the synthetic Ollama
+schema inference. Doctor never prints endpoints, DSNs, paths, secrets, job IDs,
+or private content. Do not proceed if either doctor or capability preflight is
+not ready for the requested operation. See
+[baseline-runtime-operations.md](baseline-runtime-operations.md).
 
 ## 7. Authenticate, select a group, and create the source document
 

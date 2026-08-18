@@ -8,6 +8,7 @@ from ...compair.notifications.service import is_scoring_enabled
 from ...compair.retrieval.embedding import assess_baseline_embedding
 from ...compair.retrieval.transport import assess_retrieval_query_transport
 from ...db import engine
+from ...runtime_config import build_runtime_configuration
 from ..settings import Settings, get_settings
 
 router = APIRouter(tags=["meta"])
@@ -30,8 +31,23 @@ def _baseline_embedding(settings: Settings) -> dict[str, object]:
     return assess_baseline_embedding(settings).as_dict()
 
 
+def _runtime_configuration(settings: Settings) -> dict[str, object]:
+    try:
+        return build_runtime_configuration(
+            settings,
+            database_url=engine.url,
+        ).safe_summary()
+    except Exception:  # noqa: BLE001 - capability output is non-reflective
+        return {
+            "contract_version": "baseline-runtime-config.v1",
+            "status": "unavailable",
+        }
+
+
 @router.get("/capabilities")
-def capabilities(settings: Settings = Depends(get_settings)) -> dict[str, object]:
+def capabilities(
+    settings: Settings = Depends(get_settings),  # noqa: B008 - FastAPI dependency
+) -> dict[str, object]:
     edition = settings.edition.lower()
     require_auth = settings.require_authentication
     google_oauth_configured = (
@@ -76,6 +92,7 @@ def capabilities(settings: Settings = Depends(get_settings)) -> dict[str, object
             "notification_delivery": edition == "cloud",
         },
         "baseline_embedding": _baseline_embedding(settings),
+        "baseline_runtime_configuration": _runtime_configuration(settings),
         "retrieval_query_transport": _retrieval_query_transport(settings),
         "server": "Compair Cloud" if edition == "cloud" else "Compair Core",
         "version": settings.version,
@@ -84,7 +101,9 @@ def capabilities(settings: Settings = Depends(get_settings)) -> dict[str, object
 
 
 @router.get("/health")
-def health(settings: Settings = Depends(get_settings)) -> dict[str, object]:
+def health(
+    settings: Settings = Depends(get_settings),  # noqa: B008 - FastAPI dependency
+) -> dict[str, object]:
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
@@ -95,5 +114,6 @@ def health(settings: Settings = Depends(get_settings)) -> dict[str, object]:
         "edition": settings.edition,
         "version": settings.version,
         "baseline_embedding": _baseline_embedding(settings),
+        "baseline_runtime_configuration": _runtime_configuration(settings),
         "retrieval_query_transport": _retrieval_query_transport(settings),
     }

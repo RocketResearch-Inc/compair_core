@@ -42,6 +42,7 @@ from compair_core.compair.retrieval.control_plane_v2 import (
     assess_index_build_capability,
 )
 from compair_core.compair.retrieval.database_worker import (
+    DatabaseWorkerAttestation,
     DatabaseWorkerRegistry,
 )
 from compair_core.compair.retrieval.index_continuation import (
@@ -50,6 +51,7 @@ from compair_core.compair.retrieval.index_continuation import (
 from compair_core.compair.retrieval.indexing import (
     baseline_engine_config_fingerprint,
 )
+from compair_core.runtime_config import build_runtime_configuration
 
 SCHEMA = json.loads(
     (
@@ -171,6 +173,12 @@ def test_v2_database_dispatch_capability_and_exact_replay_under_backpressure(
     DatabaseWorkerRegistry(
         environment.engine,
         heartbeat_ttl=timedelta(seconds=30),
+        attestation=DatabaseWorkerAttestation.from_runtime(
+            build_runtime_configuration(
+                settings,
+                database_url=environment.engine.url,
+            )
+        ),
     ).register(str(uuid4()))
     client, _service_instance = _client(environment, monkeypatch)
     payload = _v2_payload(environment)

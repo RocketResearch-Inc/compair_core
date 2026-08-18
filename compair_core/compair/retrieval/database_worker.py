@@ -23,14 +23,21 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from ...baseline_control_plane_schema import (
     BASELINE_DATABASE_WORKER_CONTRACT_VERSION,
+    BASELINE_WORKER_ATTESTATION_TABLE,
     BASELINE_WORKER_INSTANCE_TABLE,
     baseline_run_job,
     baseline_run_payload,
+    baseline_worker_attestation,
     baseline_worker_instance,
     control_job,
     snapshot_continuation_job,
 )
 from ...baseline_evidence_schema import baseline_retrieval_run
+from ...runtime_config import (
+    RUNTIME_CONFIG_CONTRACT_VERSION,
+    RuntimeConfigurationAttestation,
+    build_runtime_configuration,
+)
 from ...schema_migrations import (
     CORE_SCHEMA_MIGRATIONS,
     schema_migration_table,
@@ -51,6 +58,7 @@ from .run_operator import (
 )
 
 DATABASE_WORKER_MIGRATION_ID = "0013_baseline_database_worker_v1"
+DATABASE_WORKER_ATTESTATION_MIGRATION_ID = "0014_baseline_worker_runtime_attestation_v1"
 DATABASE_WORKER_CONTRACT_VERSION = BASELINE_DATABASE_WORKER_CONTRACT_VERSION
 DATABASE_WORKER_SUPPORTED_JOB_TYPES = (
     "corpus_ingestion",
@@ -128,6 +136,53 @@ class DatabaseWorkerReadiness:
     active_count: int
     pending_count: int
     maximum_pending: int
+    mismatched_workers: int = 0
+    draining_workers: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DatabaseWorkerAttestation:
+    runtime_config_contract_version: str
+    runtime_config_fingerprint: str
+    embedding_identity_fingerprint: str
+    generation_identity_fingerprint: str
+
+    @classmethod
+    def from_runtime(
+        cls,
+        runtime: RuntimeConfigurationAttestation,
+    ) -> DatabaseWorkerAttestation:
+        return cls(
+            runtime.contract_version,
+            runtime.fingerprint,
+            runtime.embedding_identity_fingerprint,
+            runtime.generation_identity_fingerprint,
+        )
+
+    def validate(self) -> None:
+        values = (
+            self.runtime_config_fingerprint,
+            self.embedding_identity_fingerprint,
+            self.generation_identity_fingerprint,
+        )
+        if (
+            self.runtime_config_contract_version != RUNTIME_CONFIG_CONTRACT_VERSION
+            or any(
+                len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+                for value in values
+            )
+        ):
+            raise DatabaseWorkerError("worker_configuration_invalid")
+
+
+_UNATTESTED_FINGERPRINT = hashlib.sha256(b"test-unattested-runtime").hexdigest()
+_DEFAULT_TEST_ATTESTATION = DatabaseWorkerAttestation(
+    RUNTIME_CONFIG_CONTRACT_VERSION,
+    _UNATTESTED_FINGERPRINT,
+    hashlib.sha256(b"test-unattested-embedding").hexdigest(),
+    hashlib.sha256(b"test-unattested-generation").hexdigest(),
+)
 
 
 class JobDispatcher(Protocol):
@@ -148,12 +203,15 @@ class DatabaseWorkerRegistry:
         engine: Engine,
         *,
         heartbeat_ttl: timedelta,
+        attestation: DatabaseWorkerAttestation | None = None,
         clock: Callable[[], datetime] = _utcnow,
     ) -> None:
         if heartbeat_ttl < timedelta(seconds=5) or heartbeat_ttl > timedelta(minutes=5):
             raise DatabaseWorkerError("worker_configuration_invalid")
         self.engine = engine
         self.heartbeat_ttl = heartbeat_ttl
+        self.attestation = attestation or _DEFAULT_TEST_ATTESTATION
+        self.attestation.validate()
         self.clock = clock
 
     @staticmethod
@@ -234,6 +292,42 @@ class DatabaseWorkerRegistry:
                     )
                     .values(**values)
                 )
+            attestation_values = {
+                "runtime_config_contract_version": (
+                    self.attestation.runtime_config_contract_version
+                ),
+                "runtime_config_fingerprint": (
+                    self.attestation.runtime_config_fingerprint
+                ),
+                "embedding_identity_fingerprint": (
+                    self.attestation.embedding_identity_fingerprint
+                ),
+                "generation_identity_fingerprint": (
+                    self.attestation.generation_identity_fingerprint
+                ),
+            }
+            existing_attestation = connection.execute(
+                select(baseline_worker_attestation.c.worker_instance_id).where(
+                    baseline_worker_attestation.c.worker_instance_id
+                    == worker_instance_id
+                )
+            ).first()
+            if existing_attestation is None:
+                connection.execute(
+                    baseline_worker_attestation.insert().values(
+                        worker_instance_id=worker_instance_id,
+                        **attestation_values,
+                    )
+                )
+            else:
+                connection.execute(
+                    update(baseline_worker_attestation)
+                    .where(
+                        baseline_worker_attestation.c.worker_instance_id
+                        == worker_instance_id
+                    )
+                    .values(**attestation_values)
+                )
 
         if self.engine.dialect.name == "sqlite":
             connection = self.engine.connect()
@@ -266,6 +360,22 @@ class DatabaseWorkerRegistry:
         if active_count not in {0, 1}:
             raise DatabaseWorkerError("worker_capacity_invalid")
         with self.engine.begin() as connection:
+            attested = connection.execute(
+                select(baseline_worker_attestation.c.worker_instance_id).where(
+                    baseline_worker_attestation.c.worker_instance_id
+                    == worker_instance_id,
+                    baseline_worker_attestation.c.runtime_config_contract_version
+                    == self.attestation.runtime_config_contract_version,
+                    baseline_worker_attestation.c.runtime_config_fingerprint
+                    == self.attestation.runtime_config_fingerprint,
+                    baseline_worker_attestation.c.embedding_identity_fingerprint
+                    == self.attestation.embedding_identity_fingerprint,
+                    baseline_worker_attestation.c.generation_identity_fingerprint
+                    == self.attestation.generation_identity_fingerprint,
+                )
+            ).first()
+            if attested is None:
+                raise DatabaseWorkerError("worker_configuration_mismatch")
             changed = connection.execute(
                 update(baseline_worker_instance)
                 .where(
@@ -296,31 +406,36 @@ class DatabaseWorkerRegistry:
         try:
             if BASELINE_WORKER_INSTANCE_TABLE not in set(
                 inspect(self.engine).get_table_names()
+            ) or BASELINE_WORKER_ATTESTATION_TABLE not in set(
+                inspect(self.engine).get_table_names()
             ):
                 return False
-            migration = next(
-                item
-                for item in CORE_SCHEMA_MIGRATIONS
-                if item.migration_id == DATABASE_WORKER_MIGRATION_ID
-            )
             with self.engine.connect() as connection:
-                row = (
-                    connection.execute(
-                        select(schema_migration_table).where(
-                            schema_migration_table.c.migration_id
-                            == DATABASE_WORKER_MIGRATION_ID
-                        )
-                    )
-                    .mappings()
-                    .one_or_none()
-                )
-                if (
-                    row is None
-                    or row["state"] != "applied"
-                    or row["checksum"] != migration.checksum
+                for migration_id in (
+                    DATABASE_WORKER_MIGRATION_ID,
+                    DATABASE_WORKER_ATTESTATION_MIGRATION_ID,
                 ):
-                    return False
-                migration.validate(connection)
+                    migration = next(
+                        item
+                        for item in CORE_SCHEMA_MIGRATIONS
+                        if item.migration_id == migration_id
+                    )
+                    row = (
+                        connection.execute(
+                            select(schema_migration_table).where(
+                                schema_migration_table.c.migration_id == migration_id
+                            )
+                        )
+                        .mappings()
+                        .one_or_none()
+                    )
+                    if (
+                        row is None
+                        or row["state"] != "applied"
+                        or row["checksum"] != migration.checksum
+                    ):
+                        return False
+                    migration.validate(connection)
                 connection.exec_driver_sql("SELECT 1").scalar_one()
         except Exception:  # noqa: BLE001 - schema readiness is non-reflective
             return False
@@ -332,6 +447,7 @@ class DatabaseWorkerRegistry:
         required_job_types: Iterable[str],
         pending_count: int,
         maximum_pending_per_slot: int,
+        required_runtime_config_fingerprint: str | None = None,
     ) -> DatabaseWorkerReadiness:
         if not self._schema_ready():
             return DatabaseWorkerReadiness(
@@ -348,13 +464,28 @@ class DatabaseWorkerRegistry:
             baseline_worker_instance.c.last_heartbeat_at >= cutoff,
             baseline_worker_instance.c.draining.is_(False),
         ]
+        if required_runtime_config_fingerprint is not None:
+            conditions.extend(
+                [
+                    baseline_worker_attestation.c.runtime_config_contract_version
+                    == RUNTIME_CONFIG_CONTRACT_VERSION,
+                    baseline_worker_attestation.c.runtime_config_fingerprint
+                    == required_runtime_config_fingerprint,
+                ]
+            )
         for job_type in required_job_types:
             conditions.append(self._support_column(job_type).is_(True))
         try:
             with self.engine.connect() as connection:
                 rows = (
                     connection.execute(
-                        select(baseline_worker_instance).where(*conditions)
+                        select(baseline_worker_instance)
+                        .join(
+                            baseline_worker_attestation,
+                            baseline_worker_attestation.c.worker_instance_id
+                            == baseline_worker_instance.c.worker_instance_id,
+                        )
+                        .where(*conditions)
                     )
                     .mappings()
                     .all()
@@ -365,6 +496,39 @@ class DatabaseWorkerRegistry:
         active = sum(int(row["active_count"]) for row in rows)
         maximum = total * maximum_pending_per_slot
         ready = total > 0 and pending_count < maximum
+        mismatched = 0
+        draining_count = 0
+        if required_runtime_config_fingerprint is not None:
+            cutoff = self.clock() - self.heartbeat_ttl
+            try:
+                with self.engine.connect() as connection:
+                    recent = (
+                        connection.execute(
+                            select(
+                                baseline_worker_instance.c.draining,
+                                baseline_worker_attestation.c.runtime_config_fingerprint,
+                            )
+                            .join(
+                                baseline_worker_attestation,
+                                baseline_worker_attestation.c.worker_instance_id
+                                == baseline_worker_instance.c.worker_instance_id,
+                            )
+                            .where(
+                                baseline_worker_instance.c.last_heartbeat_at >= cutoff
+                            )
+                        )
+                        .mappings()
+                        .all()
+                    )
+                mismatched = sum(
+                    row["runtime_config_fingerprint"]
+                    != required_runtime_config_fingerprint
+                    for row in recent
+                )
+                draining_count = sum(bool(row["draining"]) for row in recent)
+            except SQLAlchemyError:
+                mismatched = 0
+                draining_count = 0
         return DatabaseWorkerReadiness(
             ready=ready,
             reason_code=None if ready else "worker_unavailable",
@@ -373,6 +537,8 @@ class DatabaseWorkerRegistry:
             active_count=active,
             pending_count=pending_count,
             maximum_pending=maximum,
+            mismatched_workers=mismatched,
+            draining_workers=draining_count,
         )
 
 
@@ -820,8 +986,7 @@ class BaselineDatabaseWorker:
                 )
             except DatabaseWorkerError:
                 _LOGGER.error(
-                    "baseline_worker event=heartbeat_failed worker_id=%s reason=%s",
-                    self.worker_instance_id,
+                    "baseline_worker event=heartbeat_failed reason=%s",
                     "worker_unavailable",
                 )
 
@@ -845,20 +1010,38 @@ class BaselineDatabaseWorker:
     def close(self) -> None:
         if not self._registered:
             return
-        self.begin_draining()
-        self._heartbeat_stop.set()
-        if self._heartbeat_thread is not None:
-            self._heartbeat_thread.join(
-                timeout=max(1.0, self.heartbeat_interval_seconds * 2)
+        heartbeat_available = True
+        try:
+            self.begin_draining()
+        except DatabaseWorkerError:
+            # Configuration drift or a lost database must never strand the
+            # non-daemon heartbeat thread during interpreter shutdown.
+            heartbeat_available = False
+            _LOGGER.error(
+                "baseline_worker event=drain_failed reason=%s",
+                "worker_unavailable",
             )
-        active, _ = self._snapshot_state()
-        self.registry.heartbeat(
-            self.worker_instance_id,
-            active_count=active,
-            draining=True,
-        )
-        self._registered = False
-        self._safe_log("stopped")
+        finally:
+            self._heartbeat_stop.set()
+            if self._heartbeat_thread is not None:
+                self._heartbeat_thread.join(
+                    timeout=max(1.0, self.heartbeat_interval_seconds * 2)
+                )
+            if heartbeat_available:
+                active, _ = self._snapshot_state()
+                try:
+                    self.registry.heartbeat(
+                        self.worker_instance_id,
+                        active_count=active,
+                        draining=True,
+                    )
+                except DatabaseWorkerError:
+                    _LOGGER.error(
+                        "baseline_worker event=stop_heartbeat_failed reason=%s",
+                        "worker_unavailable",
+                    )
+            self._registered = False
+            self._safe_log("stopped")
 
     def _safe_log(
         self,
@@ -869,11 +1052,9 @@ class BaselineDatabaseWorker:
         elapsed_ms: int | None = None,
     ) -> None:
         _LOGGER.info(
-            "baseline_worker event=%s worker_id=%s job_id=%s job_type=%s "
-            "state=%s attempt=%s elapsed_ms=%s reason=%s",
+            "baseline_worker event=%s job_type=%s state=%s attempt=%s "
+            "elapsed_ms=%s reason=%s",
             event,
-            self.worker_instance_id,
-            candidate.job_id if candidate is not None else "none",
             candidate.job_type if candidate is not None else "none",
             result.state if result is not None else "none",
             result.attempt_count if result is not None else 0,
@@ -891,8 +1072,7 @@ class BaselineDatabaseWorker:
                 total += int(callback())
             except Exception:  # noqa: BLE001 - cleanup failure stays sanitized
                 _LOGGER.error(
-                    "baseline_worker event=cleanup_failed worker_id=%s reason=%s",
-                    self.worker_instance_id,
+                    "baseline_worker event=cleanup_failed reason=%s",
                     "worker_unavailable",
                 )
         total += self.registry.cleanup_expired()
@@ -905,12 +1085,12 @@ class BaselineDatabaseWorker:
         _, draining = self._snapshot_state()
         if draining:
             return None
+        # Re-attest before even selecting work. A worker whose effective
+        # configuration drifted cannot reach any job-specific claim path.
+        self.registry.heartbeat(self.worker_instance_id, active_count=0, draining=False)
         self._cleanup_if_due()
         candidate = self.scheduler.select()
         if candidate is None:
-            self.registry.heartbeat(
-                self.worker_instance_id, active_count=0, draining=False
-            )
             return None
         self._set_state(active_count=1)
         self.registry.heartbeat(self.worker_instance_id, active_count=1, draining=False)
@@ -1015,17 +1195,23 @@ def assess_database_worker_readiness(
             required_job_types=required_job_types,
             pending_count=scheduler.pending_count(),
             maximum_pending_per_slot=int(settings.baseline_worker_max_pending_per_slot),
+            required_runtime_config_fingerprint=build_runtime_configuration(
+                settings,
+                database_url=engine.url,
+            ).fingerprint,
         )
     except Exception:  # noqa: BLE001 - capability is intentionally non-reflective
         return DatabaseWorkerReadiness(False, "capability_unavailable", 0, 0, 0, 0, 0)
 
 
 __all__ = [
+    "DATABASE_WORKER_ATTESTATION_MIGRATION_ID",
     "DATABASE_WORKER_CONTRACT_VERSION",
     "DATABASE_WORKER_MIGRATION_ID",
     "DATABASE_WORKER_SUPPORTED_JOB_TYPES",
     "BaselineDatabaseWorker",
     "DatabaseJobScheduler",
+    "DatabaseWorkerAttestation",
     "DatabaseWorkerCandidate",
     "DatabaseWorkerDispatchResult",
     "DatabaseWorkerError",

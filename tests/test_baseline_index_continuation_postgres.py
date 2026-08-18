@@ -57,7 +57,7 @@ def test_postgres_index_job_submission_publication_concurrency_and_restart(
 ) -> None:
     environment = postgres_control_environment
     assert read_schema_migration_state(environment.engine)[-1].migration_id == (
-        "0013_baseline_database_worker_v1"
+        "0014_baseline_worker_runtime_attestation_v1"
     )
     _publish_corpus(environment)
     service = _service(environment)

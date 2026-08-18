@@ -88,6 +88,11 @@ provider setup failures to `worker_unavailable`; use this installed verifier
 for the safe detailed diagnosis. Ordinary capability requests perform static
 attestation only and never run the inference probe.
 
+`compair-core doctor` incorporates the same runtime/model/digest and packaged
+schema checks into whole-workflow readiness. It performs no inference by
+default. `compair-core doctor --probe-generation` is the only doctor mode that
+sends the existing synthetic, private-data-free schema probe.
+
 ## Durable provenance
 
 No migration is required. Existing fields record provider `ollama`, model,

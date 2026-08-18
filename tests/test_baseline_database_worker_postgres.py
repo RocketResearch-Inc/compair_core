@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from test_baseline_control_generation import _structured
 from test_baseline_control_plane import _stage_worker_snapshot
 from test_baseline_control_plane_postgres import (
@@ -28,19 +31,89 @@ from test_baseline_run_jobs import _keyring
 
 from compair_core.baseline_control_plane_schema import (
     baseline_run_job,
+    baseline_worker_attestation,
     baseline_worker_instance,
     snapshot_continuation_job,
 )
 from compair_core.compair.retrieval.control_plane_v2 import parse_run_submission
 from compair_core.compair.retrieval.database_worker import (
     DatabaseJobScheduler,
+    DatabaseWorkerAttestation,
+    DatabaseWorkerError,
+    DatabaseWorkerRegistry,
 )
 from compair_core.compair.retrieval.run_jobs import BaselineRunJobService
+from compair_core.doctor import run_doctor
+from compair_core.runtime_config import build_runtime_configuration
+from compair_core.server.settings import Settings
 
 
 @pytest.fixture
 def postgres_control_environment(request: pytest.FixtureRequest):
     return request.getfixturevalue("_postgres_control_environment_fixture")
+
+
+def test_postgres_runtime_attestation_requires_exact_match_before_work(
+    postgres_control_environment,
+) -> None:
+    environment = postgres_control_environment
+    runtime = build_runtime_configuration(
+        SimpleNamespace(),
+        database_url=environment.engine.url,
+    )
+    registry = DatabaseWorkerRegistry(
+        environment.engine,
+        heartbeat_ttl=timedelta(seconds=30),
+        attestation=DatabaseWorkerAttestation.from_runtime(runtime),
+    )
+    worker_id = str(uuid4())
+    registry.register(worker_id)
+    ready = registry.readiness(
+        required_job_types=("baseline_run", "cleanup"),
+        pending_count=0,
+        maximum_pending_per_slot=8,
+        required_runtime_config_fingerprint=runtime.fingerprint,
+    )
+    assert ready.ready
+    assert ready.mismatched_workers == 0
+
+    with environment.engine.begin() as connection:
+        connection.execute(
+            update(baseline_worker_attestation)
+            .where(baseline_worker_attestation.c.worker_instance_id == worker_id)
+            .values(runtime_config_fingerprint="0" * 64)
+        )
+    mismatch = registry.readiness(
+        required_job_types=("baseline_run", "cleanup"),
+        pending_count=0,
+        maximum_pending_per_slot=8,
+        required_runtime_config_fingerprint=runtime.fingerprint,
+    )
+    assert not mismatch.ready
+    assert mismatch.mismatched_workers == 1
+    with pytest.raises(DatabaseWorkerError, match="worker_configuration_mismatch"):
+        registry.heartbeat(worker_id, active_count=0, draining=False)
+
+
+def test_postgres_doctor_reports_matching_safe_database_worker(
+    postgres_control_environment,
+) -> None:
+    environment = postgres_control_environment
+    settings = Settings(baseline_worker_mode="database")
+    runtime = build_runtime_configuration(settings, database_url=environment.engine.url)
+    registry = DatabaseWorkerRegistry(
+        environment.engine,
+        heartbeat_ttl=timedelta(seconds=30),
+        attestation=DatabaseWorkerAttestation.from_runtime(runtime),
+    )
+    registry.register(str(uuid4()))
+    result = run_doctor(settings=settings, engine=environment.engine)
+    assert result.component("database").details["backend"] == "postgresql"
+    assert result.component("migrations").reason_code == "migrations_current"
+    assert result.component("worker").reason_code == "worker_ready"
+    rendered = str(result.as_dict())
+    assert "postgresql://" not in rendered
+    assert "127.0.0.1" not in rendered
 
 
 def test_postgres_multiple_workers_skip_locked_and_single_service_claim(

@@ -38,6 +38,7 @@ COMPATIBLE_INDEX_JOB_TABLE = "baseline_compatible_index_job"
 BASELINE_RUN_JOB_TABLE = "baseline_control_run_job"
 BASELINE_RUN_PAYLOAD_TABLE = "baseline_control_run_payload"
 BASELINE_WORKER_INSTANCE_TABLE = "baseline_database_worker_instance"
+BASELINE_WORKER_ATTESTATION_TABLE = "baseline_database_worker_attestation"
 BASELINE_RUN_WORKER_SERVICE_ID = "compair-core-baseline-runner"
 BASELINE_RUN_WORKER_CONTRACT_VERSION = "baseline-run-worker.v1"
 BASELINE_CONTROL_GENERATION_CONTRACT_VERSION = "baseline-control-generation.v1"
@@ -972,6 +973,38 @@ baseline_worker_instance = Table(
 )
 
 
+baseline_worker_attestation = Table(
+    BASELINE_WORKER_ATTESTATION_TABLE,
+    _metadata,
+    Column(
+        "worker_instance_id",
+        String(36),
+        ForeignKey(
+            "baseline_database_worker_instance.worker_instance_id",
+            ondelete="CASCADE",
+            name="fk_bl_db_worker_attestation_instance",
+        ),
+        primary_key=True,
+    ),
+    Column("runtime_config_contract_version", String(64), nullable=False),
+    Column("runtime_config_fingerprint", String(64), nullable=False),
+    Column("embedding_identity_fingerprint", String(64), nullable=False),
+    Column("generation_identity_fingerprint", String(64), nullable=False),
+    CheckConstraint(
+        "runtime_config_contract_version = 'baseline-runtime-config.v1' "
+        "AND length(runtime_config_fingerprint) = 64 "
+        "AND length(embedding_identity_fingerprint) = 64 "
+        "AND length(generation_identity_fingerprint) = 64",
+        name="ck_bl_db_worker_attestation_contract",
+    ),
+    Index(
+        "ix_bl_db_worker_attestation_runtime",
+        "runtime_config_fingerprint",
+        "worker_instance_id",
+    ),
+)
+
+
 STAGING_CONTROL_PLANE_TABLES = (
     repository_registration,
     control_job,
@@ -990,12 +1023,15 @@ RUN_CONTROL_PLANE_TABLES = (baseline_run_job, baseline_run_payload)
 
 DATABASE_WORKER_TABLES = (baseline_worker_instance,)
 
+DATABASE_WORKER_ATTESTATION_TABLES = (baseline_worker_attestation,)
+
 CONTROL_PLANE_TABLES = (
     STAGING_CONTROL_PLANE_TABLES
     + CONTINUATION_CONTROL_PLANE_TABLES
     + INDEX_CONTROL_PLANE_TABLES
     + RUN_CONTROL_PLANE_TABLES
     + DATABASE_WORKER_TABLES
+    + DATABASE_WORKER_ATTESTATION_TABLES
 )
 
 
@@ -1006,12 +1042,14 @@ __all__ = [
     "BASELINE_RUN_PAYLOAD_TABLE",
     "BASELINE_RUN_WORKER_CONTRACT_VERSION",
     "BASELINE_RUN_WORKER_SERVICE_ID",
+    "BASELINE_WORKER_ATTESTATION_TABLE",
     "BASELINE_WORKER_INSTANCE_TABLE",
     "COMPATIBLE_INDEX_JOB_TABLE",
     "CONTINUATION_CONTROL_PLANE_TABLES",
     "CONTROL_JOB_TABLE",
     "CONTROL_PLANE_SCHEMA_VERSION",
     "CONTROL_PLANE_TABLES",
+    "DATABASE_WORKER_ATTESTATION_TABLES",
     "DATABASE_WORKER_TABLES",
     "INDEX_CONTROL_PLANE_TABLES",
     "REPOSITORY_APPROVAL_TABLE",
@@ -1023,6 +1061,7 @@ __all__ = [
     "STAGING_CONTROL_PLANE_TABLES",
     "baseline_run_job",
     "baseline_run_payload",
+    "baseline_worker_attestation",
     "baseline_worker_instance",
     "compatible_index_job",
     "control_job",

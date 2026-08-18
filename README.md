@@ -164,6 +164,22 @@ The first command performs no inference. The opt-in probe uses only synthetic
 text and validates the exact packaged `baseline-generation-output.v2` schema.
 See [the native Ollama generation runbook](docs/baseline-ollama-generation.md).
 
+The installed self-hosted baseline processes have stable loopback-first entry
+points. Give the API and worker the same database and baseline environment:
+
+```bash
+compair-core-api --host 127.0.0.1 --port 8000
+compair-core-worker --poll
+compair-core doctor --require-baseline
+```
+
+Run doctor before the worker to confirm automatic dispatch is unavailable,
+then again after the matching heartbeat to confirm readiness. The default
+doctor is read-only and performs no generation inference; add
+`--probe-generation` only for the benign Ollama schema probe. Non-loopback API
+binding requires `--allow-non-loopback` and the documented TLS reverse-proxy
+policy. See [baseline runtime operations](docs/baseline-runtime-operations.md).
+
 ### Installing from source
 
 You can also install directly from GitHub (handy for pinning to a specific commit or branch):

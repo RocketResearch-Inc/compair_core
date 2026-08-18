@@ -38,7 +38,7 @@ def test_postgres_control_positive_and_restart(
 ) -> None:
     environment = postgres_generation_environment
     assert read_schema_migration_state(environment.engine)[-1].migration_id == (
-        "0013_baseline_database_worker_v1"
+        "0014_baseline_worker_runtime_attestation_v1"
     )
     job_id, _caller, persisted = _persist_control(environment)
     provider = CapturingProvider("postgres first", "postgres second")
