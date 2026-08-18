@@ -346,7 +346,7 @@ def test_configured_http_adapter_sends_ordered_renderer_values_verbatim(
         assert captured["payload"]["output_contract"] == {
             "schema_version": GENERATION_OUTPUT_SCHEMA_VERSION,
             "specification_sha256": (
-                "1dccd3a11ec659a5e8705f9b8acf333a64a21f056265fcd7c96e9c6ac197bb20"
+                "e670731777b253f9d5e3984405c2d99871ba26f637a17e6221cc82d97bc8beb1"
             ),
             "schema_sha256": GENERATION_OUTPUT_SCHEMA_SHA256,
             "strict": True,

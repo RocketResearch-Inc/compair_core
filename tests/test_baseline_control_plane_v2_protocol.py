@@ -13,6 +13,19 @@ from typing import Any
 import pytest
 import rfc8785
 
+from compair_core.compair.retrieval import generation as generation_module
+from compair_core.compair.retrieval.generation import (
+    GENERATION_OUTPUT_SCHEMA_SHA256 as RUNTIME_GENERATION_OUTPUT_SCHEMA_SHA256,
+)
+from compair_core.compair.retrieval.generation import (
+    GENERATION_OUTPUT_SPEC_SHA256 as RUNTIME_GENERATION_OUTPUT_SPEC_SHA256,
+)
+from compair_core.compair.retrieval.generation import (
+    MAX_GENERATION_OUTPUT_CHARACTERS,
+    BaselineGenerationError,
+    BaselineGenerationService,
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 CLI_ROOT = ROOT.parent / "compair-cli"
 PROTOCOL_DIR = ROOT / "protocol"
@@ -62,22 +75,36 @@ V2_INVALID_FIXTURE_JCS_SHA256 = (
 )
 
 GENERATION_OUTPUT_SPEC_SHA256 = (
-    "1dccd3a11ec659a5e8705f9b8acf333a64a21f056265fcd7c96e9c6ac197bb20"
+    "e670731777b253f9d5e3984405c2d99871ba26f637a17e6221cc82d97bc8beb1"
 )
 GENERATION_OUTPUT_SCHEMA_SHA256 = (
-    "39f8e8eaf5e5a219e806d34f46af887d69268a88d5f1d06d45e6c56465e250ed"
+    "fc5a85d5d38c18775afe0966987ea74e7e9ac072148822c1be60a199e32cca27"
 )
 GENERATION_OUTPUT_VALID_FIXTURE_SHA256 = (
-    "b9781155870350dd8b72619e562ea8da6997125229f2064a39947e71a494b488"
+    "887e03e9749f63237507556c5a85df40c684bb856e74b474071c39d0807beaa5"
 )
 GENERATION_OUTPUT_INVALID_FIXTURE_SHA256 = (
-    "489164e6b5f1596134ce0a4e0092dcdc65a80d0fd173870beafa01fe73ea108f"
+    "935dec72319d6b46133a509464cd44cf34fa460f62956253de949576ea153a4a"
 )
 GENERATION_OUTPUT_VALID_FIXTURE_JCS_SHA256 = (
-    "b428181d7fecbb4c2f6bfca00e120ec3347182fc4ef9c43a4ec50066e9d71336"
+    "9562858647e98ecc145ae1fec8b7ce44a6828b9cfc172b2b966871fcd1b386d1"
 )
 GENERATION_OUTPUT_INVALID_FIXTURE_JCS_SHA256 = (
-    "24126307ddf2257f8cf16f2b9d30a6ed740688653fc7f80c5bf11b2b5a214ed3"
+    "833051274a0fd2f1354f6ff2348eb07642c303aef1e24da9afd78684c439135d"
+)
+
+OBSOLETE_GENERATION_OUTPUT_SPEC_SHA256 = (
+    "1dccd3a11ec659a5e8705f9b8acf333a64a21f056265fcd7c96e9c6ac197bb20"
+)
+OBSOLETE_GENERATION_OUTPUT_SCHEMA_SHA256 = (
+    "39f8e8eaf5e5a219e806d34f46af887d69268a88d5f1d06d45e6c56465e250ed"
+)
+
+GENERATION_OUTPUT_NONBLANK_PATTERN = (
+    r"^(.|\n|\r|\u2028|\u2029)*"
+    r"[^\t-\r\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a"
+    r"\u2028\u2029\u202f\u205f\u3000]"
+    r"(.|\n|\r|\u2028|\u2029)*$"
 )
 
 EXPECTED_RUN_STATES = {
@@ -497,11 +524,14 @@ def test_generation_output_v2_valid_fixtures_preserve_order() -> None:
         "no_findings",
         "findings",
         "findings",
+        "findings",
+        "findings",
+        "findings",
     ]
     for output in outputs:
         _validate_schema(output, schema, schema)
     assert outputs[0]["findings"] == []
-    assert [item["feedback"] for item in outputs[2]["findings"]] == [
+    assert [item["feedback"] for item in outputs[-1]["findings"]] == [
         "First ordered finding.",
         "Second ordered finding.",
         "Third ordered finding.",
@@ -522,7 +552,11 @@ def test_generation_output_v2_invalid_fixtures_fail_closed() -> None:
         "duplicate_outcome_key_invalid",
         "no_findings_with_finding_invalid",
         "findings_without_finding_invalid",
-        "blank_feedback_invalid",
+        "empty_feedback_invalid",
+        "spaces_only_feedback_invalid",
+        "tabs_only_feedback_invalid",
+        "newlines_only_feedback_invalid",
+        "mixed_whitespace_only_feedback_invalid",
         "too_many_findings_invalid",
         "extra_output_property_invalid",
         "extra_finding_property_invalid",
@@ -538,6 +572,81 @@ def test_generation_output_v2_invalid_fixtures_fail_closed() -> None:
             value = case["value"]
         with pytest.raises(ContractValidationError):
             _validate_schema(value, schema, schema)
+
+
+def test_generation_output_nonblank_pattern_matches_core_parser_semantics() -> None:
+    schema = _strict_loads(GENERATION_OUTPUT_SCHEMA_PATH.read_bytes())
+    findings_rule = schema["oneOf"][1]["properties"]["findings"]
+    feedback_rule = schema["$defs"]["finding"]["properties"]["feedback"]
+    assert feedback_rule == {
+        "type": "string",
+        "minLength": 1,
+        "pattern": GENERATION_OUTPUT_NONBLANK_PATTERN,
+    }
+    assert findings_rule["minItems"] == 1
+    assert findings_rule["maxItems"] == 4
+    assert MAX_GENERATION_OUTPUT_CHARACTERS == 100_000
+
+    matcher = re.compile(GENERATION_OUTPUT_NONBLANK_PATTERN)
+    for codepoint in range(0x110000):
+        character = chr(codepoint)
+        assert (matcher.search(character) is not None) == bool(character.strip())
+
+    invalid = (
+        "",
+        "     ",
+        "\t\t\t",
+        "\n\r\n",
+        " \t\n\r ",
+        "\u001c\u001d\u001e\u001f",
+        "\u0085\u00a0\u1680\u2000\u200a\u2028\u2029\u202f\u205f\u3000",
+    )
+    valid = (
+        "ordinary finding",
+        "  leading and trailing  \n",
+        "\nfirst line\n\tsecond line\r\n",
+        "\u2028multiline after separator\u2029",
+        "  検査結果 Δ  ",
+    )
+
+    def output(feedback: str) -> dict[str, object]:
+        return {
+            "schema_version": "baseline-generation-output.v2",
+            "outcome": "findings",
+            "findings": [{"feedback": feedback}],
+        }
+
+    for feedback in valid:
+        value = output(feedback)
+        _validate_schema(value, schema, schema)
+        parsed, _fingerprint = BaselineGenerationService._parse_output(
+            json.dumps(value, ensure_ascii=False),
+            maximum_findings=1,
+        )
+        assert parsed == (feedback,)
+    for feedback in invalid:
+        value = output(feedback)
+        with pytest.raises(ContractValidationError):
+            _validate_schema(value, schema, schema)
+        with pytest.raises(BaselineGenerationError):
+            BaselineGenerationService._parse_output(
+                json.dumps(value, ensure_ascii=False),
+                maximum_findings=1,
+            )
+
+
+def test_obsolete_generation_output_hashes_have_no_runtime_compatibility() -> None:
+    assert RUNTIME_GENERATION_OUTPUT_SPEC_SHA256 == GENERATION_OUTPUT_SPEC_SHA256
+    assert RUNTIME_GENERATION_OUTPUT_SCHEMA_SHA256 == GENERATION_OUTPUT_SCHEMA_SHA256
+    assert GENERATION_OUTPUT_SPEC_SHA256 != OBSOLETE_GENERATION_OUTPUT_SPEC_SHA256
+    assert GENERATION_OUTPUT_SCHEMA_SHA256 != (
+        OBSOLETE_GENERATION_OUTPUT_SCHEMA_SHA256
+    )
+    contract = generation_module._generation_output_contract(4)
+    assert contract["specification_sha256"] == GENERATION_OUTPUT_SPEC_SHA256
+    assert contract["schema_sha256"] == GENERATION_OUTPUT_SCHEMA_SHA256
+    assert OBSOLETE_GENERATION_OUTPUT_SPEC_SHA256 not in contract.values()
+    assert OBSOLETE_GENERATION_OUTPUT_SCHEMA_SHA256 not in contract.values()
 
 
 def test_every_valid_v2_message_validates_and_uses_exact_protocol(
