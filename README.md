@@ -131,6 +131,20 @@ pip install compair-core
 
 This installs the package as a dependency so you can embed Compair into your own FastAPI instance or reuse the models in scripts.
 
+The pinned, loopback-only `baseline_v1` BGE service is an opt-in Python 3.11+
+extra. Model weights are not included and are downloaded only by the explicit
+fetch command:
+
+```bash
+pip install "compair-core[baseline-embedding]"
+compair-core-models fetch baseline-v1
+compair-core-models verify baseline-v1
+compair-core-embedding-service --host 127.0.0.1 --port 9010
+```
+
+See [the baseline embedding runbook](docs/baseline-embedding-service.md) for
+the frozen artifact hashes, cache policy, readiness states, and Core settings.
+
 ### Installing from source
 
 You can also install directly from GitHub (handy for pinning to a specific commit or branch):

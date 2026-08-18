@@ -36,6 +36,20 @@ MAX_BASELINE_EMBEDDING_DIMENSION = 8192
 
 ClientFactory = Callable[[], httpx.Client]
 
+_SAFE_LOCAL_SERVICE_REASONS = {
+    "baseline_model_absent",
+    "baseline_model_artifact_changed",
+    "baseline_model_artifact_hash_mismatch",
+    "baseline_model_artifact_mismatch",
+    "baseline_model_artifact_unsafe",
+    "baseline_model_cache_unsafe",
+    "baseline_model_cache_unavailable",
+    "baseline_model_manifest_mismatch",
+    "baseline_embedding_model_unavailable",
+    "baseline_embedding_runtime_unavailable",
+    "baseline_embedding_runtime_version_mismatch",
+}
+
 
 class BaselineEmbeddingCapabilityStatus(str, Enum):
     DISABLED = "disabled"
@@ -348,6 +362,18 @@ class HTTPBaselineEmbeddingAdapter:
                 "baseline embedding service is unavailable",
             ) from None
         if response.status_code != 200:
+            if path == BASELINE_EMBEDDING_HEALTH_PATH:
+                try:
+                    error_payload = response.json()
+                except ValueError:
+                    error_payload = None
+                if isinstance(error_payload, dict):
+                    safe_reason = error_payload.get("reason")
+                    if safe_reason in _SAFE_LOCAL_SERVICE_REASONS:
+                        raise BaselineEmbeddingAdapterError(
+                            str(safe_reason),
+                            "baseline embedding service is not ready",
+                        )
             raise BaselineEmbeddingAdapterError(
                 "embedding_service_unavailable",
                 "baseline embedding service returned an unsuccessful status",

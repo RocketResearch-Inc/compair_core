@@ -407,6 +407,37 @@ def test_timeout_and_unavailable_status_are_sanitized(caplog) -> None:
     assert "private backend detail" not in str(unavailable_exc.value)
 
 
+@pytest.mark.parametrize(
+    "reason",
+    (
+        "baseline_model_absent",
+        "baseline_model_manifest_mismatch",
+        "baseline_model_artifact_hash_mismatch",
+    ),
+)
+def test_capability_preserves_only_allowlisted_local_readiness_reason(
+    reason: str,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503,
+            json={
+                "status": "unavailable",
+                "reason": reason,
+                "detail": "private cache path and backend detail",
+            },
+        )
+
+    capability = assess_baseline_embedding(
+        _settings(),
+        client_factory=_client_factory(handler),
+    )
+
+    assert capability.status is BaselineEmbeddingCapabilityStatus.UNAVAILABLE
+    assert capability.reason == reason
+    assert "private cache path" not in repr(capability.as_dict())
+
+
 def test_malformed_json_and_embedding_response_identity_fail_closed() -> None:
     def malformed_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET":

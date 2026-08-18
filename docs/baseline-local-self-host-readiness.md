@@ -375,9 +375,12 @@ compatibility, disable/reactivate, and no-disclosure tests cover the workflow.
 
 ### M3 — production local providers and configuration
 
-Likely files:
+The pinned BGE acquisition, verification, and loopback service are now
+installed with Core's `baseline-embedding` extra. Remaining M3 work is the
+strict local generation provider and broader service orchestration.
 
-- promoted BGE service package/image/launcher and pinned model manifest;
+Remaining likely files:
+
 - a maintained Ollama adapter or native provider module;
 - `.env.example`, provider docs, health/capability checks, and compose/service
   definitions; and

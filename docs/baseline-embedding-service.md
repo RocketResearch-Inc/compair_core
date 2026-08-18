@@ -17,6 +17,27 @@ COMPAIR_BASELINE_EMBEDDING_BATCH_SIZE=32
 COMPAIR_BASELINE_EMBEDDING_ALLOW_INSECURE_LOOPBACK=true
 ```
 
+The installed local service is a separate Python 3.11+ process. The pinned
+NumPy and ONNX Runtime snapshot is intentionally stricter than Core's general
+Python floor. Install and acquire it with:
+
+```bash
+python3.11 -m venv /path/to/baseline-embedding-venv
+/path/to/baseline-embedding-venv/bin/pip install \
+  "compair-core[baseline-embedding]"
+/path/to/baseline-embedding-venv/bin/compair-core-models fetch baseline-v1
+/path/to/baseline-embedding-venv/bin/compair-core-models verify baseline-v1
+/path/to/baseline-embedding-venv/bin/compair-core-embedding-service \
+  --host 127.0.0.1 --port 9010
+```
+
+`fetch` is the only installed action allowed to use the network. `verify` and
+the service perform no download or revision resolution. The default private
+cache is `~/.cache/compair-core/models`; an operator may set the same absolute
+`COMPAIR_BASELINE_MODEL_CACHE` for all three commands. Incomplete staging is
+not a valid snapshot and is removed only by the explicit
+`compair-core-models clean baseline-v1 --incomplete` command.
+
 Plaintext HTTP is accepted only for `localhost`, a `127.0.0.0/8` address, or
 `::1`, and only when the explicit loopback setting is true. Remote endpoints
 must use HTTPS. Endpoint userinfo, query strings, and fragments are rejected.
@@ -81,6 +102,50 @@ mismatch, wrong vector count/dimension, and NaN/Inf all fail closed. A compatibl
 index is not published on document-embedding failure, and query retrieval never
 falls back to legacy or lexical-only behavior.
 
+Core capabilities use safe reason codes to distinguish `baseline_model_absent`,
+`baseline_model_manifest_mismatch`, artifact size/hash/symlink failure, service
+unreachability, runtime-version mismatch, contract/provider/model/revision/
+dimension mismatch, and fully attested readiness. These responses contain no
+endpoint, cache path, credential, submitted text, or internal exception.
+
+## Frozen installed manifest
+
+The wheel packages `compair-baseline-model-manifest.v1` for profile
+`baseline-v1`. The service reads this manifest as its sole model identity and
+artifact authority:
+
+```text
+Logical model: BAAI/bge-small-en-v1.5
+Artifact repository: qdrant/bge-small-en-v1.5-onnx-Q
+Revision: 52398278842ec682c6f32300af41344b1c0b0bb2
+Runtime: FastEmbed 0.8.0, ONNX Runtime 1.28.0, NumPy 2.4.6,
+         Tokenizers 0.23.1, Hugging Face Hub 1.27.0
+Dimension/dtype/normalization: 384 / float32 / none
+Contract/provider: baseline-embedding-http.v1 / baseline_http_v1
+Artifact count/bytes: 5 / 67,179,163
+Manifest fingerprint: 429e20eed22b1fbd1dc3788969be6241e49d8dccf685a7d246d283c5d91d37de
+```
+
+| File | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `config.json` | 706 | `13582bcf2effc85b7bf3d3f5532e686bc1c9ce86bb009d10f0ec33cbe92299dd` |
+| `model_optimized.onnx` | 66,465,124 | `51f1bd0addd6e859e42c2c8021a5e5461385bb676a649f4b269aa445449f2431` |
+| `special_tokens_map.json` | 695 | `5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a` |
+| `tokenizer.json` | 711,396 | `d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66` |
+| `tokenizer_config.json` | 1,242 | `0b29c7bfc889e53b36d9dd3e686dd4300f6525110eaa98c76a5dafceb2029f53` |
+
+The artifact repository declares Apache-2.0 in its pinned model card and links
+to the upstream BAAI model card; both links are retained in the packaged
+manifest. Weights remain in the operator cache and are excluded from source,
+sdist, and wheel artifacts.
+
+Acquisition is serialized across processes. It downloads into a private,
+same-filesystem staging directory, rejects traversal, symlinks, non-regular or
+unexpected runtime files, verifies every size/hash, fsyncs, and renames the
+complete snapshot atomically. A verified target is never overwritten. A
+corrupt published target fails closed for operator review instead of being
+silently replaced.
+
 ## Manual smoke check
 
 With a compatible BGE/FastEmbed service already running locally:
@@ -95,9 +160,9 @@ The script uses fixed non-sensitive probe strings and prints only the attested
 identity, fingerprint, and vector metadata. It does not download a model or
 start a service.
 
-## Reproducible loopback FastEmbed validation service
+## Historical source-checkout validation helper
 
-`scripts/live_baseline_embedding_service.py` is an operator-only thin adapter
+`scripts/live_baseline_embedding_service.py` is the earlier operator-only thin adapter
 over the self-hosted FastEmbed/BGE helper. It implements the protocol above;
 it is not imported by Core and does not change production provider routing.
 The helper accepts only `BAAI/bge-small-en-v1.5`, requires an absolute snapshot
@@ -116,8 +181,8 @@ Model revision: 52398278842ec682c6f32300af41344b1c0b0bb2
 Dimension: 384
 ```
 
-Create a Python 3.11 environment and reproduce the fully resolved service
-package snapshot without changing Core's runtime dependencies:
+Its fully resolved validation environment can still be reproduced for
+historical comparison:
 
 ```bash
 python3.11 -m venv /path/to/baseline-embedding-venv
@@ -125,8 +190,8 @@ python3.11 -m venv /path/to/baseline-embedding-venv
   -r scripts/requirements-baseline-embedding-live.txt
 ```
 
-Start one worker on loopback and disable access logging so submitted texts are
-not recorded:
+The following old helper invocation is retained for validation only. Supported
+deployments use `compair-core-embedding-service`; both disable access logging:
 
 ```bash
 SNAPSHOT_ROOT="$HOME/.cache/compair-baseline/models"

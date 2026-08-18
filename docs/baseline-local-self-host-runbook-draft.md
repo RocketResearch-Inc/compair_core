@@ -145,9 +145,16 @@ elapsed wall time.
 
 ## 4. Start BGE
 
-The only committed service is the operator validation helper documented in
-[baseline-embedding-service.md](baseline-embedding-service.md). It requires the
-exact model snapshot to exist already:
+Install the supported Python 3.11+ service extra. The wheel includes the
+verified manifest and entry points, never the model weights:
+
+```sh
+python3.11 -m venv /path/to/baseline-embedding-venv
+/path/to/baseline-embedding-venv/bin/pip install \
+  "compair-core[baseline-embedding]"
+```
+
+The only permitted model identity is:
 
 ```text
 model: BAAI/bge-small-en-v1.5
@@ -156,23 +163,28 @@ revision: 52398278842ec682c6f32300af41344b1c0b0bb2
 dimension: 384
 ```
 
-With that snapshot already present, the documented source-checkout sequence is:
+Fetch is the sole network-enabled action. It stages each frozen artifact,
+checks its exact size and SHA-256, and atomically publishes only the complete
+five-file snapshot:
 
 ```sh
-python3.11 -m venv /path/to/baseline-embedding-venv
-/path/to/baseline-embedding-venv/bin/pip install \
-  -r scripts/requirements-baseline-embedding-live.txt
-
-export COMPAIR_BASELINE_EMBEDDING_SNAPSHOT_DIR='/absolute/path/to/models--qdrant--bge-small-en-v1.5-onnx-Q/snapshots/52398278842ec682c6f32300af41344b1c0b0bb2'
-export COMPAIR_BASELINE_EMBEDDING_THREADS=8
-export HF_HUB_OFFLINE=1
-
-/path/to/baseline-embedding-venv/bin/uvicorn \
-  scripts.live_baseline_embedding_service:app \
-  --host 127.0.0.1 --port 9010 --workers 1 --no-access-log
+/path/to/baseline-embedding-venv/bin/compair-core-models fetch baseline-v1
+/path/to/baseline-embedding-venv/bin/compair-core-models verify baseline-v1
+/path/to/baseline-embedding-venv/bin/compair-core-embedding-service \
+  --host 127.0.0.1 --port 9010
 ```
 
-In another terminal, from the Core source checkout:
+The default private cache is `~/.cache/compair-core/models`; set
+`COMPAIR_BASELINE_MODEL_CACHE` identically for fetch, verify, and service to
+choose another absolute cache root. Serving is offline-only and rejects a
+missing, partial, corrupt, symlinked, or unexpected artifact set. Interrupted
+staging is never eligible and can be removed explicitly with:
+
+```sh
+compair-core-models clean baseline-v1 --incomplete
+```
+
+From a source checkout, the older fixed-probe smoke helper remains available:
 
 ```sh
 python scripts/smoke_baseline_embedding.py \
@@ -180,16 +192,11 @@ python scripts/smoke_baseline_embedding.py \
   --revision 52398278842ec682c6f32300af41344b1c0b0bb2
 ```
 
-**Manual gap:** there is no supported model download/prefetch command, package
-entry point, or service image. The helper is not included in the Python wheel.
-Do not allow it to resolve or download a model at service startup.
-
-The helper, smoke client, live retrieval validator, and frozen validation
-requirements under `scripts/` are source-only validation tools. They are not
-installed services. The wheel intentionally contains only the Core runtime and
-`compair-core-worker`; top-level `protocol/` and `docs/` are repository-only
-specification/operator material because runtime uses packaged frozen constants
-and schemas rather than source-checkout-relative files.
+The smoke client, live retrieval validator, old validation adapter, and frozen
+validation requirements under `scripts/` remain source-only validation tools.
+Production instructions use the installed commands above. Top-level
+`protocol/` and `docs/` remain repository-only specification/operator material;
+the wheel carries the machine-readable model manifest inside the package.
 
 ## 5. Start strict local generation
 

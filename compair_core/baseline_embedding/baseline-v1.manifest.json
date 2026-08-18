@@ -1,0 +1,61 @@
+{
+  "schema_version": "compair-baseline-model-manifest.v1",
+  "profile": "baseline-v1",
+  "logical_model": "BAAI/bge-small-en-v1.5",
+  "artifact_repository": "qdrant/bge-small-en-v1.5-onnx-Q",
+  "revision": "52398278842ec682c6f32300af41344b1c0b0bb2",
+  "dimension": 384,
+  "dtype": "float32",
+  "normalization": "none",
+  "contract_version": "baseline-embedding-http.v1",
+  "provider": "baseline_http_v1",
+  "total_bytes": 67179163,
+  "files": [
+    {
+      "path": "config.json",
+      "size": 706,
+      "sha256": "13582bcf2effc85b7bf3d3f5532e686bc1c9ce86bb009d10f0ec33cbe92299dd"
+    },
+    {
+      "path": "model_optimized.onnx",
+      "size": 66465124,
+      "sha256": "51f1bd0addd6e859e42c2c8021a5e5461385bb676a649f4b269aa445449f2431"
+    },
+    {
+      "path": "special_tokens_map.json",
+      "size": 695,
+      "sha256": "5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a"
+    },
+    {
+      "path": "tokenizer.json",
+      "size": 711396,
+      "sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"
+    },
+    {
+      "path": "tokenizer_config.json",
+      "size": 1242,
+      "sha256": "0b29c7bfc889e53b36d9dd3e686dd4300f6525110eaa98c76a5dafceb2029f53"
+    }
+  ],
+  "embedding_identity_fingerprint": "6bd70c9fe4da25202041bd8096295a6592447494593480e0b892bf9e88f16363",
+  "tokenizer_fingerprint": "555ec4ba6e8f499f30a261cb3824b6748526b4ee40a0a4bccbeb6a73d5d9a76f",
+  "model_artifact_fingerprint": "93a376429bd9f1e4636bbdc9d7887189efeb36a922c9318e0fdc9b8ec5ece297",
+  "licenses": [
+    {
+      "name": "Apache-2.0",
+      "url": "https://huggingface.co/qdrant/bge-small-en-v1.5-onnx-Q/blob/52398278842ec682c6f32300af41344b1c0b0bb2/README.md"
+    },
+    {
+      "name": "BAAI/bge-small-en-v1.5 model card",
+      "url": "https://huggingface.co/BAAI/bge-small-en-v1.5"
+    }
+  ],
+  "runtime_packages": {
+    "fastembed": "0.8.0",
+    "huggingface-hub": "1.27.0",
+    "numpy": "2.4.6",
+    "onnxruntime": "1.28.0",
+    "tokenizers": "0.23.1"
+  },
+  "manifest_fingerprint": "429e20eed22b1fbd1dc3788969be6241e49d8dccf685a7d246d283c5d91d37de"
+}

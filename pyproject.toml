@@ -36,6 +36,8 @@ dependencies = [
 
 [project.scripts]
 compair-core-worker = "compair_core.worker:main"
+compair-core-models = "compair_core.baseline_embedding.model_cli:main"
+compair-core-embedding-service = "compair_core.baseline_embedding.service:main"
 
 [project.optional-dependencies]
 dev = [
@@ -53,6 +55,13 @@ ocr = [
 postgres = [
   "psycopg2-binary>=2.9"
 ]
+baseline-embedding = [
+  "fastembed==0.8.0",
+  "huggingface-hub==1.27.0",
+  "numpy==2.4.6",
+  "onnxruntime==1.28.0",
+  "tokenizers==0.23.1",
+]
 
 [project.urls]
 Homepage = "https://github.com/RocketResearch-Inc/compair_core"
@@ -67,4 +76,4 @@ include = [
 ]
 
 [tool.setuptools.package-data]
-"*" = ["*.md"]
+"*" = ["*.md", "*.json"]
