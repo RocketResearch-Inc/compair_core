@@ -11,24 +11,29 @@ from __future__ import annotations
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import text
+from test_baseline_evidence_persistence import make_persistence_environment
+from test_baseline_generation import (
+    CapturingProvider,
+    _feedback_rows,
+    _persist,
+)
 
 from compair_core import db as core_db
+from compair_core.baseline_generation.profile import (
+    CPU_GENERATION_TIMEOUT_SECONDS,
+    required_generation_lease_seconds,
+)
 from compair_core.compair.retrieval.generation import (
     BaselineGenerationBusyError,
     BaselineGenerationError,
     BaselineGenerationService,
     BaselineGenerationState,
     GenerationWriteStage,
-)
-from test_baseline_evidence_persistence import make_persistence_environment
-from test_baseline_generation import (
-    CapturingProvider,
-    _feedback_rows,
-    _persist,
 )
 
 POSTGRES_URL = os.getenv("COMPAIR_TEST_POSTGRES_URL")
@@ -37,7 +42,9 @@ POSTGRES_URL = os.getenv("COMPAIR_TEST_POSTGRES_URL")
 @pytest.fixture
 def postgres_generation_environment():
     if not POSTGRES_URL:
-        pytest.skip("set COMPAIR_TEST_POSTGRES_URL for real PostgreSQL generation tests")
+        pytest.skip(
+            "set COMPAIR_TEST_POSTGRES_URL for real PostgreSQL generation tests"
+        )
     schema_name = f"baseline_generation_{uuid4().hex}"
     admin_engine = core_db.create_engine(POSTGRES_URL, pool_pre_ping=True)
     if admin_engine.dialect.name != "postgresql":
@@ -73,17 +80,26 @@ def test_postgres_ordered_success_replay_restart_and_no_notification(
     assert replay.feedback_ids == first.feedback_ids
     assert [item.ordinal for item in provider.inputs[0].evidence] == [1, 2, 3, 4]
     with environment.engine.connect() as connection:
-        stored_outputs = connection.execute(
-            text(
-                "SELECT renderer_output FROM baseline_selected_evidence "
-                "WHERE run_id = :run_id ORDER BY ordinal"
-            ),
-            {"run_id": persisted.run_id},
-        ).scalars().all()
-        assert connection.execute(
-            text("SELECT count(*) FROM notification_event")
-        ).scalar_one() == 0
-    assert [item.renderer_output for item in provider.inputs[0].evidence] == stored_outputs
+        stored_outputs = (
+            connection.execute(
+                text(
+                    "SELECT renderer_output FROM baseline_selected_evidence "
+                    "WHERE run_id = :run_id ORDER BY ordinal"
+                ),
+                {"run_id": persisted.run_id},
+            )
+            .scalars()
+            .all()
+        )
+        assert (
+            connection.execute(
+                text("SELECT count(*) FROM notification_event")
+            ).scalar_one()
+            == 0
+        )
+    assert [
+        item.renderer_output for item in provider.inputs[0].evidence
+    ] == stored_outputs
     assert len(_feedback_rows(environment, persisted.run_id)) == 1
 
     environment.engine.dispose()
@@ -92,6 +108,44 @@ def test_postgres_ordered_success_replay_restart_and_no_notification(
     )
     assert restarted.replayed is True
     assert restarted.feedback_ids == first.feedback_ids
+
+
+def test_postgres_cpu_timeout_lease_covers_provider_and_commit_margin(
+    postgres_generation_environment,
+) -> None:
+    environment = postgres_generation_environment
+    persisted, command = _persist(environment, "postgres-cpu-timeout")
+
+    class InspectingProvider(CapturingProvider):
+        remaining: timedelta | None = None
+
+        def generate(self, generation_input, *, idempotency_key: str) -> str:
+            with environment.engine.connect() as connection:
+                expiry = connection.execute(
+                    text(
+                        "SELECT generation_lease_expires_at "
+                        "FROM baseline_retrieval_run WHERE run_id = :run_id"
+                    ),
+                    {"run_id": persisted.run_id},
+                ).scalar_one()
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            self.remaining = expiry - datetime.now(timezone.utc)
+            return super().generate(
+                generation_input,
+                idempotency_key=idempotency_key,
+            )
+
+    provider = InspectingProvider("postgres lease-safe finding")
+    service = BaselineGenerationService(
+        environment.sessions,
+        lease_seconds=required_generation_lease_seconds(CPU_GENERATION_TIMEOUT_SECONDS),
+        provider_timeout_seconds=CPU_GENERATION_TIMEOUT_SECONDS,
+    )
+    receipt = service.generate(command, provider)
+    assert receipt.state is BaselineGenerationState.SUCCEEDED
+    assert provider.remaining is not None
+    assert provider.remaining > timedelta(seconds=350)
 
 
 def test_postgres_feedback_rollback_is_retryable(
@@ -105,9 +159,9 @@ def test_postgres_feedback_rollback_is_retryable(
             raise RuntimeError("injected PostgreSQL transaction failure")
 
     with pytest.raises(BaselineGenerationError) as error:
-        BaselineGenerationService(
-            environment.sessions, stage_hook=fail
-        ).generate(command, CapturingProvider())
+        BaselineGenerationService(environment.sessions, stage_hook=fail).generate(
+            command, CapturingProvider()
+        )
     assert error.value.code == "database_commit_failed"
     assert _feedback_rows(environment, persisted.run_id) == []
 
@@ -160,9 +214,7 @@ def test_postgres_authorization_revocation_before_commit_blocks_feedback(
 
     class RevokingProvider(CapturingProvider):
         def generate(self, generation_input, *, idempotency_key: str) -> str:
-            output = super().generate(
-                generation_input, idempotency_key=idempotency_key
-            )
+            output = super().generate(generation_input, idempotency_key=idempotency_key)
             with environment.engine.begin() as connection:
                 connection.execute(
                     text(

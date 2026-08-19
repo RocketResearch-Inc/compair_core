@@ -10,15 +10,25 @@ from __future__ import annotations
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import text
-from test_baseline_control_generation import _persist_control, _state, _structured
+from test_baseline_control_generation import (
+    CoordinatedLeaseInspectingProvider,
+    _persist_control,
+    _state,
+    _structured,
+)
 from test_baseline_generation import CapturingProvider, RawOutputProvider
 from test_baseline_generation_postgres import (
     postgres_generation_environment as _postgres_generation_environment_fixture,  # noqa: F401
 )
 
+from compair_core.baseline_generation.profile import (
+    CPU_GENERATION_TIMEOUT_SECONDS,
+    required_generation_lease_seconds,
+)
 from compair_core.compair.retrieval.generation import (
     BaselineGenerationBusyError,
     BaselineGenerationError,
@@ -61,6 +71,28 @@ def test_postgres_control_positive_and_restart(
     assert [row["baseline_finding_ordinal"] for row in feedback] == [1, 2]
     assert len(outbox) == 1
     assert notifications == 0
+
+
+def test_postgres_control_and_generation_leases_cover_cpu_timeout(
+    postgres_generation_environment,
+) -> None:
+    environment = postgres_generation_environment
+    job_id, _caller, persisted = _persist_control(environment)
+    provider = CoordinatedLeaseInspectingProvider(
+        environment,
+        job_id,
+        persisted.run_id,
+    )
+    receipt = BaselineGenerationService(
+        environment.sessions,
+        lease_seconds=required_generation_lease_seconds(CPU_GENERATION_TIMEOUT_SECONDS),
+        provider_timeout_seconds=CPU_GENERATION_TIMEOUT_SECONDS,
+    ).generate_control(job_id, provider)
+    assert receipt.state == "feedback_persisted"
+    assert provider.control_remaining is not None
+    assert provider.generation_remaining is not None
+    assert provider.control_remaining > timedelta(seconds=350)
+    assert provider.generation_remaining > timedelta(seconds=350)
 
 
 def test_postgres_control_zero_findings(postgres_generation_environment) -> None:

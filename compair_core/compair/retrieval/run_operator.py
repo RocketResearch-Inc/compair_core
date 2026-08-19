@@ -27,6 +27,10 @@ from ...baseline_generation.ollama import (
     OllamaGenerationConfig,
     validate_baseline_generation_endpoint,
 )
+from ...baseline_generation.profile import (
+    ACCELERATED_GENERATION_TIMEOUT_SECONDS,
+    required_generation_lease_seconds,
+)
 from ...schema_migrations import (
     CORE_SCHEMA_MIGRATIONS,
     MIGRATION_TABLE_NAME,
@@ -331,6 +335,13 @@ class BaselineRunRuntime:
             if provider_factory is not None
             else _configured_generation_provider(settings)
         )
+        provider_timeout_seconds = float(
+            getattr(
+                settings,
+                "baseline_generation_timeout_seconds",
+                ACCELERATED_GENERATION_TIMEOUT_SECONDS,
+            )
+        )
         executor = BaselineDocumentRunExecutor(
             engine,
             identity=InternalBaselineRunWorkerIdentity.create("manual-operator"),
@@ -345,6 +356,10 @@ class BaselineRunRuntime:
             executor=executor,
             generation=BaselineGenerationService(
                 self.sessions,
+                lease_seconds=required_generation_lease_seconds(
+                    provider_timeout_seconds
+                ),
+                provider_timeout_seconds=provider_timeout_seconds,
                 notifications_enabled=False,
             ),
             provider=self.provider,

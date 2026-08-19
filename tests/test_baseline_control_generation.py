@@ -19,6 +19,10 @@ from test_baseline_generation import (
     _environment,
 )
 
+from compair_core.baseline_generation.profile import (
+    CPU_GENERATION_TIMEOUT_SECONDS,
+    required_generation_lease_seconds,
+)
 from compair_core.compair.retrieval import generation as generation_module
 from compair_core.compair.retrieval.evidence_persistence import (
     BaselineEvidencePersistenceService,
@@ -104,6 +108,43 @@ def _state(environment, job_id: str, run_id: str):
     return job, run, feedback, outbox, notifications
 
 
+class CoordinatedLeaseInspectingProvider(CapturingProvider):
+    def __init__(self, environment, job_id: str, run_id: str) -> None:
+        super().__init__("coordinated lease-safe finding")
+        self.environment = environment
+        self.job_id = job_id
+        self.run_id = run_id
+        self.control_remaining: timedelta | None = None
+        self.generation_remaining: timedelta | None = None
+
+    @staticmethod
+    def _aware(value: datetime | str) -> datetime:
+        if isinstance(value, str):
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+    def generate(self, generation_input, *, idempotency_key: str) -> str:
+        with self.environment.engine.connect() as connection:
+            control_expiry = connection.execute(
+                text(
+                    "SELECT lease_expires_at FROM baseline_control_run_job "
+                    "WHERE job_id = :job_id"
+                ),
+                {"job_id": self.job_id},
+            ).scalar_one()
+            generation_expiry = connection.execute(
+                text(
+                    "SELECT generation_lease_expires_at "
+                    "FROM baseline_retrieval_run WHERE run_id = :run_id"
+                ),
+                {"run_id": self.run_id},
+            ).scalar_one()
+        now = datetime.now(timezone.utc)
+        self.control_remaining = self._aware(control_expiry) - now
+        self.generation_remaining = self._aware(generation_expiry) - now
+        return super().generate(generation_input, idempotency_key=idempotency_key)
+
+
 def test_control_generation_positive_is_ordered_atomic_and_replayed(
     tmp_path: Path,
 ) -> None:
@@ -165,6 +206,34 @@ def test_control_generation_positive_is_ordered_atomic_and_replayed(
         assert outbox[0]["state"] == "suppressed"
         assert outbox[0]["finding_count"] == 2
         assert notifications == 0
+    finally:
+        environment.engine.dispose()
+
+
+def test_control_and_generation_leases_cover_cpu_provider_timeout(
+    tmp_path: Path,
+) -> None:
+    environment = _environment(tmp_path, "control-cpu-timeout-lease.db")
+    try:
+        job_id, _caller, persisted = _persist_control(environment)
+        provider = CoordinatedLeaseInspectingProvider(
+            environment,
+            job_id,
+            persisted.run_id,
+        )
+        service = BaselineGenerationService(
+            environment.sessions,
+            lease_seconds=required_generation_lease_seconds(
+                CPU_GENERATION_TIMEOUT_SECONDS
+            ),
+            provider_timeout_seconds=CPU_GENERATION_TIMEOUT_SECONDS,
+        )
+        receipt = service.generate_control(job_id, provider)
+        assert receipt.state == "feedback_persisted"
+        assert provider.control_remaining is not None
+        assert provider.generation_remaining is not None
+        assert provider.control_remaining > timedelta(seconds=350)
+        assert provider.generation_remaining > timedelta(seconds=350)
     finally:
         environment.engine.dispose()
 

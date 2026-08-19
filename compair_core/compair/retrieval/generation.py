@@ -35,6 +35,10 @@ from ...baseline_evidence_schema import (
     SOURCE_SCOPE_LEGACY_CHUNK,
     SOURCE_SCOPE_VERSION,
 )
+from ...baseline_generation.profile import (
+    MINIMUM_GENERATION_LEASE_SECONDS,
+    validate_generation_timeout_lease,
+)
 from .control_document_scope import (
     ControlDocumentCorpusScopeError,
     control_document_corpus_identity,
@@ -65,7 +69,7 @@ GENERATION_OUTPUT_SPEC_SHA256 = (
 GENERATION_OUTPUT_SCHEMA_SHA256 = (
     "fc5a85d5d38c18775afe0966987ea74e7e9ac072148822c1be60a199e32cca27"
 )
-DEFAULT_LEASE_SECONDS = 300
+DEFAULT_LEASE_SECONDS = MINIMUM_GENERATION_LEASE_SECONDS
 MAX_GENERATION_OUTPUT_CHARACTERS = 100_000
 
 
@@ -617,12 +621,18 @@ class BaselineGenerationService:
         session_factory: Any,
         *,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
+        provider_timeout_seconds: float | None = None,
         stage_hook: StageHook | None = None,
         clock: Callable[[], datetime] = _utcnow,
         notifications_enabled: bool | None = None,
     ) -> None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
+        if provider_timeout_seconds is not None:
+            validate_generation_timeout_lease(
+                provider_timeout_seconds,
+                lease_seconds,
+            )
         self._session_factory = session_factory
         self._lease_seconds = lease_seconds
         self._stage_hook = stage_hook
@@ -633,6 +643,12 @@ class BaselineGenerationService:
             else notifications_enabled
         )
         self._input_adapter = BaselineGenerationInputAdapter()
+
+    @property
+    def lease_seconds(self) -> int:
+        """Return the configured internal lease duration for diagnostics/tests."""
+
+        return self._lease_seconds
 
     def generate(
         self,

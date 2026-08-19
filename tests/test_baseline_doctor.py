@@ -3,10 +3,12 @@ from __future__ import annotations
 import base64
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
 import httpx
+import pytest
 from sqlalchemy import create_engine, inspect, update
 
 from compair_core import doctor as doctor_module
@@ -16,6 +18,11 @@ from compair_core.baseline_control_plane_schema import (
     baseline_worker_instance,
 )
 from compair_core.baseline_embedding.manifest import load_baseline_model_manifest
+from compair_core.baseline_generation.profile import (
+    GIB,
+    RECOMMENDED_GENERATION_MODEL,
+    RECOMMENDED_GENERATION_MODEL_DIGEST,
+)
 from compair_core.compair import models
 from compair_core.compair.retrieval.corpus import ensure_retrieval_corpus_schema
 from compair_core.compair.retrieval.database_worker import (
@@ -26,6 +33,7 @@ from compair_core.doctor import (
     DOCTOR_RESULT_SCHEMA_VERSION,
     BaselineDoctorResult,
     DoctorComponent,
+    GenerationResourceSnapshot,
     run_doctor,
 )
 from compair_core.runtime_config import build_runtime_configuration
@@ -61,8 +69,8 @@ def _settings(tmp_path, **overrides: object) -> Settings:
         "baseline_model_cache": str(tmp_path / "models"),
         "baseline_generation_provider": "ollama",
         "baseline_generation_endpoint": "http://127.0.0.1:11434",
-        "baseline_generation_model": "qwen3:1.7b",
-        "baseline_generation_model_digest": "sha256:" + "8" * 64,
+        "baseline_generation_model": RECOMMENDED_GENERATION_MODEL,
+        "baseline_generation_model_digest": RECOMMENDED_GENERATION_MODEL_DIGEST,
         "baseline_generation_allow_loopback_http": True,
         "baseline_run_encryption_keyring": _keyring(),
         "baseline_notifications_enabled": False,
@@ -115,8 +123,8 @@ def _generation_factory(calls: list[str]):
                     json={
                         "models": [
                             {
-                                "name": "qwen3:1.7b",
-                                "digest": "sha256:" + "8" * 64,
+                                "name": RECOMMENDED_GENERATION_MODEL,
+                                "digest": RECOMMENDED_GENERATION_MODEL_DIGEST,
                             }
                         ]
                     },
@@ -125,7 +133,7 @@ def _generation_factory(calls: list[str]):
                 return httpx.Response(
                     200,
                     json={
-                        "model": "qwen3:1.7b",
+                        "model": RECOMMENDED_GENERATION_MODEL,
                         "done": True,
                         "done_reason": "stop",
                         "message": {
@@ -149,6 +157,19 @@ def _generation_factory(calls: list[str]):
 
 def _verified_model():
     return SimpleNamespace(manifest=load_baseline_model_manifest())
+
+
+@pytest.fixture(autouse=True)
+def _stable_generation_resources(monkeypatch) -> None:
+    monkeypatch.setattr(
+        doctor_module,
+        "_sample_generation_resources",
+        lambda: GenerationResourceSnapshot(
+            total_memory_bytes=32 * GIB,
+            available_memory_bytes=24 * GIB,
+            free_storage_bytes=40 * GIB,
+        ),
+    )
 
 
 def _matching_worker(engine, settings, *, clock=None):
@@ -204,6 +225,111 @@ def test_doctor_ready_json_contract_and_probe_is_opt_in(
     assert without_probe.component("notifications").reason_code == (
         "notifications_default_off"
     )
+
+
+def test_generation_resource_projection_warning_failure_and_attested_gpu() -> None:
+    recommended = doctor_module._generation_resource_component(
+        _settings(Path(".")),
+        lambda: GenerationResourceSnapshot(
+            total_memory_bytes=32 * GIB,
+            available_memory_bytes=24 * GIB,
+            free_storage_bytes=40 * GIB,
+        ),
+    )
+    assert recommended.status == "ready"
+    assert recommended.reason_code == "generation_resources_recommended"
+    assert recommended.details["warning"] is False
+    assert recommended.details["accelerator_memory_attested"] is False
+    assert recommended.details["accelerator_memory_bytes"] is None
+    assert recommended.details["measured_32k_inference_allocation_bytes"] == (15 * GIB)
+    assert recommended.details["recommended_total_memory_bytes"] == 24 * GIB
+    assert recommended.details["preferred_total_memory_bytes"] == 32 * GIB
+    assert recommended.details["minimum_free_storage_bytes"] == 25 * GIB
+    assert recommended.details["acquisition_free_storage_bytes"] == 40 * GIB
+
+    warning = doctor_module._generation_resource_component(
+        _settings(Path(".")),
+        lambda: GenerationResourceSnapshot(
+            total_memory_bytes=24 * GIB,
+            available_memory_bytes=16 * GIB,
+            free_storage_bytes=25 * GIB,
+        ),
+    )
+    assert warning.status == "ready"
+    assert warning.reason_code == "generation_resources_warning"
+    assert warning.details["readiness_blocking"] is False
+    assert warning.details["warning_codes"] == [
+        "total_memory_below_preferred",
+        "free_storage_below_acquisition_recommendation",
+    ]
+
+    insufficient = doctor_module._generation_resource_component(
+        _settings(Path(".")),
+        lambda: GenerationResourceSnapshot(
+            total_memory_bytes=8 * GIB,
+            available_memory_bytes=4 * GIB,
+            free_storage_bytes=50 * GIB,
+        ),
+    )
+    assert insufficient.status == "not_ready"
+    assert insufficient.reason_code == "generation_resources_insufficient"
+    assert insufficient.details["readiness_blocking"] is True
+
+    advisory = doctor_module._generation_resource_component(
+        Settings(),
+        lambda: GenerationResourceSnapshot(
+            total_memory_bytes=8 * GIB,
+            available_memory_bytes=4 * GIB,
+            free_storage_bytes=10 * GIB,
+        ),
+    )
+    assert advisory.status == "ready"
+    assert advisory.reason_code == "generation_resources_warning"
+    assert advisory.details["recommended_profile_selected"] is False
+    assert advisory.details["readiness_blocking"] is False
+
+    dedicated = doctor_module._generation_resource_component(
+        _settings(Path(".")),
+        lambda: GenerationResourceSnapshot(
+            total_memory_bytes=8 * GIB,
+            available_memory_bytes=4 * GIB,
+            free_storage_bytes=50 * GIB,
+            accelerator_memory_attested=True,
+            accelerator_memory_bytes=24 * GIB,
+        ),
+    )
+    assert dedicated.status == "ready"
+    assert dedicated.reason_code == "generation_resources_recommended"
+    assert dedicated.details["assessment_mode"] == ("attested_dedicated_accelerator")
+    rendered = json.dumps(dedicated.as_dict(), sort_keys=True)
+    for prohibited in ("/Users/", "http://", "postgresql://", "credential"):
+        assert prohibited not in rendered
+
+
+def test_insufficient_generation_resources_fail_baseline_readiness(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    engine = _engine(tmp_path)
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(
+        doctor_module, "verify_baseline_model", lambda _root: _verified_model()
+    )
+    _matching_worker(engine, settings)
+    result = run_doctor(
+        settings=settings,
+        engine=engine,
+        embedding_client_factory=_embedding_client,
+        generation_client_factory=_generation_factory([]),
+        generation_resource_sampler=lambda: GenerationResourceSnapshot(
+            total_memory_bytes=8 * GIB,
+            available_memory_bytes=4 * GIB,
+            free_storage_bytes=50 * GIB,
+        ),
+    )
+    assert result.component("generation_resources").status == "not_ready"
+    assert result.component("baseline_capability").reason_code == ("baseline_not_ready")
+    assert result.exit_code(require_baseline=True) == 5
 
 
 def test_doctor_does_not_create_missing_migration_registry(tmp_path) -> None:

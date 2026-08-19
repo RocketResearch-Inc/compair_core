@@ -173,6 +173,18 @@ readiness, notification default-off state, retained model staging, safe job
 state counts, and threshold-only disk sufficiency. Core intentionally does not
 read the CLI repository-binding installation secret.
 
+The additive `generation_resources` component evaluates the recommended
+qwen3:14b CPU profile without exposing a path, endpoint, cache listing, or
+credential. It reports host total/available memory and free storage as byte
+counts, a 24 GiB minimum and 32 GiB preferred total-memory recommendation,
+approximately 15 GB measured 32K inference allocation, and 25/40 GB steady
+state/acquisition storage guidance. Capacity below the measured safe floor is
+readiness-blocking when the exact recommended Ollama profile is selected;
+lesser recommendation shortfalls are explicit warnings. Disabled or custom
+generation profiles are not falsely failed using qwen3:14b measurements.
+Dedicated-GPU memory is reported only when supplied by a reliable attestation;
+otherwise the assessment is labeled conservative host memory.
+
 Stable action codes never embed commands or private values. The usual recovery
 order is: correct configuration, restore database connectivity, apply pending
 migrations through a normal API/worker startup, restore the query keyring,

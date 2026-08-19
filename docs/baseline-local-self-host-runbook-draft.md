@@ -214,11 +214,21 @@ never pulls it. Configure the native provider with its exact immutable digest:
 ```sh
 export COMPAIR_BASELINE_GENERATION_PROVIDER=ollama
 export COMPAIR_BASELINE_GENERATION_ENDPOINT=http://127.0.0.1:11434
-export COMPAIR_BASELINE_GENERATION_MODEL=qwen3:1.7b
-export COMPAIR_BASELINE_GENERATION_MODEL_DIGEST=sha256:8f68893c685c3ddff2aa3fffce2aa60a30bb2da65ca488b61fff134a4d1730e7
-export COMPAIR_BASELINE_GENERATION_TIMEOUT_SECONDS=60
+export COMPAIR_BASELINE_GENERATION_MODEL=qwen3:14b
+export COMPAIR_BASELINE_GENERATION_MODEL_DIGEST=sha256:bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8
+export COMPAIR_BASELINE_GENERATION_TIMEOUT_SECONDS=300
 export COMPAIR_BASELINE_GENERATION_ALLOW_LOOPBACK_HTTP=true
 ```
+
+This is the supported CPU-only timeout profile. It preserves the qualified
+32,768-token context and 1,024-token output limit. Plan for 24 GiB total memory
+minimum (32 GiB preferred), approximately 15 GB measured 32K inference
+allocation, 25 GB free storage after installation, and 40 GB free during model
+acquisition or upgrades. Accelerated deployments may retain the 60-second
+default only when their measured provider bound fits it. For routine CPU jobs,
+configure the Ollama service with a keep-alive such as
+`OLLAMA_KEEP_ALIVE=30m`; Core does not control model acquisition or silently
+substitute another model.
 
 Verify runtime, model, and digest without inference, then opt into one benign
 strict-schema probe:
@@ -249,6 +259,9 @@ compair-core-worker --poll
 
 Graceful SIGINT/SIGTERM stops new claims, drains the current call, updates the
 heartbeat, and exits. A hard stop relies on job lease expiry/reclaim.
+The worker derives the generation lease from the configured provider timeout.
+At the 300-second CPU bound the lease is 360 seconds, reserving 60 seconds for
+strict response validation and the atomic Feedback commit.
 
 Before starting the worker, inspect the common environment and database:
 

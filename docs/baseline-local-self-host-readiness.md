@@ -158,6 +158,25 @@ one safe JSON value without endpoints, prompts, evidence, findings, raw
 responses, leases, or idempotency keys. The old development translation proxy
 is unnecessary and remains unsupported.
 
+The supported recommended local profile is `qwen3:14b` Q4_K_M at immutable
+Ollama manifest digest
+`sha256:bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8`.
+It was independently qualified on Ollama 0.32.14 at 32,768 context and a
+1,024-token output limit, with 32/32 expected outcomes across two cold cycles.
+That qualification is not the final 120-case examination. Peak Ollama RSS was
+14.88 GB, maximum observed case latency was 87.76 seconds, and a separate cold
+probe took 119.47 seconds.
+
+CPU-only operation therefore uses an explicit 300-second provider timeout and
+a derived 360-second internal generation lease. The historical 60-second
+accelerated default remains available. Doctor reports 24 GiB total memory as
+the supported minimum, 32 GiB as preferred, approximately 15 GB measured 32K
+inference allocation, 25 GB minimum free storage, and 40 GB during acquisition
+or upgrades. Host-only measurements are conservative; doctor does not claim
+dedicated-GPU memory unless an attested measurement exists. CPU operators
+should configure Ollama keep-alive to avoid routine cold loading when the
+resident-memory tradeoff is acceptable.
+
 ### FastEmbed/BGE
 
 The committed `scripts/live_baseline_embedding_service.py` is contract-correct

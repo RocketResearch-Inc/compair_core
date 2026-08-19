@@ -28,6 +28,24 @@ fixed seed, and bounded `num_ctx`/`num_predict`. Ordered stored renderer output
 is passed without reranking, clipping, or normalization. Findings remain
 bounded by both the four-item schema and the persisted Reference count.
 
+## Recommended qualified profile
+
+The supported recommended local profile is:
+
+- model: `qwen3:14b`;
+- quantization: Q4_K_M;
+- immutable Ollama manifest digest:
+  `sha256:bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8`;
+- validated Ollama runtime: 0.32.14;
+- context: 32,768 tokens;
+- output limit: 1,024 tokens; and
+- adapter: `baseline-generation-ollama-http.v1`.
+
+The provider qualification produced 32/32 expected outcomes across two
+independent cold cycles. Peak Ollama RSS was 14.88 GB, maximum observed latency
+was 87.76 seconds, and a separate cold probe took 119.47 seconds. This is a
+provider qualification result, not the final 120-case examination.
+
 Only `message.content` is passed to Core's existing strict output validator.
 Plain text, `NONE`, Markdown fences, blank or malformed JSON, duplicate keys,
 non-finite numbers, extra properties, blank findings, and excessive findings
@@ -41,11 +59,23 @@ idempotent across retries.
 ```sh
 export COMPAIR_BASELINE_GENERATION_PROVIDER=ollama
 export COMPAIR_BASELINE_GENERATION_ENDPOINT=http://127.0.0.1:11434
-export COMPAIR_BASELINE_GENERATION_MODEL=qwen3:1.7b
-export COMPAIR_BASELINE_GENERATION_MODEL_DIGEST=sha256:8f68893c685c3ddff2aa3fffce2aa60a30bb2da65ca488b61fff134a4d1730e7
-export COMPAIR_BASELINE_GENERATION_TIMEOUT_SECONDS=60
+export COMPAIR_BASELINE_GENERATION_MODEL=qwen3:14b
+export COMPAIR_BASELINE_GENERATION_MODEL_DIGEST=sha256:bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8
+export COMPAIR_BASELINE_GENERATION_TIMEOUT_SECONDS=300
 export COMPAIR_BASELINE_GENERATION_ALLOW_LOOPBACK_HTTP=true
 ```
+
+The 300-second value is the supported CPU-only timeout profile. The settings
+default remains 60 seconds for compatibility with accelerated deployments.
+Core derives a 360-second internal generation/control-job lease from the CPU
+timeout, preserving a 60-second response-validation and atomic-commit margin.
+Configurations cannot use a provider timeout above 300 seconds, and an
+internally supplied lease shorter than the derived bound is rejected.
+
+For CPU deployments, configure model residency on the Ollama service, for
+example `OLLAMA_KEEP_ALIVE=30m`, to avoid a cold model load on routine jobs.
+Choose a shorter duration when reclaiming resident memory is more important.
+Core does not send pull requests or replace the attested model.
 
 The HTTP exception accepts only a literal loopback IP and must be explicit.
 `localhost`, credentials in URLs, query strings, fragments, and non-loopback
@@ -56,6 +86,7 @@ The optional bounds are:
 
 | Setting | Default | Allowed range |
 | --- | ---: | ---: |
+| `COMPAIR_BASELINE_GENERATION_TIMEOUT_SECONDS` | 60 seconds | 0.1–300 seconds; use 300 for the supported CPU profile |
 | `COMPAIR_BASELINE_GENERATION_MAX_REQUEST_BYTES` | 256,000 | 4,096–8,000,000 |
 | `COMPAIR_BASELINE_GENERATION_MAX_RESPONSE_BYTES` | 200,000 | 4,096–1,000,000 |
 | `COMPAIR_BASELINE_GENERATION_CONTEXT_TOKENS` | 32,768 | 2,048–131,072 |
@@ -64,6 +95,23 @@ The optional bounds are:
 
 Inputs that cannot fit the conservative context bound fail; Core never relies
 on hidden model-side truncation.
+
+## Resource guidance
+
+For the recommended CPU/unified-memory profile:
+
+- total memory: 24 GiB minimum, 32 GiB preferred;
+- measured 32K inference allocation: approximately 15 GB;
+- free storage after acquisition: at least 25 GB; and
+- free storage during acquisition or upgrades: at least 40 GB.
+
+`compair-core doctor` reports observed host memory and free storage without
+printing a filesystem path or inspecting model-cache contents. When the exact
+recommended Ollama profile is selected, capacity below the measured safe floor
+is a readiness failure. Falling below the recommended or preferred guidance is
+a nonblocking warning. Dedicated-GPU capacity is not claimed unless it can be
+explicitly attested; otherwise doctor uses the host memory result
+conservatively.
 
 ## Verification and readiness
 

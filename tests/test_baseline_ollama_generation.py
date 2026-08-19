@@ -23,6 +23,11 @@ from compair_core.baseline_generation.ollama import (
     OllamaGenerationConfig,
     verify_ollama_generation,
 )
+from compair_core.baseline_generation.profile import (
+    ACCELERATED_GENERATION_TIMEOUT_SECONDS,
+    RECOMMENDED_GENERATION_MODEL,
+    RECOMMENDED_GENERATION_MODEL_DIGEST,
+)
 from compair_core.compair.retrieval.generation import (
     GENERATION_OUTPUT_SCHEMA_SHA256,
     GENERATION_OUTPUT_SPEC_SHA256,
@@ -39,9 +44,9 @@ from compair_core.compair.retrieval.run_operator import (
 from compair_core.server.settings import Settings
 
 ROOT = Path(__file__).resolve().parents[1]
-MODEL = "qwen3:1.7b"
-DIGEST_HEX = "8f68893c685c3ddff2aa3fffce2aa60a30bb2da65ca488b61fff134a4d1730e7"
-DIGEST = f"sha256:{DIGEST_HEX}"
+MODEL = RECOMMENDED_GENERATION_MODEL
+DIGEST = RECOMMENDED_GENERATION_MODEL_DIGEST
+DIGEST_HEX = DIGEST.removeprefix("sha256:")
 
 
 def _structured(outcome: str, findings: list[str]) -> str:
@@ -739,6 +744,12 @@ def test_default_settings_are_fail_closed(monkeypatch) -> None:
             monkeypatch.delenv(key, raising=False)
     settings = Settings()
     assert settings.baseline_generation_provider == "disabled"
+    assert settings.baseline_generation_model == MODEL
+    assert settings.baseline_generation_model_digest == DIGEST
+    assert (
+        settings.baseline_generation_timeout_seconds
+        == ACCELERATED_GENERATION_TIMEOUT_SECONDS
+    )
     readiness = verify_ollama_generation(settings)
     assert readiness.status == "provider_unconfigured"
     assert readiness.ready is False

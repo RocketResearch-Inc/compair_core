@@ -30,6 +30,14 @@ from ..compair.retrieval.generation import (
     BaselineGenerationProviderError,
     BaselineGenerationService,
 )
+from .profile import (
+    ACCELERATED_GENERATION_TIMEOUT_SECONDS,
+    MAXIMUM_GENERATION_TIMEOUT_SECONDS,
+    QUALIFIED_CONTEXT_TOKENS,
+    QUALIFIED_OUTPUT_TOKENS,
+    RECOMMENDED_GENERATION_MODEL,
+    RECOMMENDED_GENERATION_MODEL_DIGEST,
+)
 
 OLLAMA_GENERATION_ADAPTER_CONTRACT = "baseline-generation-ollama-http.v1"
 OLLAMA_PROVIDER = "ollama"
@@ -167,8 +175,8 @@ class OllamaGenerationConfig:
     allow_loopback_http: bool
     maximum_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES
     maximum_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
-    context_tokens: int = 32_768
-    output_tokens: int = 1_024
+    context_tokens: int = QUALIFIED_CONTEXT_TOKENS
+    output_tokens: int = QUALIFIED_OUTPUT_TOKENS
     seed: int = 0
 
     @classmethod
@@ -178,10 +186,22 @@ class OllamaGenerationConfig:
                 getattr(settings, "baseline_generation_provider", "disabled")
             ).lower(),
             endpoint=getattr(settings, "baseline_generation_endpoint", None),
-            model=getattr(settings, "baseline_generation_model", None),
-            expected_digest=getattr(settings, "baseline_generation_model_digest", None),
+            model=getattr(
+                settings,
+                "baseline_generation_model",
+                RECOMMENDED_GENERATION_MODEL,
+            ),
+            expected_digest=getattr(
+                settings,
+                "baseline_generation_model_digest",
+                RECOMMENDED_GENERATION_MODEL_DIGEST,
+            ),
             timeout_seconds=float(
-                getattr(settings, "baseline_generation_timeout_seconds", 60.0)
+                getattr(
+                    settings,
+                    "baseline_generation_timeout_seconds",
+                    ACCELERATED_GENERATION_TIMEOUT_SECONDS,
+                )
             ),
             allow_loopback_http=bool(
                 getattr(
@@ -205,10 +225,18 @@ class OllamaGenerationConfig:
                 )
             ),
             context_tokens=int(
-                getattr(settings, "baseline_generation_context_tokens", 32_768)
+                getattr(
+                    settings,
+                    "baseline_generation_context_tokens",
+                    QUALIFIED_CONTEXT_TOKENS,
+                )
             ),
             output_tokens=int(
-                getattr(settings, "baseline_generation_output_tokens", 1_024)
+                getattr(
+                    settings,
+                    "baseline_generation_output_tokens",
+                    QUALIFIED_OUTPUT_TOKENS,
+                )
             ),
             seed=int(getattr(settings, "baseline_generation_seed", 0)),
         )
@@ -227,7 +255,7 @@ class OllamaGenerationConfig:
             allow_loopback_http=self.allow_loopback_http,
             require_root_path=True,
         )
-        if not 0.1 <= self.timeout_seconds <= 300.0:
+        if not 0.1 <= self.timeout_seconds <= MAXIMUM_GENERATION_TIMEOUT_SECONDS:
             raise _provider_error("provider_unconfigured")
         if not 4_096 <= self.maximum_request_bytes <= 8_000_000:
             raise _provider_error("provider_unconfigured")

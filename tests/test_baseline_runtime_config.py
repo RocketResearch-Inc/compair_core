@@ -7,6 +7,9 @@ from pathlib import Path
 
 from sqlalchemy.engine import make_url
 
+from compair_core.baseline_generation.profile import (
+    RECOMMENDED_GENERATION_MODEL,
+)
 from compair_core.runtime_config import (
     BASELINE_GENERATION_OUTPUT_SCHEMA_SHA256,
     BASELINE_GENERATION_OUTPUT_SPEC_SHA256,
@@ -51,7 +54,7 @@ def _settings(**overrides: object) -> Settings:
         "baseline_embedding_allow_insecure_loopback": True,
         "baseline_generation_provider": "ollama",
         "baseline_generation_endpoint": "http://127.0.0.1:11434",
-        "baseline_generation_model": "qwen3:1.7b",
+        "baseline_generation_model": RECOMMENDED_GENERATION_MODEL,
         "baseline_generation_model_digest": "sha256:" + "a" * 64,
         "baseline_generation_allow_loopback_http": True,
         "baseline_run_encryption_keyring": _keyring(),

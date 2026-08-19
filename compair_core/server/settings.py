@@ -6,6 +6,15 @@ from typing import Literal
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings
 
+from ..baseline_generation.profile import (
+    ACCELERATED_GENERATION_TIMEOUT_SECONDS,
+    MAXIMUM_GENERATION_TIMEOUT_SECONDS,
+    QUALIFIED_CONTEXT_TOKENS,
+    QUALIFIED_OUTPUT_TOKENS,
+    RECOMMENDED_GENERATION_MODEL,
+    RECOMMENDED_GENERATION_MODEL_DIGEST,
+)
+
 
 class Settings(BaseSettings):
     """Configuration injected via COMPAIR_ environment variables."""
@@ -78,7 +87,7 @@ class Settings(BaseSettings):
     baseline_worker_max_backoff_seconds: float = Field(
         default=30.0,
         ge=1.0,
-        le=300.0,
+        le=MAXIMUM_GENERATION_TIMEOUT_SECONDS,
     )
 
     # Baseline_v1 uses a separate fail-closed embedding provider. It never
@@ -102,11 +111,11 @@ class Settings(BaseSettings):
     # sending any source or evidence bytes and never falls back or pulls.
     baseline_generation_provider: Literal["disabled", "http", "ollama"] = "disabled"
     baseline_generation_endpoint: str | None = None
-    baseline_generation_model: str | None = None
-    baseline_generation_model_digest: str | None = None
+    baseline_generation_model: str | None = RECOMMENDED_GENERATION_MODEL
+    baseline_generation_model_digest: str | None = RECOMMENDED_GENERATION_MODEL_DIGEST
     baseline_generation_model_version: str | None = None
     baseline_generation_timeout_seconds: float = Field(
-        default=60.0,
+        default=ACCELERATED_GENERATION_TIMEOUT_SECONDS,
         ge=0.1,
         le=300.0,
     )
@@ -122,12 +131,12 @@ class Settings(BaseSettings):
         le=1_000_000,
     )
     baseline_generation_context_tokens: int = Field(
-        default=32_768,
+        default=QUALIFIED_CONTEXT_TOKENS,
         ge=2_048,
         le=131_072,
     )
     baseline_generation_output_tokens: int = Field(
-        default=1_024,
+        default=QUALIFIED_OUTPUT_TOKENS,
         ge=64,
         le=4_096,
     )

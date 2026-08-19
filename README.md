@@ -153,8 +153,9 @@ digest is attested:
 ```bash
 export COMPAIR_BASELINE_GENERATION_PROVIDER=ollama
 export COMPAIR_BASELINE_GENERATION_ENDPOINT=http://127.0.0.1:11434
-export COMPAIR_BASELINE_GENERATION_MODEL=qwen3:1.7b
-export COMPAIR_BASELINE_GENERATION_MODEL_DIGEST=sha256:8f68893c685c3ddff2aa3fffce2aa60a30bb2da65ca488b61fff134a4d1730e7
+export COMPAIR_BASELINE_GENERATION_MODEL=qwen3:14b
+export COMPAIR_BASELINE_GENERATION_MODEL_DIGEST=sha256:bdbd181c33f2ed1b31c972991882db3cf4d192569092138a7d29e973cd9debe8
+export COMPAIR_BASELINE_GENERATION_TIMEOUT_SECONDS=300
 export COMPAIR_BASELINE_GENERATION_ALLOW_LOOPBACK_HTTP=true
 compair-core-generation verify
 compair-core-generation verify --probe
@@ -162,6 +163,14 @@ compair-core-generation verify --probe
 
 The first command performs no inference. The opt-in probe uses only synthetic
 text and validates the exact packaged `baseline-generation-output.v2` schema.
+The recommended CPU profile uses `qwen3:14b` Q4_K_M at 32,768 context and a
+1,024-token output limit. Plan for at least 24 GiB total memory (32 GiB
+preferred), 25 GB free storage after installation, and 40 GB free while
+acquiring or upgrading the model. The measured 32K inference allocation was
+approximately 15 GB. Set an Ollama service keep-alive such as
+`OLLAMA_KEEP_ALIVE=30m` for CPU deployments where avoiding routine cold loads
+is more important than releasing the resident memory promptly. Core does not
+download the model or weaken exact digest attestation.
 See [the native Ollama generation runbook](docs/baseline-ollama-generation.md).
 
 The installed self-hosted baseline processes have stable loopback-first entry
@@ -239,7 +248,7 @@ Key environment variables for the core edition:
 - `COMPAIR_GENERATION_ENDPOINT` – HTTP endpoint invoked when `COMPAIR_GENERATION_PROVIDER=http`; the service receives a JSON payload (`document`, `references`, `length_instruction`) and should return `{"feedback": ...}`.
 - `COMPAIR_BASELINE_GENERATION_PROVIDER` (`disabled`) – select baseline-only `ollama` or the separate strict `http` adapter. It never inherits or falls back to legacy generation.
 - `COMPAIR_BASELINE_GENERATION_ENDPOINT` / `COMPAIR_BASELINE_GENERATION_MODEL` / `COMPAIR_BASELINE_GENERATION_MODEL_DIGEST` – pin the native Ollama base URL, tag, and mandatory immutable digest. Plain HTTP is limited to an explicitly enabled literal-loopback endpoint; remote endpoints require verified HTTPS.
-- `COMPAIR_BASELINE_GENERATION_TIMEOUT_SECONDS` / `COMPAIR_BASELINE_GENERATION_CONTEXT_TOKENS` / `COMPAIR_BASELINE_GENERATION_OUTPUT_TOKENS` – bound native connect/read/total time and deterministic context/output budgets.
+- `COMPAIR_BASELINE_GENERATION_TIMEOUT_SECONDS` / `COMPAIR_BASELINE_GENERATION_CONTEXT_TOKENS` / `COMPAIR_BASELINE_GENERATION_OUTPUT_TOKENS` – bound native connect/read/total time and deterministic context/output budgets. The accelerated default remains 60 seconds; the supported CPU-only qwen3:14b profile explicitly uses 300 seconds and receives a 360-second internal generation lease.
 - `COMPAIR_NOTIFICATION_SCORING_ENABLED` (`true`) – enable ranked notification-event scoring in Core. Set to `false` if you only want raw feedback without notification triage.
 - `COMPAIR_NOTIFICATION_SCORING_PROVIDER` (`auto`) – choose `auto`, `heuristic`, or `openai` for notification-event scoring. `auto` uses OpenAI when an API key is configured and otherwise falls back to a deterministic local heuristic.
 - `COMPAIR_NOTIFICATION_SCORING_TIMEOUT_S` (`30`) – request timeout in seconds for OpenAI-backed notification scoring. Increase this for large cross-repo review runs if scorer requests are timing out.

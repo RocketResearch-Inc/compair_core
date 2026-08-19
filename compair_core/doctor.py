@@ -18,6 +18,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
+import psutil
 from sqlalchemy import Engine, func, inspect, select
 
 from .baseline_control_plane_schema import (
@@ -36,6 +37,16 @@ from .baseline_embedding.cache import (
 from .baseline_embedding.manifest import (
     BaselineModelManifestError,
     load_baseline_model_manifest,
+)
+from .baseline_generation.profile import (
+    ACQUISITION_FREE_STORAGE_BYTES,
+    MEASURED_32K_INFERENCE_ALLOCATION_BYTES,
+    MINIMUM_FREE_STORAGE_BYTES,
+    MINIMUM_GENERATION_CAPACITY_BYTES,
+    PREFERRED_TOTAL_MEMORY_BYTES,
+    RECOMMENDED_GENERATION_MODEL,
+    RECOMMENDED_GENERATION_MODEL_DIGEST,
+    RECOMMENDED_TOTAL_MEMORY_BYTES,
 )
 from .config_init import add_config_init_arguments, run_config_init_command
 from .runtime_config import (
@@ -89,6 +100,34 @@ class DoctorComponent:
 
 
 @dataclass(frozen=True, slots=True)
+class GenerationResourceSnapshot:
+    """Privacy-safe host/accelerator capacity supplied to doctor."""
+
+    total_memory_bytes: int
+    available_memory_bytes: int
+    free_storage_bytes: int
+    accelerator_memory_attested: bool = False
+    accelerator_memory_bytes: int | None = None
+
+    def validate(self) -> None:
+        values = (
+            self.total_memory_bytes,
+            self.available_memory_bytes,
+            self.free_storage_bytes,
+        )
+        if any(value < 0 for value in values):
+            raise ValueError("resource measurement is invalid")
+        if self.accelerator_memory_attested:
+            if (
+                self.accelerator_memory_bytes is None
+                or self.accelerator_memory_bytes < 0
+            ):
+                raise ValueError("accelerator measurement is invalid")
+        elif self.accelerator_memory_bytes is not None:
+            raise ValueError("unattested accelerator memory is prohibited")
+
+
+@dataclass(frozen=True, slots=True)
 class BaselineDoctorResult:
     status: str
     runtime_configuration_fingerprint: str | None
@@ -123,6 +162,14 @@ class BaselineDoctorResult:
         migrations = self.component("migrations")
         embedding = self.component("embedding")
         generation = self.component("generation")
+        generation_resources = next(
+            (
+                component
+                for component in self.components
+                if component.name == "generation_resources"
+            ),
+            None,
+        )
         worker = self.component("worker")
         if configuration.status == _NOT_READY:
             return 2
@@ -132,6 +179,11 @@ class BaselineDoctorResult:
             if embedding.status != _READY:
                 return 4
             if generation.status != _READY:
+                return 5
+            if (
+                generation_resources is not None
+                and generation_resources.status == _NOT_READY
+            ):
                 return 5
             if worker.status != _READY:
                 return 6
@@ -525,6 +577,8 @@ def _generation_component(
             probe_performed=probe,
             probe_outcome=probe_outcome,
             supports_idempotency=False,
+            model=settings.baseline_generation_model,
+            model_digest=settings.baseline_generation_model_digest,
         )
     except (
         ValueError,
@@ -548,6 +602,122 @@ def _generation_component(
             probe_performed=probe,
             probe_outcome=None,
         )
+
+
+def _sample_generation_resources() -> GenerationResourceSnapshot:
+    memory = psutil.virtual_memory()
+    return GenerationResourceSnapshot(
+        total_memory_bytes=int(memory.total),
+        available_memory_bytes=int(memory.available),
+        free_storage_bytes=int(shutil.disk_usage(tempfile.gettempdir()).free),
+    )
+
+
+def _generation_resource_component(
+    settings: Settings,
+    sampler: Callable[[], GenerationResourceSnapshot] | None,
+) -> DoctorComponent:
+    recommended_profile_selected = (
+        settings.baseline_generation_provider == "ollama"
+        and settings.baseline_generation_model == RECOMMENDED_GENERATION_MODEL
+        and settings.baseline_generation_model_digest
+        == RECOMMENDED_GENERATION_MODEL_DIGEST
+    )
+    try:
+        snapshot = (sampler or _sample_generation_resources)()
+        snapshot.validate()
+    except (OSError, ValueError, psutil.Error):
+        return _component(
+            "generation_resources",
+            _READY,
+            "generation_resources_unattested",
+            readiness_blocking=False,
+            recommended_profile_selected=recommended_profile_selected,
+            warning=True,
+            warning_codes=["resource_measurement_unavailable"],
+            assessment_mode="host_memory_conservative",
+            accelerator_memory_attested=False,
+            accelerator_memory_bytes=None,
+            total_memory_bytes=None,
+            available_memory_bytes=None,
+            free_storage_bytes=None,
+            measured_32k_inference_allocation_bytes=(
+                MEASURED_32K_INFERENCE_ALLOCATION_BYTES
+            ),
+            recommended_total_memory_bytes=RECOMMENDED_TOTAL_MEMORY_BYTES,
+            preferred_total_memory_bytes=PREFERRED_TOTAL_MEMORY_BYTES,
+            minimum_free_storage_bytes=MINIMUM_FREE_STORAGE_BYTES,
+            acquisition_free_storage_bytes=ACQUISITION_FREE_STORAGE_BYTES,
+            recommended_model=RECOMMENDED_GENERATION_MODEL,
+            recommended_model_digest=RECOMMENDED_GENERATION_MODEL_DIGEST,
+        )
+
+    attested_accelerator = (
+        snapshot.accelerator_memory_bytes
+        if snapshot.accelerator_memory_attested
+        else None
+    )
+    accelerator_satisfies_floor = (
+        attested_accelerator is not None
+        and attested_accelerator >= MINIMUM_GENERATION_CAPACITY_BYTES
+    )
+    capacity_satisfies_floor = (
+        snapshot.total_memory_bytes >= MINIMUM_GENERATION_CAPACITY_BYTES
+        or accelerator_satisfies_floor
+    )
+    warnings: list[str] = []
+    if not accelerator_satisfies_floor:
+        if snapshot.total_memory_bytes < RECOMMENDED_TOTAL_MEMORY_BYTES:
+            warnings.append("total_memory_below_recommended")
+        elif snapshot.total_memory_bytes < PREFERRED_TOTAL_MEMORY_BYTES:
+            warnings.append("total_memory_below_preferred")
+    if (
+        snapshot.available_memory_bytes < MEASURED_32K_INFERENCE_ALLOCATION_BYTES
+        and not accelerator_satisfies_floor
+    ):
+        warnings.append("available_memory_below_measured_allocation")
+    if snapshot.free_storage_bytes < MINIMUM_FREE_STORAGE_BYTES:
+        warnings.append("free_storage_below_recommended_minimum")
+    elif snapshot.free_storage_bytes < ACQUISITION_FREE_STORAGE_BYTES:
+        warnings.append("free_storage_below_acquisition_recommendation")
+
+    if not capacity_satisfies_floor and recommended_profile_selected:
+        status = _NOT_READY
+        reason = "generation_resources_insufficient"
+    elif warnings:
+        status = _READY
+        reason = "generation_resources_warning"
+    else:
+        status = _READY
+        reason = "generation_resources_recommended"
+    return _component(
+        "generation_resources",
+        status,
+        reason,
+        readiness_blocking=status == _NOT_READY,
+        recommended_profile_selected=recommended_profile_selected,
+        warning=bool(warnings),
+        warning_codes=warnings,
+        assessment_mode=(
+            "attested_dedicated_accelerator"
+            if snapshot.accelerator_memory_attested
+            else "host_memory_conservative"
+        ),
+        accelerator_memory_attested=snapshot.accelerator_memory_attested,
+        accelerator_memory_bytes=attested_accelerator,
+        total_memory_bytes=snapshot.total_memory_bytes,
+        available_memory_bytes=snapshot.available_memory_bytes,
+        free_storage_bytes=snapshot.free_storage_bytes,
+        measured_32k_inference_allocation_bytes=(
+            MEASURED_32K_INFERENCE_ALLOCATION_BYTES
+        ),
+        recommended_total_memory_bytes=RECOMMENDED_TOTAL_MEMORY_BYTES,
+        preferred_total_memory_bytes=PREFERRED_TOTAL_MEMORY_BYTES,
+        minimum_free_storage_bytes=MINIMUM_FREE_STORAGE_BYTES,
+        acquisition_free_storage_bytes=ACQUISITION_FREE_STORAGE_BYTES,
+        recommended_model=RECOMMENDED_GENERATION_MODEL,
+        recommended_model_digest=RECOMMENDED_GENERATION_MODEL_DIGEST,
+    )
 
 
 def _safe_counts(engine: Engine, table_names: set[str]) -> dict[str, int]:
@@ -869,6 +1039,7 @@ def run_doctor(
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     embedding_client_factory: Callable[[], httpx.Client] | None = None,
     generation_client_factory: Callable[[], httpx.Client] | None = None,
+    generation_resource_sampler: Callable[[], GenerationResourceSnapshot] | None = None,
 ) -> BaselineDoctorResult:
     """Inspect readiness without applying migrations or executing private inference."""
 
@@ -953,6 +1124,9 @@ def run_doctor(
         probe=probe_generation,
         client_factory=generation_client_factory,
     )
+    generation_resources = _generation_resource_component(
+        settings, generation_resource_sampler
+    )
     worker = _worker_component(
         settings,
         runtime,
@@ -973,6 +1147,7 @@ def run_doctor(
                 worker,
             )
         )
+        and generation_resources.status != _NOT_READY
         and settings.baseline_runs_enabled
     )
     capability = _component(
@@ -992,6 +1167,7 @@ def run_doctor(
                     generation,
                 )
             )
+            and generation_resources.status != _NOT_READY
             and settings.baseline_runs_enabled
             else "not_ready"
         ),
@@ -1024,6 +1200,7 @@ def run_doctor(
         keyring,
         embedding,
         generation,
+        generation_resources,
         worker,
         capability,
         notifications,
@@ -1033,7 +1210,13 @@ def run_doctor(
     )
     if any(
         item.status == _NOT_READY
-        for item in (configuration, database, migrations, keyring)
+        for item in (
+            configuration,
+            database,
+            migrations,
+            keyring,
+            generation_resources,
+        )
     ):
         overall = _NOT_READY
     elif workflow_ready and disk.status == _READY and model_staging.status == _READY:
@@ -1048,6 +1231,7 @@ def run_doctor(
         "keyring": "restore_query_keyring",
         "embedding": "start_or_correct_embedding_service",
         "generation": "start_or_correct_generation_service",
+        "generation_resources": "review_generation_resource_capacity",
         "worker": "start_matching_database_worker",
         "model_staging": "review_retained_model_staging",
         "disk": "increase_available_disk_space",
@@ -1055,6 +1239,10 @@ def run_doctor(
     for component in components:
         if component.status != _READY and component.name in action_map:
             actions.append(action_map[component.name])
+        if component.name == "generation_resources" and component.details.get(
+            "warning"
+        ):
+            actions.append("review_generation_resource_capacity")
     if not settings.baseline_runs_enabled:
         actions.append("enable_baseline_runs_after_validation")
     return BaselineDoctorResult(

@@ -16,6 +16,10 @@ from test_baseline_evidence_persistence import (
 )
 
 from compair_core import db as core_db
+from compair_core.baseline_generation.profile import (
+    CPU_GENERATION_TIMEOUT_SECONDS,
+    required_generation_lease_seconds,
+)
 from compair_core.compair.retrieval import generation as generation_module
 from compair_core.compair.retrieval.evidence_persistence import (
     BaselineEvidencePersistenceCommand,
@@ -81,6 +85,30 @@ class FailingProvider(CapturingProvider):
             "safe fixture failure",
             retryable=self.retryable,
         )
+
+
+class LeaseInspectingProvider(CapturingProvider):
+    def __init__(self, engine, run_id: str) -> None:
+        super().__init__("lease-safe finding")
+        self.engine = engine
+        self.run_id = run_id
+        self.remaining: timedelta | None = None
+
+    def generate(self, generation_input, *, idempotency_key: str) -> str:
+        with self.engine.connect() as connection:
+            expiry = connection.execute(
+                text(
+                    "SELECT generation_lease_expires_at FROM baseline_retrieval_run "
+                    "WHERE run_id = :run_id"
+                ),
+                {"run_id": self.run_id},
+            ).scalar_one()
+        if isinstance(expiry, str):
+            expiry = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        self.remaining = expiry - datetime.now(timezone.utc)
+        return super().generate(generation_input, idempotency_key=idempotency_key)
 
 
 def _environment(tmp_path: Path, name: str = "generation.db"):
@@ -200,6 +228,29 @@ def test_control_document_generation_authorizes_without_source_chunk(
         assert generation_input.source_text == expected_document
         assert feedback_chunks == [None]
         assert outbox_count == 1
+    finally:
+        environment.engine.dispose()
+
+
+def test_sqlite_cpu_timeout_lease_remains_active_through_provider_call(
+    tmp_path: Path,
+) -> None:
+    environment = _environment(tmp_path, "cpu-timeout-lease.db")
+    try:
+        persisted, command = _persist(environment, "cpu-timeout-lease")
+        provider = LeaseInspectingProvider(environment.engine, persisted.run_id)
+        service = BaselineGenerationService(
+            environment.sessions,
+            lease_seconds=required_generation_lease_seconds(
+                CPU_GENERATION_TIMEOUT_SECONDS
+            ),
+            provider_timeout_seconds=CPU_GENERATION_TIMEOUT_SECONDS,
+        )
+        receipt = service.generate(command, provider)
+        assert receipt.state is BaselineGenerationState.SUCCEEDED
+        assert service.lease_seconds == 360
+        assert provider.remaining is not None
+        assert provider.remaining > timedelta(seconds=350)
     finally:
         environment.engine.dispose()
 

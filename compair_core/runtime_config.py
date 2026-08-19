@@ -22,6 +22,14 @@ import rfc8785
 from pydantic import SecretStr
 from sqlalchemy.engine import URL, make_url
 
+from .baseline_generation.profile import (
+    ACCELERATED_GENERATION_TIMEOUT_SECONDS,
+    GENERATION_LEASE_COMMIT_MARGIN_SECONDS,
+    QUALIFIED_CONTEXT_TOKENS,
+    QUALIFIED_OUTPUT_TOKENS,
+    required_generation_lease_seconds,
+)
+
 RUNTIME_CONFIG_CONTRACT_VERSION = "baseline-runtime-config.v1"
 BASELINE_ENGINE_VERSION = "baseline_v1.persistent.v1"
 BASELINE_TOKENIZER_VERSION = "baseline_v1_frozen_tokenizer.v1"
@@ -396,6 +404,21 @@ def build_runtime_configuration(
     keyring = attest_keyring(getattr(settings, "baseline_run_encryption_keyring", None))
     embedding = _embedding_identity(settings)
     generation = _generation_identity(settings)
+    generation_timeout_seconds = float(
+        getattr(
+            settings,
+            "baseline_generation_timeout_seconds",
+            ACCELERATED_GENERATION_TIMEOUT_SECONDS,
+        )
+    )
+    try:
+        generation_lease_seconds = required_generation_lease_seconds(
+            generation_timeout_seconds
+        )
+    except ValueError:
+        raise RuntimeConfigurationError(
+            "generation_timeout_lease_incompatible"
+        ) from None
     configuration: dict[str, object] = {
         "contract_version": RUNTIME_CONFIG_CONTRACT_VERSION,
         "core_version": _package_version(),
@@ -511,14 +534,24 @@ def build_runtime_configuration(
             "generation_response_bytes": int(
                 getattr(settings, "baseline_generation_max_response_bytes", 200_000)
             ),
-            "generation_timeout_seconds": float(
-                getattr(settings, "baseline_generation_timeout_seconds", 60.0)
+            "generation_timeout_seconds": generation_timeout_seconds,
+            "generation_lease_seconds": generation_lease_seconds,
+            "generation_lease_commit_margin_seconds": (
+                GENERATION_LEASE_COMMIT_MARGIN_SECONDS
             ),
             "generation_context_tokens": int(
-                getattr(settings, "baseline_generation_context_tokens", 32_768)
+                getattr(
+                    settings,
+                    "baseline_generation_context_tokens",
+                    QUALIFIED_CONTEXT_TOKENS,
+                )
             ),
             "generation_output_tokens": int(
-                getattr(settings, "baseline_generation_output_tokens", 1_024)
+                getattr(
+                    settings,
+                    "baseline_generation_output_tokens",
+                    QUALIFIED_OUTPUT_TOKENS,
+                )
             ),
             "generation_seed": int(getattr(settings, "baseline_generation_seed", 0)),
         },
