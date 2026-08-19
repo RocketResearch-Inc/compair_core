@@ -1,0 +1,1089 @@
+{
+  "schema_version": "baseline-generation-qualification-semantic-audit.v1",
+  "provider_visible": false,
+  "method": "inference-free source-to-evidence consistency review",
+  "case_count": 120,
+  "cases": [
+    {
+      "ordinal": 1,
+      "case_id": "benign_correct_arithmetic",
+      "case_sha256": "2352fecbc99c7ac835991f89b580303bfc0fcd4a918a0e31665e627cd42266a9",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The function returns left plus right exactly as the arithmetic contract states."
+    },
+    {
+      "ordinal": 2,
+      "case_id": "benign_api_documentation_agrees",
+      "case_sha256": "2fe96de9ddc59b3d6b1e21bf872ff224e56ae1b6d8f4a7bf2e2449b649956f58",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The GET route, path, status field, and value agree with the API evidence."
+    },
+    {
+      "ordinal": 3,
+      "case_id": "benign_cli_flag_agrees",
+      "case_sha256": "6c0ea7a9a87070e9632106a90de7663916f84e3bbcfa821ead8df87d0cfbb7ab",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The implemented --dry-run spelling and non-writing behavior agree with the command evidence."
+    },
+    {
+      "ordinal": 4,
+      "case_id": "benign_environment_default_agrees",
+      "case_sha256": "17ed4c437ae7b0b4a4fa3530c94816d085d4786fb5bef0c24182d6ab5b7ccbf2",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The environment name and 30-second default agree exactly."
+    },
+    {
+      "ordinal": 5,
+      "case_id": "benign_equivalent_refactor",
+      "case_sha256": "7034b64e314fc92ad388c80e726167c9a45131ee18107f93d2c3b024ea323f26",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "len(items) greater than zero is equivalent to the documented nonempty-list predicate."
+    },
+    {
+      "ordinal": 6,
+      "case_id": "benign_authentication_example_agrees",
+      "case_sha256": "b3683583e7edadc527ac7edfa64700251d14e04c5a49ebcec1904da60c3b3ab4",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The request supplies the required Bearer Authorization header to the stated path."
+    },
+    {
+      "ordinal": 7,
+      "case_id": "benign_migration_order_agrees",
+      "case_sha256": "5357dbe03741b2973afa3881b311d3d0b417ce1d0b58eb0235df8f7595739457",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The table is created before the index that references it."
+    },
+    {
+      "ordinal": 8,
+      "case_id": "benign_prose_style_only",
+      "case_sha256": "70c7cc7d668f0c4c9000a482297c3376dc0ab722fc6c38824321a8c90493b3af",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only heading capitalization changes, and the evidence explicitly makes it non-behavioral."
+    },
+    {
+      "ordinal": 9,
+      "case_id": "finding_endpoint_mismatch",
+      "case_sha256": "c12dfc3d39a4669dd1d4b718b44bc6958cb0339f966f01d4d9bc7a539c87f8e7",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The source alone uses POST /v2/status while the evidence requires GET /v1/status."
+    },
+    {
+      "ordinal": 10,
+      "case_id": "finding_authentication_omitted",
+      "case_sha256": "9a59afc4f031083c59896138f559fe8dcb02d19c603490e40920bc07fd0582a3",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The source omits the sole mandatory Authorization header from the private request."
+    },
+    {
+      "ordinal": 11,
+      "case_id": "finding_environment_name_mismatch",
+      "case_sha256": "351690ce1c4187ee68f11facc506442d0ca8909f6e05f3ec2deea2ac86a99469",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The source alone misspells APP_TIMEOUT_SECONDS as APP_TIMOUT_SECONDS."
+    },
+    {
+      "ordinal": 12,
+      "case_id": "finding_cli_flag_mismatch",
+      "case_sha256": "b39dfe62d7b42334777c5807ee5a79ea23b5bbcf1b5646384553ad01b18044bb",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The source alone implements --dryrun where the evidence requires --dry-run."
+    },
+    {
+      "ordinal": 13,
+      "case_id": "finding_webhook_signature_omitted",
+      "case_sha256": "30e5887dec9934a2f76a0c8c13edaad460f708935bc4399263e0a258b57da217",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The source parses and processes before performing the one required signature verification."
+    },
+    {
+      "ordinal": 14,
+      "case_id": "finding_migration_order_invalid",
+      "case_sha256": "ac61ec8616a984d1200a5367593c65330216555c72daa45c524e94e9e0cd6ff5",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The source alone creates an index before the referenced table exists."
+    },
+    {
+      "ordinal": 15,
+      "case_id": "finding_insecure_default",
+      "case_sha256": "a19c8ae04f27dff9ceb0e5427f408ad085e6d6ea43adae1b86dab736386bf619",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The source alone defaults VERIFY_TLS to false where true is mandatory."
+    },
+    {
+      "ordinal": 16,
+      "case_id": "finding_removed_api_documented_current",
+      "case_sha256": "c010788f093db83e6595f09b9540e31d8b3a659e8915172159f33a66dea915f8",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The source alone presents removed /v1/users as current instead of /v2/users."
+    },
+    {
+      "ordinal": 17,
+      "case_id": "api_put_widget_path_agrees",
+      "case_sha256": "2937a52f4ff0d988f4be2c4802b42903442f51e2bb9c608350ece8750f4c398e",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Method, versioned path, identifier, and boolean body agree exactly."
+    },
+    {
+      "ordinal": 18,
+      "case_id": "api_delete_returns_no_content",
+      "case_sha256": "6195659484522749cc9977b4825762a84903ccada56cb8248fce87ca2266986a",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The route, deletion action, and empty 204 result are consistent."
+    },
+    {
+      "ordinal": 19,
+      "case_id": "api_query_page_default_agrees",
+      "case_sha256": "0345cc61f51710536b22d739035b3a87f33ab3b098d9161d033a6c5f5f2d606e",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The one-based constraint and default both match."
+    },
+    {
+      "ordinal": 20,
+      "case_id": "api_multievidence_etag_agrees",
+      "case_sha256": "38592ddd4f743c9fd722254f420fdcedba3effae444a54f574f7e164577862ca",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Both conditional and ordinary cache branches match; the final item is irrelevant context."
+    },
+    {
+      "ordinal": 21,
+      "case_id": "api_patch_method_contradiction",
+      "case_sha256": "a4b2af8c047bc9ec6bee94e37d5f5c74e7d02004e24714f98bcd4b66fde688bb",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the HTTP method conflicts: PUT is used where PATCH is required."
+    },
+    {
+      "ordinal": 22,
+      "case_id": "api_success_status_contradiction",
+      "case_sha256": "8ae723fa8cd4ef80e9223ff42d9f6be08d14b5c2e360c49d10cdb689327e1aa8",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the success status differs from the explicit 201 contract."
+    },
+    {
+      "ordinal": 23,
+      "case_id": "api_path_parameter_contradiction",
+      "case_sha256": "44f7ac76d71b41093838b0c5c73e5fead8c90fa1a128b3627100a926dbdc671c",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The method and route are correct, but the wrong identifier is placed in the path."
+    },
+    {
+      "ordinal": 24,
+      "case_id": "api_multiline_content_type_contradiction",
+      "case_sha256": "a80551c64cdd596bd44901267983fb55d3d26b4f0891d7b87713d0fa075f0a75",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the declared media type contradicts the CSV body contract."
+    },
+    {
+      "ordinal": 25,
+      "case_id": "auth_owner_or_admin_agrees",
+      "case_sha256": "dd1a92ed65c272d7ff0581ee922613979969df8de2a063f713e21a6a140b5d86",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The boolean authorization condition implements owner-or-admin exactly."
+    },
+    {
+      "ordinal": 26,
+      "case_id": "auth_group_membership_agrees",
+      "case_sha256": "71233abfea8b4929e10373fcf2f654ebe8e637945a4f2b3f80241f3de0902384",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Both identities and active status are checked, and either unauthorized state is privacy-safe."
+    },
+    {
+      "ordinal": 27,
+      "case_id": "auth_scope_set_agrees",
+      "case_sha256": "aab30ba6402dab06d76365a84ed716641350017f76ef299dc65f22e3673be2f6",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The subset check requires both documented scopes."
+    },
+    {
+      "ordinal": 28,
+      "case_id": "auth_ordered_policy_evidence_agrees",
+      "case_sha256": "22477da4629b0097560ba3e3a64aa3d812c76de649a78b63e5a7511cb082f975",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "All three independent prerequisites are implemented without adding or omitting one."
+    },
+    {
+      "ordinal": 29,
+      "case_id": "auth_cross_group_lookup_contradiction",
+      "case_sha256": "ef06de1558517108ffd4c0f2291a386df0c8f486fad344d4dc8b9742002df1b6",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The lookup omits only the required group binding."
+    },
+    {
+      "ordinal": 30,
+      "case_id": "auth_disabled_user_contradiction",
+      "case_sha256": "fbf48ad3f82153c4c3d603b0443efcd60efa405d5f505a4d40314e3bf1f7fca5",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The code checks existence but omits the sole additional active-user requirement."
+    },
+    {
+      "ordinal": 31,
+      "case_id": "auth_any_scope_contradiction",
+      "case_sha256": "728dc17772bc5bb47f3dc0994aa7ae552fc301331aec3cb0b1d0d463b011a4cf",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Set intersection accepts either scope, contradicting the explicit both-scopes rule."
+    },
+    {
+      "ordinal": 32,
+      "case_id": "auth_role_case_contradiction",
+      "case_sha256": "b31e0cb4d01c3ea301d00955e9e8002e357597f7ef23eaf4c73ca4e0c544809c",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the compared role values use the wrong case; the display note is irrelevant."
+    },
+    {
+      "ordinal": 33,
+      "case_id": "cli_output_default_agrees",
+      "case_sha256": "e0133275767612a958c3fb3fb29ea0e6d9c5e7a02872fe0377c2e1bab7582830",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Choices and default match exactly."
+    },
+    {
+      "ordinal": 34,
+      "case_id": "cli_required_group_agrees",
+      "case_sha256": "ca372bfe7386701378e27d1beb702419d29f515701750b6ed38085c75e9eac1c",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The argument is explicitly required and no fallback is present."
+    },
+    {
+      "ordinal": 35,
+      "case_id": "cli_mutual_exclusion_agrees",
+      "case_sha256": "b1e3af80e098af60dd57e1e2b4b0710f031f8f0b2c3365e78cb0213026a9d922",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "A required mutually exclusive group enforces exactly one target."
+    },
+    {
+      "ordinal": 36,
+      "case_id": "cli_multiline_stdout_agrees",
+      "case_sha256": "c55a82ea75c7cb9e88af5edd48e549fddcf12b08bb92fba0d5bde22065be34a5",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "JSON and diagnostics are routed to the required streams."
+    },
+    {
+      "ordinal": 37,
+      "case_id": "cli_default_format_contradiction",
+      "case_sha256": "dce73b17a748072798f219c857060dbd4d810c76f30f1e45a12720e03267acf6",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the default value conflicts."
+    },
+    {
+      "ordinal": 38,
+      "case_id": "cli_optional_group_contradiction",
+      "case_sha256": "ed700d1ff8c6cd6225267eda349caadb3d3d60040e8848c6cb1d3a867d7948de",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only requiredness is wrong."
+    },
+    {
+      "ordinal": 39,
+      "case_id": "cli_exit_code_contradiction",
+      "case_sha256": "2e965518894727aa6f70f507b3daccddd85a2bae0162e2ce9ef048351a5966f3",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the not-found exit classification is wrong."
+    },
+    {
+      "ordinal": 40,
+      "case_id": "cli_diagnostic_stream_contradiction",
+      "case_sha256": "24eb1814f898a20ab9de5939ea071c9e52aaf0e6f3a42955e1c7ae35150d4da2",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The allowed diagnostic is written to stdout instead of stderr; polling itself is valid."
+    },
+    {
+      "ordinal": 41,
+      "case_id": "config_boolean_default_agrees",
+      "case_sha256": "7176653cb9d8d59abe7312e4b5767c411d7fb800b4e4522ad498a2e865f9ea6c",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Name, type, and default agree."
+    },
+    {
+      "ordinal": 42,
+      "case_id": "config_precedence_agrees",
+      "case_sha256": "e013f4837b34e732e13c0415ab52c2d845a4cb0c1acfb67ae8f09019ca236936",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The conditional implements the documented precedence and default."
+    },
+    {
+      "ordinal": 43,
+      "case_id": "config_range_agrees",
+      "case_sha256": "d2dae20f2ca74ea67c5c43d70fd9522b8c12cb0f5c44bcbbcd2a63050769fb5b",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Default and inclusive bounds match."
+    },
+    {
+      "ordinal": 44,
+      "case_id": "config_multisource_duration_agrees",
+      "case_sha256": "fc8b0db5be86e95fff9d5a8673d4535c17ada6450bc6ee95edf73d3ebb7798b9",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The configured seconds are converted into the expected duration."
+    },
+    {
+      "ordinal": 45,
+      "case_id": "config_unit_contradiction",
+      "case_sha256": "f0e0842b85ccd710d0cb065e6eaa7cf0c092645b6b2a1a6d3404cecb7cd71ba9",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the conversion unit is wrong."
+    },
+    {
+      "ordinal": 46,
+      "case_id": "config_precedence_contradiction",
+      "case_sha256": "5bec1e89646a4ab0aa0e6ddb14d91a0b56dc0414d8a46688190b67226f5e40e8",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "A set environment value overrides the CLI value, reversing only the required precedence."
+    },
+    {
+      "ordinal": 47,
+      "case_id": "config_upper_bound_contradiction",
+      "case_sha256": "58405ed8abcce2949403df3e61236406286680e3eba2f49454d366d742d5a833",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The code alone excludes the valid upper endpoint 16."
+    },
+    {
+      "ordinal": 48,
+      "case_id": "config_empty_value_contradiction",
+      "case_sha256": "e8ffa855ae9be5f37936530583366bd5947d45c48c778a8790061ea1ff9cff59",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "An explicitly empty value is preserved instead of using the required default; case handling is unaffected."
+    },
+    {
+      "ordinal": 49,
+      "case_id": "db_nullable_column_agrees",
+      "case_sha256": "11dc90b81fe085714009fe98221b0ca5c9614747b4ba6d2f73a3f3124e5ac9fc",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The new column has the required nullability."
+    },
+    {
+      "ordinal": 50,
+      "case_id": "db_unique_scope_agrees",
+      "case_sha256": "4b2e46a7499543c9c9613afe5d2a03625c8bd02d20ef52a8009db468b1da9ba4",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The compound unique key matches group-scoped uniqueness."
+    },
+    {
+      "ordinal": 51,
+      "case_id": "db_fk_delete_agrees",
+      "case_sha256": "3eb577ef9e29a3ad29fdba26645b2ff46f238b7856252c9aa4b703b8141d576c",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The foreign-key action matches the lifecycle rule."
+    },
+    {
+      "ordinal": 52,
+      "case_id": "db_ordered_migration_agrees",
+      "case_sha256": "2be94e372751217b93e5b4616cfefa8303e418ccb9dd032eb8bd39b65e79699d",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The additive column, valid backfill, and constraint occur in safe order."
+    },
+    {
+      "ordinal": 53,
+      "case_id": "db_nullability_contradiction",
+      "case_sha256": "e27d5b02f34b7fec611404d8da4f987d16fb0190f200bda9f5152cd6263a8490",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the column nullability conflicts."
+    },
+    {
+      "ordinal": 54,
+      "case_id": "db_unique_scope_contradiction",
+      "case_sha256": "19407efb6df7f68169afd052608c4a739cac3455cffb4146c2e6a3c09167a19e",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Global uniqueness replaces the required group-scoped uniqueness."
+    },
+    {
+      "ordinal": 55,
+      "case_id": "db_delete_action_contradiction",
+      "case_sha256": "419e960cb08938e7b343601497cceb9de3f0a24a25066e32ded99249e073d2d2",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the foreign-key delete action conflicts."
+    },
+    {
+      "ordinal": 56,
+      "case_id": "db_backfill_value_contradiction",
+      "case_sha256": "70d0807cfff8717b64b40b5cbdc8c6572b4ea4d7ea999e4e6da92a82af99a6d6",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The migration order is valid; only the backfill uses an unsupported value."
+    },
+    {
+      "ordinal": 57,
+      "case_id": "webhook_raw_body_signature_agrees",
+      "case_sha256": "c07964367147408983dc862466e1a2656fbd06dbd575eea2f460456407502021",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Raw-byte verification occurs before parsing."
+    },
+    {
+      "ordinal": 58,
+      "case_id": "webhook_timestamp_window_agrees",
+      "case_sha256": "32b866d42e1f0bbaf32090c4a7d37b641276df6680aea19094cb3fa43d14cda0",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The absolute age and inclusive acceptance window agree."
+    },
+    {
+      "ordinal": 59,
+      "case_id": "webhook_hex_encoding_agrees",
+      "case_sha256": "92dd9835cfefaba077f4ba931c4eba7172edc67c6bc835bc004e7f8ea224389e",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Algorithm, encoding, and comparison agree."
+    },
+    {
+      "ordinal": 60,
+      "case_id": "webhook_event_filter_agrees",
+      "case_sha256": "c1af874cf4703cdbdc3259687abbc9b2eccbb0baca31a1aabb2499efe222cea8",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The allowlist and acknowledgement behavior match."
+    },
+    {
+      "ordinal": 61,
+      "case_id": "webhook_ordered_key_rotation_agrees",
+      "case_sha256": "aec82b3b5592608c75f75689121a4dccb4af5794565f8e0380329ddeeeac11a3",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The code accepts any active key and cannot select retired keys from the supplied set."
+    },
+    {
+      "ordinal": 62,
+      "case_id": "webhook_reencoded_body_contradiction",
+      "case_sha256": "30c2604f2b9d002a81d12a1baf30b974d3169f6ae4c25aa574c621f043991b47",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the signed byte representation is wrong."
+    },
+    {
+      "ordinal": 63,
+      "case_id": "webhook_timestamp_boundary_contradiction",
+      "case_sha256": "c247161cefc7f79438e96ac9613dbed6476969fcd52ca2157bfcf117977d0b04",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the boundary comparison rejects a valid exact-limit request."
+    },
+    {
+      "ordinal": 64,
+      "case_id": "webhook_digest_encoding_contradiction",
+      "case_sha256": "c315266e8ede7ff8555817dd55bf0806044c9290ef1a4616566840fe38688724",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the output encoding is wrong."
+    },
+    {
+      "ordinal": 65,
+      "case_id": "webhook_event_allowlist_contradiction",
+      "case_sha256": "52d22bc2892841eb3eebbd2db902d6d3970db314ff609e6ec7490fac493a3f67",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only invoice.failed replaces invoice.paid in the allowlist."
+    },
+    {
+      "ordinal": 66,
+      "case_id": "sdk_retry_count_agrees",
+      "case_sha256": "7e033b0e592c3af338442cd59edf9b323e0be0d480d1fd57a78e6ea322cdf7cd",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The loop performs exactly three total attempts and rethrows after the third."
+    },
+    {
+      "ordinal": 67,
+      "case_id": "sdk_none_passthrough_agrees",
+      "case_sha256": "87db738db5173c50733221c140d4331bd75c272af5a92981564821557af11b31",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Both null and string branches match."
+    },
+    {
+      "ordinal": 68,
+      "case_id": "sdk_stable_sort_agrees",
+      "case_sha256": "525b8af251e709b3c4cdc091bf0afac017fc2cc19e52ecc133a0a62b0175b38e",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Python's stable sort with reverse ordering preserves ties while ordering priorities descending."
+    },
+    {
+      "ordinal": 69,
+      "case_id": "sdk_multievidence_pagination_agrees",
+      "case_sha256": "4742393b68d8fde7035baef30b2c4ec2c33c46eff3fe12456d2191557aa08bb6",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Page size, yield order, cursor progression, and terminal page behavior all match."
+    },
+    {
+      "ordinal": 70,
+      "case_id": "sdk_retry_total_contradiction",
+      "case_sha256": "d705d4955f8c17a23df66bb01a7afd619011c6990865f772f90d84708b902174",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the total attempt bound is wrong."
+    },
+    {
+      "ordinal": 71,
+      "case_id": "sdk_none_coercion_contradiction",
+      "case_sha256": "b33af6a135fcc1b90eac8dc0e3c867fba6e8cb47e85cb995df9f16bf471ff3ad",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only None is coerced instead of preserved."
+    },
+    {
+      "ordinal": 72,
+      "case_id": "sdk_sort_direction_contradiction",
+      "case_sha256": "93831350c04e5556fe44a77d6c012a0cc906ea5e21309f9ed1ed2e2f0782d073",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the priority direction is wrong; stability remains intact."
+    },
+    {
+      "ordinal": 73,
+      "case_id": "sdk_terminal_page_contradiction",
+      "case_sha256": "02128962cf1398299b354aa17c1d48495d95745b860e8467748af73b13cc4629",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The loop omits only the terminal page's records."
+    },
+    {
+      "ordinal": 74,
+      "case_id": "sdk_timeout_unit_contradiction",
+      "case_sha256": "2dc960d6f4d5b31ac43b431631f9ec28838ec4cf50ad51d8d661658d5c1989e7",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the required seconds-to-milliseconds conversion is absent."
+    },
+    {
+      "ordinal": 75,
+      "case_id": "version_new_field_optional_agrees",
+      "case_sha256": "557e4395eac12fc39034ab00f682844edc1344058af50365c6972601b7d232fc",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The added field is optional as required."
+    },
+    {
+      "ordinal": 76,
+      "case_id": "version_alias_window_agrees",
+      "case_sha256": "8c7512a53a73376029dd4a5af70a34057c4dfadd58884b71e83be5533ae86ad1",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Both routes resolve to the same implementation and the old one is marked deprecated."
+    },
+    {
+      "ordinal": 77,
+      "case_id": "version_unknown_field_tolerance_agrees",
+      "case_sha256": "ee9af6f00f9795d0a05fb206cff1b4017d4759d80384ac4e27d454f8fa356b91",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The reader ignores later fields."
+    },
+    {
+      "ordinal": 78,
+      "case_id": "version_header_selection_agrees",
+      "case_sha256": "c3e708008c93a4435576f59518eb5871282d5c337f1e04e53c2047226b5bad8c",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The explicit V2 selection and default V1 behavior agree."
+    },
+    {
+      "ordinal": 79,
+      "case_id": "version_multiline_deprecation_agrees",
+      "case_sha256": "13ce4f6c61b424088a9e7ab90c9d11b9e4f59fc0c50cdc0768a2176cd79485f9",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The wrapper remains functional, delegates, and emits the required caller-level warning."
+    },
+    {
+      "ordinal": 80,
+      "case_id": "version_new_field_required_contradiction",
+      "case_sha256": "400fa3a0a4ff68052d582a64bef75ad59babb0c7ada12f80a084d57a0a379921",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the compatibility-critical optionality is wrong."
+    },
+    {
+      "ordinal": 81,
+      "case_id": "version_alias_removed_early_contradiction",
+      "case_sha256": "2bb1460577e6b2ebc57a0df2e8d014830aacb09cbb9694ae085f6267c1e7d60b",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the required compatibility alias is absent."
+    },
+    {
+      "ordinal": 82,
+      "case_id": "version_unknown_field_rejection_contradiction",
+      "case_sha256": "17fa14756ec835f69308ac8c3bdfba3190861628f105b81cac4ed02e0e54c4c0",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the unknown-field policy conflicts."
+    },
+    {
+      "ordinal": 83,
+      "case_id": "version_default_selection_contradiction",
+      "case_sha256": "b929c40242ad1d3c1e8f9f5fe00ed3696a20bc0263aa107131768d29a2d059ee",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the absent-header default is wrong."
+    },
+    {
+      "ordinal": 84,
+      "case_id": "version_deprecated_wrapper_behavior_contradiction",
+      "case_sha256": "fc8e1690c771ca5f795eaf23cb48c7141292ff499c8efc7bc6ff356625b2d626",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The warning is correct; only the wrapper fails to delegate to the current behavior."
+    },
+    {
+      "ordinal": 85,
+      "case_id": "deploy_loopback_bind_agrees",
+      "case_sha256": "e54b310a2a5a02dd524aa93c4f7f3c963f8c4246b9e822f433e26075fcbbb99f",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Host and port are exact."
+    },
+    {
+      "ordinal": 86,
+      "case_id": "deploy_health_port_agrees",
+      "case_sha256": "06a24636f5901d70f81de62ae2dec650b3fe3f0bdb69f91d58b5f340fc2ec668",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Container and probe ports plus path agree."
+    },
+    {
+      "ordinal": 87,
+      "case_id": "deploy_remote_https_agrees",
+      "case_sha256": "4bf8fd87bb7489936b4e906022b2943327bb5188adf65347d529947856e849ec",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The transport exception is limited to loopback."
+    },
+    {
+      "ordinal": 88,
+      "case_id": "deploy_proxy_peer_agrees",
+      "case_sha256": "9d44ae30eaeada7a328b316eae319caa66c39db0182b9ee3cc62fd127ff43c16",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Forwarded metadata is gated by actual peer trust."
+    },
+    {
+      "ordinal": 89,
+      "case_id": "deploy_multievidence_tls_agrees",
+      "case_sha256": "19c10c767bda20437b8dbf32c35c5282e26aebb66d5a47ce58cd84bf62c98d4d",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Minimum version, certificate verification, and hostname verification match."
+    },
+    {
+      "ordinal": 90,
+      "case_id": "deploy_wildcard_bind_contradiction",
+      "case_sha256": "165224e5dd7f7f017cc5f822bccbf90d457adfb613d385a954a20ecc582f06a9",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the bind address violates the local-only contract."
+    },
+    {
+      "ordinal": 91,
+      "case_id": "deploy_probe_port_contradiction",
+      "case_sha256": "9a223ec4e816b5c6b899714734be6818d67de98e01b45479e88cf309f3c86305",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the readiness probe port differs."
+    },
+    {
+      "ordinal": 92,
+      "case_id": "deploy_forwarded_spoof_contradiction",
+      "case_sha256": "666a45b87f7602f14de7bd1ee90f230156e6191ef37ff4522fa9f2fb5ce5ba33",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the peer-trust gate is absent."
+    },
+    {
+      "ordinal": 93,
+      "case_id": "deploy_tls_hostname_contradiction",
+      "case_sha256": "d13fd92ed89da445d262a225d717fe900d18a87b2a8c7ff2c51a995015438c5e",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only hostname checking is disabled; version and certificate requirements remain correct."
+    },
+    {
+      "ordinal": 94,
+      "case_id": "serialization_null_preserved_agrees",
+      "case_sha256": "2e130c552ddc061a6c59f89d9310579dac1eb719cdc16c995179c7ca9e641de3",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "A Python None value is retained for JSON null."
+    },
+    {
+      "ordinal": 95,
+      "case_id": "serialization_timestamp_agrees",
+      "case_sha256": "83e4a4cbe5594aa840792d5c15bd55fdff09d8e0430f804877c6bd027ac81375",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The aware timestamp is converted to UTC and serialized with the required Z suffix."
+    },
+    {
+      "ordinal": 96,
+      "case_id": "serialization_ordered_array_agrees",
+      "case_sha256": "5939349b645efda1637ef775aa94ac55ff7cd7395a849268fbf20574382c38d8",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Array order is explicitly ascending ordinal."
+    },
+    {
+      "ordinal": 97,
+      "case_id": "serialization_decimal_string_agrees",
+      "case_sha256": "82d1dd752f0216a052b345a204fda4e1469fdff4aa2243d1aea201a0169161d5",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The decimal remains a string and the explicit Unicode label is preserved without an encoding change."
+    },
+    {
+      "ordinal": 98,
+      "case_id": "serialization_multievidence_union_agrees",
+      "case_sha256": "133d662367d89bf0688d36c0ba24647064c3117241db15697ee5ff30e5d21906",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Each tagged-union branch emits exactly its documented shape."
+    },
+    {
+      "ordinal": 99,
+      "case_id": "serialization_null_omitted_contradiction",
+      "case_sha256": "d9a45f83c21986d6be3b1ff73afc3ba3b990d818153efb69ef836594d7da24ca",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the required explicit null field is omitted."
+    },
+    {
+      "ordinal": 100,
+      "case_id": "serialization_timezone_contradiction",
+      "case_sha256": "5b2ef65257269075fe344f8e215a0a450ff03cefe453022f4b40b9ef49eddb24",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the mandatory UTC normalization is absent."
+    },
+    {
+      "ordinal": 101,
+      "case_id": "serialization_array_order_contradiction",
+      "case_sha256": "de63ebdc2b6a78465094ab41083e63b501a0f1f9af15dac735f5bd260c023d7b",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the array order is reversed."
+    },
+    {
+      "ordinal": 102,
+      "case_id": "serialization_number_type_contradiction",
+      "case_sha256": "16c8743787aea137b1ce46bf163b5b3b494f306f98f3c66fd3125a4327c03dc2",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the serialized JSON type conflicts."
+    },
+    {
+      "ordinal": 103,
+      "case_id": "serialization_union_extra_field_contradiction",
+      "case_sha256": "a5d788a8871bc8961c82f9a980ee68b593332c843b31d8eb78494646944de426",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the branch-inapplicable count field violates the exact text-record shape."
+    },
+    {
+      "ordinal": 104,
+      "case_id": "refactor_any_equivalent_agrees",
+      "case_sha256": "d874e46fa3994a71b531809eb3f724f21eb5604c350e5f63c6ab861c40582450",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "any is equivalent to the stated existential behavior."
+    },
+    {
+      "ordinal": 105,
+      "case_id": "refactor_guard_clause_agrees",
+      "case_sha256": "445f93da3e1dd335cae8e9678c397a8e5d0fb36937198be0dfde5be41bcb72c7",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The guard-clause form preserves both branches."
+    },
+    {
+      "ordinal": 106,
+      "case_id": "refactor_set_membership_agrees",
+      "case_sha256": "bc41e7a74b675f7c8d2c563d925020a5ea84432552286cfe4f84fdc190ac21e9",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Set membership is exactly the specified predicate."
+    },
+    {
+      "ordinal": 107,
+      "case_id": "refactor_large_equivalent_pipeline_agrees",
+      "case_sha256": "4a7793981eb00b14f7188054c2d7b372f1228f6fd2f8c3a6bf7755eb994c3e59",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The imperative pipeline preserves order and applies exactly the visibility and title rules."
+    },
+    {
+      "ordinal": 108,
+      "case_id": "refactor_all_for_any_contradiction",
+      "case_sha256": "2479ea7272782fed541239c22ed3357840d751e77d9857d21ed2abfcca544e36",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the existential predicate is changed to universal."
+    },
+    {
+      "ordinal": 109,
+      "case_id": "refactor_guard_value_contradiction",
+      "case_sha256": "da48bab1977fc92ab34035c81533a8305f3a7d53e465fed4b56add833c6a51ab",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the None branch value differs."
+    },
+    {
+      "ordinal": 110,
+      "case_id": "refactor_membership_extra_contradiction",
+      "case_sha256": "49dc5bf205dfc4d027244ea72d9adb5e841c571687467c2f137d2a007413ec4e",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the unsupported xml value is added."
+    },
+    {
+      "ordinal": 111,
+      "case_id": "refactor_order_reversal_contradiction",
+      "case_sha256": "a836eead1ff24da37859745962555e25fdb18af9885336bb5e21e7951d67a84d",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Filtering and trimming are correct; only output order is reversed."
+    },
+    {
+      "ordinal": 112,
+      "case_id": "refactor_boundary_shift_contradiction",
+      "case_sha256": "bf908b846af5696dbfe88c46ede606992879fe44b3da03db6e13ce68912f9fa9",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the lower endpoint changes from inclusive to exclusive."
+    },
+    {
+      "ordinal": 113,
+      "case_id": "docs_current_command_agrees",
+      "case_sha256": "92ea7346bd44cc717b97d824fcd26b8bccd3efc460891dd2e89fdead64525c71",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The documented command and required flag are current."
+    },
+    {
+      "ordinal": 114,
+      "case_id": "docs_removed_feature_absent_agrees",
+      "case_sha256": "2a414d7c3bbc8edebecb5e8defb2714b522ec2b752384521ed760ad1b00190fb",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The documentation lists exactly the current views and does not revive the retired one."
+    },
+    {
+      "ordinal": 115,
+      "case_id": "docs_default_port_agrees",
+      "case_sha256": "bc30fed70d1f7f4f60eb9be13305c53592d3eb82de78aeb0d68d2cb79e525033",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The local address and default port match."
+    },
+    {
+      "ordinal": 116,
+      "case_id": "docs_multisection_current_agrees",
+      "case_sha256": "df959edc50b18faa85a0ca026a42213b940ea734a2e507ab09a8dec03d3a27a7",
+      "material_issue_count": 0,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "The full documentation describes only current syntax and stream behavior."
+    },
+    {
+      "ordinal": 117,
+      "case_id": "docs_command_name_contradiction",
+      "case_sha256": "ffaa8ee4b4971c0d95a57e151f41ce2655e9ee82201de5616ffa86c854847f0e",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the command word is obsolete."
+    },
+    {
+      "ordinal": 118,
+      "case_id": "docs_retired_view_contradiction",
+      "case_sha256": "6f5991e64945b2f5a763a4d92f69bfaaa4269a42e8b7fd56ed3f0638dc850bde",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the removed timeline view is presented as current."
+    },
+    {
+      "ordinal": 119,
+      "case_id": "docs_default_port_contradiction",
+      "case_sha256": "f7a85702285c0727ff41afea20c795c28c476ebbaf2cae92077e0d6804c9aa4b",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the documented default port is wrong."
+    },
+    {
+      "ordinal": 120,
+      "case_id": "docs_removed_flag_contradiction",
+      "case_sha256": "84323cf2da179c29db8baa755ef6efaec8fdd8914aed93597118c94bc4e200f0",
+      "material_issue_count": 1,
+      "objective": true,
+      "self_contained": true,
+      "audit_basis": "Only the removed flag is described as current; the stream statement is correct."
+    }
+  ],
+  "fixture_sha256": "2f1d8d204de06173fbfbe7fabf00aeb5771ef9869c09cbd959b2e7b4789d5863"
+}
