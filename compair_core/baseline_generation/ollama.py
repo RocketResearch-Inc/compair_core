@@ -30,21 +30,23 @@ from ..compair.retrieval.generation import (
     BaselineGenerationProviderError,
     BaselineGenerationService,
 )
+from .budget import qualified_budget_profile
 from .profile import (
     ACCELERATED_GENERATION_TIMEOUT_SECONDS,
     MAXIMUM_GENERATION_TIMEOUT_SECONDS,
     QUALIFIED_CONTEXT_TOKENS,
+    QUALIFIED_OLLAMA_RUNTIME_VERSION,
     QUALIFIED_OUTPUT_TOKENS,
     RECOMMENDED_GENERATION_MODEL,
     RECOMMENDED_GENERATION_MODEL_DIGEST,
 )
 
-OLLAMA_GENERATION_ADAPTER_CONTRACT = "baseline-generation-ollama-http.v1"
+OLLAMA_GENERATION_ADAPTER_CONTRACT = "baseline-generation-ollama-http.v2"
 OLLAMA_PROVIDER = "ollama"
 OLLAMA_VERSION_PATH = "/api/version"
 OLLAMA_TAGS_PATH = "/api/tags"
 OLLAMA_CHAT_PATH = "/api/chat"
-MINIMUM_OLLAMA_VERSION = (0, 32, 13)
+MINIMUM_OLLAMA_VERSION = (0, 32, 14)
 DEFAULT_MAX_REQUEST_BYTES = 256_000
 DEFAULT_MAX_RESPONSE_BYTES = 200_000
 MAX_ATTESTATION_RESPONSE_BYTES = 1_000_000
@@ -246,9 +248,14 @@ class OllamaGenerationConfig:
     def validate(self) -> None:
         if self.provider_mode != OLLAMA_PROVIDER:
             raise _provider_error("provider_unconfigured")
-        _safe_identity(self.model)
+        model = _safe_identity(self.model)
         digest = _safe_identity(self.expected_digest, maximum=71)
         if _DIGEST.fullmatch(digest) is None:
+            raise _provider_error("provider_unconfigured")
+        if (
+            model != RECOMMENDED_GENERATION_MODEL
+            or digest != RECOMMENDED_GENERATION_MODEL_DIGEST
+        ):
             raise _provider_error("provider_unconfigured")
         validate_baseline_generation_endpoint(
             self.endpoint,
@@ -261,11 +268,10 @@ class OllamaGenerationConfig:
             raise _provider_error("provider_unconfigured")
         if not 4_096 <= self.maximum_response_bytes <= 1_000_000:
             raise _provider_error("provider_unconfigured")
-        if not 2_048 <= self.context_tokens <= 131_072:
-            raise _provider_error("provider_unconfigured")
-        if not 64 <= self.output_tokens <= 4_096:
-            raise _provider_error("provider_unconfigured")
-        if self.output_tokens >= self.context_tokens:
+        if (
+            self.context_tokens != QUALIFIED_CONTEXT_TOKENS
+            or self.output_tokens != QUALIFIED_OUTPUT_TOKENS
+        ):
             raise _provider_error("provider_unconfigured")
         if not 0 <= self.seed <= 2_147_483_647:
             raise _provider_error("provider_unconfigured")
@@ -281,6 +287,7 @@ class OllamaGenerationIdentity:
     output_schema_version: str
     output_spec_sha256: str
     output_schema_sha256: str
+    budget_profile_fingerprint: str
     supports_idempotency: bool
     fingerprint: str
 
@@ -352,6 +359,7 @@ class OllamaBaselineGenerationProvider:
         self._seed = config.seed
         self._schema_raw = _schema_bytes()
         self._schema = _strict_json_loads(self._schema_raw)
+        self._budget_profile = qualified_budget_profile()
         self._client_factory = client_factory or self._new_client
         self._identity: OllamaGenerationIdentity | None = None
 
@@ -362,7 +370,7 @@ class OllamaBaselineGenerationProvider:
         return (
             f"{self._identity.adapter_contract};runtime="
             f"{self._identity.runtime_version};digest={self._identity.digest};"
-            f"spec={GENERATION_OUTPUT_SPEC_SHA256}"
+            f"profile={self._identity.budget_profile_fingerprint}"
         )
 
     @property
@@ -471,9 +479,7 @@ class OllamaBaselineGenerationProvider:
         if not isinstance(runtime, str):
             raise _provider_error("unsupported_runtime")
         match = _RUNTIME_VERSION.fullmatch(runtime)
-        if match is None or tuple(int(value) for value in match.groups()) < (
-            MINIMUM_OLLAMA_VERSION
-        ):
+        if match is None or runtime != QUALIFIED_OLLAMA_RUNTIME_VERSION:
             raise _provider_error("unsupported_runtime")
 
         tags_payload = self._request_json(
@@ -505,12 +511,63 @@ class OllamaBaselineGenerationProvider:
         if attested_digest != self._expected_digest:
             raise _provider_error("digest_mismatch")
 
+        render_payload = {
+            "_debug_render_only": True,
+            "model": self.model,
+            "stream": False,
+            "think": False,
+            "truncate": False,
+            "format": self._schema,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": self._budget_profile.attestation_system,
+                },
+                {
+                    "role": "user",
+                    "content": self._budget_profile.attestation_user,
+                },
+            ],
+            "options": {
+                "temperature": 0,
+                "seed": self._seed,
+                "num_ctx": self._context_tokens,
+                "num_predict": self._output_tokens,
+            },
+        }
+        render_body = json.dumps(
+            render_payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(render_body) > self._maximum_request_bytes:
+            raise _provider_error("provider_unconfigured")
+        render_response = self._request_json(
+            client,
+            "POST",
+            OLLAMA_CHAT_PATH,
+            body=render_body,
+            maximum_bytes=MAX_ATTESTATION_RESPONSE_BYTES,
+            chat=True,
+        )
+        if not isinstance(render_response, dict):
+            raise _provider_error("unsupported_runtime")
+        debug_info = render_response.get("_debug_info")
+        if (
+            not isinstance(debug_info, dict)
+            or debug_info.get("rendered_template")
+            != self._budget_profile.attestation_render
+        ):
+            raise _provider_error("unsupported_runtime")
+
         fingerprint_payload = {
             "adapter_contract": OLLAMA_GENERATION_ADAPTER_CONTRACT,
             "digest": attested_digest,
             "model": self.model,
             "output_schema_sha256": GENERATION_OUTPUT_SCHEMA_SHA256,
             "output_spec_sha256": GENERATION_OUTPUT_SPEC_SHA256,
+            "budget_profile_fingerprint": self._budget_profile.fingerprint,
             "provider": OLLAMA_PROVIDER,
             "runtime_version": runtime,
             "supports_idempotency": False,
@@ -531,6 +588,7 @@ class OllamaBaselineGenerationProvider:
             output_schema_version=GENERATION_OUTPUT_SCHEMA_VERSION,
             output_spec_sha256=GENERATION_OUTPUT_SPEC_SHA256,
             output_schema_sha256=GENERATION_OUTPUT_SCHEMA_SHA256,
+            budget_profile_fingerprint=self._budget_profile.fingerprint,
             supports_idempotency=False,
             fingerprint=fingerprint,
         )
@@ -545,13 +603,13 @@ class OllamaBaselineGenerationProvider:
         self._identity = identity
         return identity
 
-    def _chat(
+    def _prepare_chat(
         self,
         *,
         source_text: str,
         evidence: Sequence[str],
         maximum_findings: int,
-    ) -> str:
+    ) -> bytes:
         system = (
             "Review the changed source using only the ordered evidence. Return exactly "
             "one JSON object matching the supplied schema. If there is no concrete "
@@ -576,15 +634,14 @@ class OllamaBaselineGenerationProvider:
             + "\n\n"
             + "\n\n".join(evidence_sections)
         )
-        available_input_tokens = self._context_tokens - self._output_tokens
-        if len(system.encode("utf-8")) + len(user.encode("utf-8")) > (
-            available_input_tokens
-        ):
+        input_tokens = self._budget_profile.count(system, user)
+        if input_tokens + self._output_tokens > self._context_tokens:
             raise _provider_error("provider_request_too_large")
         payload = {
             "model": self.model,
             "stream": False,
             "think": False,
+            "truncate": False,
             "format": self._schema,
             "messages": [
                 {"role": "system", "content": system},
@@ -605,6 +662,9 @@ class OllamaBaselineGenerationProvider:
         ).encode("utf-8")
         if len(body) > self._maximum_request_bytes:
             raise _provider_error("provider_request_too_large")
+        return body
+
+    def _send_chat(self, body: bytes) -> str:
         with self._client_factory() as client:
             response = self._request_json(
                 client,
@@ -640,16 +700,16 @@ class OllamaBaselineGenerationProvider:
             range(1, len(ordinals) + 1)
         ):
             raise _provider_error("provider_request_invalid")
-        self.attest()  # Reattest before sending source/evidence bytes.
-        return self._chat(
+        body = self._prepare_chat(
             source_text=generation_input.source_text,
             evidence=[item.renderer_output for item in generation_input.evidence],
             maximum_findings=len(generation_input.evidence),
         )
+        self.attest()  # Preflight completed before any per-call provider request.
+        return self._send_chat(body)
 
     def probe(self) -> str:
-        self.attest()
-        output = self._chat(
+        body = self._prepare_chat(
             source_text="Synthetic compatibility document with no private content.",
             evidence=(
                 (
@@ -659,6 +719,8 @@ class OllamaBaselineGenerationProvider:
             ),
             maximum_findings=1,
         )
+        self.attest()
+        output = self._send_chat(body)
         findings, _fingerprint = BaselineGenerationService._parse_output(
             output,
             maximum_findings=1,

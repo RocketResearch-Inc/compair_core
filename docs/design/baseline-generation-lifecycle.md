@@ -49,7 +49,7 @@ verbatim in array order as ordinal 1–4 and retains the existing internal outbo
 scheduling behavior. Neither outcome invokes legacy `get_feedback`.
 
 The supported native provider uses adapter contract
-`baseline-generation-ollama-http.v1` and Ollama's nonstreaming `/api/chat`
+`baseline-generation-ollama-http.v2` and Ollama's nonstreaming `/api/chat`
 directly. It sends the exact packaged output schema, reattests the configured
 model tag's immutable digest before every evidence-bearing request, disables
 thinking/streaming/tools, and uses deterministic bounded decoding. It neither
@@ -57,10 +57,10 @@ pulls a model nor falls back to the generic HTTP provider or legacy generation.
 The separate generic strict HTTP adapter remains an explicit configuration.
 
 The existing durable provider/model/version fields are sufficient: the native
-version binds adapter contract, Ollama runtime, immutable digest, and output
-specification hash; the existing schema and provider-fingerprint fields bind
-the output schema and complete provider identity. No schema migration is
-needed.
+version remains within the 256-character field while binding adapter contract,
+exact Ollama runtime, immutable digest, and full budget-profile fingerprint;
+the existing schema and provider-fingerprint fields bind the output schema and
+complete provider identity. No schema migration is needed.
 
 ## State machine
 

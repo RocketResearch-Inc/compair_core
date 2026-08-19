@@ -148,11 +148,14 @@ audit state.
 ### Generation and Ollama
 
 `OllamaBaselineGenerationProvider` calls native nonstreaming `/api/chat` with
-the exact packaged `baseline-generation-output.v2` schema. It attests runtime,
-model tag, and immutable digest before source/evidence leaves Core, never pulls
-a model, and never falls back to generic HTTP or legacy generation.
+the exact packaged `baseline-generation-output.v2` schema. It first checks the
+complete pinned-template token count and exact request bytes, then attests the
+exact runtime, model tag, immutable digest, and template rendering before
+source/evidence leaves Core. It never pulls a model and never falls back to
+generic HTTP or legacy generation.
 
-`compair-core-generation verify` performs static runtime/model/digest checks;
+`compair-core-generation verify` performs runtime/model/digest checks plus a
+non-inference template-render attestation;
 `--probe` adds one private-data-free structured-output inference. Both produce
 one safe JSON value without endpoints, prompts, evidence, findings, raw
 responses, leases, or idempotency keys. The old development translation proxy

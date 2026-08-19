@@ -18,6 +18,7 @@ from compair_core.baseline_control_plane_schema import (
     baseline_worker_instance,
 )
 from compair_core.baseline_embedding.manifest import load_baseline_model_manifest
+from compair_core.baseline_generation.budget import qualified_budget_profile
 from compair_core.baseline_generation.profile import (
     GIB,
     RECOMMENDED_GENERATION_MODEL,
@@ -116,7 +117,7 @@ def _generation_factory(calls: list[str]):
         def handler(request: httpx.Request) -> httpx.Response:
             calls.append(request.url.path)
             if request.url.path == "/api/version":
-                return httpx.Response(200, json={"version": "0.32.13"})
+                return httpx.Response(200, json={"version": "0.32.14"})
             if request.url.path == "/api/tags":
                 return httpx.Response(
                     200,
@@ -130,6 +131,18 @@ def _generation_factory(calls: list[str]):
                     },
                 )
             if request.url.path == "/api/chat":
+                payload = json.loads(request.content)
+                if payload.get("_debug_render_only") is True:
+                    return httpx.Response(
+                        200,
+                        json={
+                            "model": RECOMMENDED_GENERATION_MODEL,
+                            "done": True,
+                            "_debug_info": {
+                                "rendered_template": qualified_budget_profile().attestation_render
+                            },
+                        },
+                    )
                 return httpx.Response(
                     200,
                     json={
@@ -206,7 +219,7 @@ def test_doctor_ready_json_contract_and_probe_is_opt_in(
     )
     assert without_probe.status == "ready"
     assert without_probe.generation_probed is False
-    assert "/api/chat" not in generation_calls
+    assert generation_calls.count("/api/chat") == 1
     payload = without_probe.as_dict()
     assert payload["schema_version"] == DOCTOR_RESULT_SCHEMA_VERSION
     assert payload["timestamp"] == "2026-01-02T00:00:00Z"
@@ -221,7 +234,7 @@ def test_doctor_ready_json_contract_and_probe_is_opt_in(
         generation_client_factory=_generation_factory(generation_calls),
     )
     assert probed.generation_probed is True
-    assert generation_calls.count("/api/chat") == 1
+    assert generation_calls.count("/api/chat") == 2
     assert without_probe.component("notifications").reason_code == (
         "notifications_default_off"
     )

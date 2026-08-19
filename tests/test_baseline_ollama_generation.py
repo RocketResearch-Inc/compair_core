@@ -16,6 +16,11 @@ from sqlalchemy import text
 from test_baseline_control_generation import _persist_control, _state
 from test_baseline_generation import _environment
 
+from compair_core.baseline_generation.budget import (
+    BUDGET_PROFILE_ASSET_SHA256,
+    BUDGET_PROFILE_FINGERPRINT,
+    qualified_budget_profile,
+)
 from compair_core.baseline_generation.cli import main as generation_cli
 from compair_core.baseline_generation.ollama import (
     OLLAMA_GENERATION_ADAPTER_CONTRACT,
@@ -63,13 +68,14 @@ def _structured(outcome: str, findings: list[str]) -> str:
 
 class FakeOllamaState:
     def __init__(self) -> None:
-        self.version = "0.32.13"
+        self.version = "0.32.14"
         self.model = MODEL
         self.digest = DIGEST_HEX
         self.chat_content = _structured("findings", ["Synthetic finding"])
         self.chat_status = 200
         self.chat_delay = 0.0
         self.chat_response_bytes: bytes | None = None
+        self.rendered_template: str | None = None
         self.requests: list[tuple[str, bytes, dict[str, str]]] = []
 
 
@@ -134,6 +140,29 @@ class _FakeOllamaHandler(BaseHTTPRequestHandler):
         )
         if self.path != "/api/chat":
             self._send_json(404, {"error": "not_found"})
+            return
+        payload = json.loads(body)
+        if payload.get("_debug_render_only") is True:
+            messages = payload["messages"]
+            rendered = (
+                "<|im_start|>system\n\n"
+                + messages[0]["content"]
+                + "<|im_end|>\n<|im_start|>user\n"
+                + messages[1]["content"]
+                + " /no_think<|im_end|>\n<|im_start|>assistant\n"
+                "<think>\n\n</think>\n\n"
+            )
+            self._send_json(
+                200,
+                {
+                    "model": self.server.state.model,
+                    "done": True,
+                    "_debug_info": {
+                        "rendered_template": self.server.state.rendered_template
+                        or rendered
+                    },
+                },
+            )
             return
         if self.server.state.chat_delay:
             time.sleep(self.server.state.chat_delay)
@@ -254,6 +283,15 @@ def _provider(endpoint: str, **overrides: object) -> OllamaBaselineGenerationPro
     return provider
 
 
+def _inference_chats(state: FakeOllamaState):
+    return [
+        request
+        for request in state.requests
+        if request[0] == "/api/chat"
+        and json.loads(request[1]).get("_debug_render_only") is not True
+    ]
+
+
 def test_configuration_rejects_insecure_or_ambiguous_transport() -> None:
     with pytest.raises(BaselineGenerationProviderError) as disabled:
         OllamaGenerationConfig.from_settings(
@@ -287,9 +325,29 @@ def test_configuration_rejects_insecure_or_ambiguous_transport() -> None:
 
 
 @pytest.mark.parametrize(
+    "overrides",
+    [
+        {"baseline_generation_model": "qwen3:14b-latest"},
+        {"baseline_generation_model_digest": "sha256:" + ("0" * 64)},
+        {"baseline_generation_context_tokens": 32_769},
+        {"baseline_generation_output_tokens": 1_025},
+    ],
+)
+def test_every_unqualified_budget_profile_is_rejected(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(BaselineGenerationProviderError) as error:
+        OllamaGenerationConfig.from_settings(
+            _settings("https://generation.example.test", **overrides)
+        )
+    assert error.value.code == "provider_unconfigured"
+
+
+@pytest.mark.parametrize(
     ("mutation", "expected"),
     [
         ({"version": "0.31.0"}, "unsupported_runtime"),
+        ({"version": "0.33.0"}, "unsupported_runtime"),
         ({"model": "another:tag"}, "model_absent"),
         ({"digest": "0" * 64}, "digest_mismatch"),
     ],
@@ -316,6 +374,14 @@ def test_unavailable_endpoint_is_safe_and_retryable() -> None:
     assert "127.0.0.1" not in json.dumps(readiness.as_dict())
 
 
+def test_template_selection_mismatch_is_unsupported() -> None:
+    with _server() as (state, endpoint):
+        state.rendered_template = "unexpected native Jinja rendering"
+        readiness = verify_ollama_generation(_settings(endpoint))
+    assert readiness.ready is False
+    assert readiness.status == "unsupported_runtime"
+
+
 def test_probe_reports_structured_output_unavailable_without_payload() -> None:
     with _server() as (state, endpoint):
         state.chat_status = 400
@@ -333,11 +399,17 @@ def test_exact_schema_deterministic_request_and_order(monkeypatch) -> None:
     with _server() as (state, endpoint):
         provider = _provider(endpoint)
         generation_input = _generation_input()
+        expected_body = provider._prepare_chat(
+            source_text=generation_input.source_text,
+            evidence=[item.renderer_output for item in generation_input.evidence],
+            maximum_findings=2,
+        )
         output = provider.generate(generation_input, idempotency_key="opaque-key")
 
     assert output == state.chat_content
-    chats = [request for request in state.requests if request[0] == "/api/chat"]
+    chats = _inference_chats(state)
     assert len(chats) == 1
+    assert chats[0][1] == expected_body
     payload = json.loads(chats[0][1])
     packaged_schema = json.loads(
         (
@@ -353,6 +425,7 @@ def test_exact_schema_deterministic_request_and_order(monkeypatch) -> None:
     assert payload["model"] == MODEL
     assert payload["stream"] is False
     assert payload["think"] is False
+    assert payload["truncate"] is False
     assert "tools" not in payload
     assert payload["options"] == {
         "temperature": 0,
@@ -382,7 +455,7 @@ def test_redirects_are_not_followed() -> None:
         with pytest.raises(BaselineGenerationProviderError) as redirected:
             provider.generate(_generation_input(), idempotency_key="ignored")
     assert redirected.value.code == "endpoint_unavailable"
-    assert sum(request[0] == "/api/chat" for request in state.requests) == 1
+    assert len(_inference_chats(state)) == 1
 
 
 @pytest.mark.parametrize(
@@ -457,18 +530,144 @@ def test_timeout_transient_status_response_limit_and_request_limit() -> None:
             provider.generate(_generation_input(), idempotency_key="ignored")
         assert oversized.value.code == "provider_response_too_large"
 
-    with _server() as (_state, endpoint):
-        provider = _provider(
-            endpoint,
-            baseline_generation_context_tokens=2_048,
-            baseline_generation_output_tokens=1_024,
-        )
+    with _server() as (state, endpoint):
+        provider = _provider(endpoint)
+        before = len(state.requests)
         with pytest.raises(BaselineGenerationProviderError) as request:
             provider.generate(
-                _generation_input(source_text="x" * 2_000),
+                _generation_input(1, source_text=" x" * 31_555),
                 idempotency_key="ignored",
             )
         assert request.value.code == "provider_request_too_large"
+        assert request.value.retryable is False
+        assert len(state.requests) == before
+
+
+def test_budget_profile_golden_tokens_and_envelopes() -> None:
+    profile = qualified_budget_profile()
+    assert profile.fingerprint == BUDGET_PROFILE_FINGERPRINT
+    assert (
+        __import__("hashlib")
+        .sha256(
+            (
+                ROOT
+                / "compair_core/baseline_generation"
+                / "qwen3-14b-ollama-0.32.14.profile.json"
+            ).read_bytes()
+        )
+        .hexdigest()
+        == BUDGET_PROFILE_ASSET_SHA256
+    )
+    golden = {
+        "hello": [14990],
+        'json: {"quote":"\\"","slash":"\\\\"}': [
+            2236,
+            25,
+            5212,
+            2949,
+            3252,
+            2105,
+            2198,
+            50256,
+            3252,
+            69947,
+            92,
+        ],
+        "Unicode café 中文 Ελληνικά emoji 🧪🚀": [
+            33920,
+            51950,
+            72858,
+            16744,
+            7851,
+            243,
+            33486,
+            33486,
+            41424,
+            33269,
+            29762,
+            67337,
+            74134,
+            42365,
+            11162,
+            100,
+            103,
+            145836,
+        ],
+        "line one\nline two\r\n\nend": [1056, 825, 198, 1056, 1378, 80823, 408],
+    }
+    for value, expected in golden.items():
+        assert profile.tokenizer.encode(value) == expected
+
+    provider = OllamaBaselineGenerationProvider(
+        _config("https://generation.example.test")
+    )
+    expected_counts = {1: 201, 2: 219, 3: 237, 4: 255}
+    for count, expected_count in expected_counts.items():
+        generation_input = _generation_input(
+            count,
+            source_text='Unicode café 中文\njson: {"quote":"\\""}',
+        )
+        body = provider._prepare_chat(
+            source_text=generation_input.source_text,
+            evidence=[item.renderer_output for item in generation_input.evidence],
+            maximum_findings=count,
+        )
+        payload = json.loads(body)
+        assert (
+            profile.count(
+                payload["messages"][0]["content"],
+                payload["messages"][1]["content"],
+            )
+            == expected_count
+        )
+        assert [
+            payload["messages"][1]["content"].index(item.renderer_output)
+            for item in generation_input.evidence
+        ] == sorted(
+            payload["messages"][1]["content"].index(item.renderer_output)
+            for item in generation_input.evidence
+        )
+
+
+def test_exact_fit_one_token_over_and_body_byte_overflow() -> None:
+    provider = OllamaBaselineGenerationProvider(
+        _config("https://generation.example.test")
+    )
+    evidence = [_generation_input(1).evidence[0].renderer_output]
+    exact = provider._prepare_chat(
+        source_text=" x" * 31_554,
+        evidence=evidence,
+        maximum_findings=1,
+    )
+    payload = json.loads(exact)
+    assert (
+        provider._budget_profile.count(
+            payload["messages"][0]["content"],
+            payload["messages"][1]["content"],
+        )
+        == 31_744
+    )
+    with pytest.raises(BaselineGenerationProviderError) as token_over:
+        provider._prepare_chat(
+            source_text=" x" * 31_555,
+            evidence=evidence,
+            maximum_findings=1,
+        )
+    assert token_over.value.code == "provider_request_too_large"
+
+    byte_limited = OllamaBaselineGenerationProvider(
+        _config(
+            "https://generation.example.test",
+            baseline_generation_max_request_bytes=4_096,
+        )
+    )
+    with pytest.raises(BaselineGenerationProviderError) as body_over:
+        byte_limited._prepare_chat(
+            source_text="漢" * 1_000,
+            evidence=evidence,
+            maximum_findings=1,
+        )
+    assert body_over.value.code == "provider_request_too_large"
 
 
 def test_no_fallback_and_safe_persistable_identity() -> None:
@@ -485,11 +684,36 @@ def test_no_fallback_and_safe_persistable_identity() -> None:
     assert identity.adapter_contract == OLLAMA_GENERATION_ADAPTER_CONTRACT
     assert identity.model == MODEL
     assert identity.digest == DIGEST
-    assert identity.runtime_version == "0.32.13"
+    assert identity.runtime_version == "0.32.14"
     assert identity.output_spec_sha256 == GENERATION_OUTPUT_SPEC_SHA256
     assert identity.output_schema_sha256 == GENERATION_OUTPUT_SCHEMA_SHA256
     assert identity.supports_idempotency is False
-    assert DIGEST in version and "runtime=0.32.13" in version
+    assert DIGEST in version and "runtime=0.32.14" in version
+    assert identity.budget_profile_fingerprint in version
+    assert len(version) <= 256
+    fingerprint_payload = {
+        "adapter_contract": OLLAMA_GENERATION_ADAPTER_CONTRACT,
+        "budget_profile_fingerprint": identity.budget_profile_fingerprint,
+        "digest": DIGEST,
+        "model": MODEL,
+        "output_schema_sha256": GENERATION_OUTPUT_SCHEMA_SHA256,
+        "output_spec_sha256": GENERATION_OUTPUT_SPEC_SHA256,
+        "provider": "ollama",
+        "runtime_version": "0.32.14",
+        "supports_idempotency": False,
+    }
+    assert (
+        identity.fingerprint
+        == __import__("hashlib")
+        .sha256(
+            json.dumps(
+                fingerprint_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        )
+        .hexdigest()
+    )
     assert "127.0.0.1" not in version and "11434" not in version
 
 
@@ -532,7 +756,7 @@ def test_native_provider_uses_existing_atomic_control_generation(
             )
             receipt = service.generate_control(job_id, provider)
             replay = service.generate_control(job_id, provider)
-            chat_count = sum(request[0] == "/api/chat" for request in state.requests)
+            chat_count = len(_inference_chats(state))
 
         assert receipt.state == "feedback_persisted"
         assert replay.replayed is True
@@ -574,7 +798,7 @@ def test_native_provider_uses_existing_atomic_control_generation(
                 .scalars()
                 .all()
             )
-        chat = next(request for request in state.requests if request[0] == "/api/chat")
+        chat = _inference_chats(state)[0]
         user_prompt = json.loads(chat[1])["messages"][1]["content"]
         positions = [user_prompt.index(renderer) for renderer in renderer_order]
         assert positions == sorted(positions)
@@ -630,6 +854,51 @@ def test_native_malformed_output_is_safe_terminal_and_zero_write(
             ).generate_control(job_id, _provider(endpoint))
         assert receipt.state == "terminal_failed"
         assert receipt.error_code == "provider_malformed_output"
+        job, run, feedback, outbox, notifications = _state(
+            environment,
+            job_id,
+            persisted.run_id,
+        )
+        assert job["state"] == "terminal_failed"
+        assert run["generation_state"] == "terminal_failed"
+        assert feedback == []
+        assert outbox == []
+        assert notifications == 0
+    finally:
+        environment.engine.dispose()
+
+
+def test_oversized_input_has_no_per_call_requests_or_output_side_effects(
+    tmp_path: Path,
+) -> None:
+    environment = _environment(tmp_path, "ollama-control-oversized.db")
+    try:
+        job_id, _caller, persisted = _persist_control(environment)
+        with environment.engine.begin() as connection:
+            source_document_id = connection.execute(
+                text(
+                    "SELECT source_document_id FROM baseline_retrieval_run "
+                    "WHERE run_id = :run_id"
+                ),
+                {"run_id": persisted.run_id},
+            ).scalar_one()
+            connection.execute(
+                text(
+                    "UPDATE document SET content = :content "
+                    "WHERE document_id = :document_id"
+                ),
+                {"content": " x" * 32_000, "document_id": source_document_id},
+            )
+        with _server() as (state, endpoint):
+            provider = _provider(endpoint)
+            request_count = len(state.requests)
+            receipt = BaselineGenerationService(
+                environment.sessions,
+                notifications_enabled=False,
+            ).generate_control(job_id, provider)
+            assert len(state.requests) == request_count
+        assert receipt.state == "terminal_failed"
+        assert receipt.error_code == "provider_request_too_large"
         job, run, feedback, outbox, notifications = _state(
             environment,
             job_id,

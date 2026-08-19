@@ -44,6 +44,10 @@ from .baseline_generation.profile import (
     MINIMUM_FREE_STORAGE_BYTES,
     MINIMUM_GENERATION_CAPACITY_BYTES,
     PREFERRED_TOTAL_MEMORY_BYTES,
+    QUALIFIED_BUDGET_PROFILE_ASSET_SHA256,
+    QUALIFIED_BUDGET_PROFILE_FINGERPRINT,
+    QUALIFIED_CONTEXT_TOKENS,
+    QUALIFIED_OUTPUT_TOKENS,
     RECOMMENDED_GENERATION_MODEL,
     RECOMMENDED_GENERATION_MODEL_DIGEST,
     RECOMMENDED_TOTAL_MEMORY_BYTES,
@@ -74,7 +78,7 @@ _NOT_READY = "not_ready"
 _PENDING_STATES = frozenset({"queued", "running"})
 _RETRYABLE_STATES = frozenset({"retryable_failed", "references_persisted"})
 _BLOCKED_STATES = frozenset({"blocked", "terminal_failed"})
-_MINIMUM_OLLAMA = (0, 32, 13)
+_QUALIFIED_OLLAMA = "0.32.14"
 _DISK_MINIMUM_DATABASE_BYTES = 512 * 1024 * 1024
 _DISK_MINIMUM_TEMP_BYTES = 512 * 1024 * 1024
 
@@ -493,6 +497,25 @@ def _generation_component(
         ):
             raise ValueError("structured_output_unavailable")
         schema = _strict_json(schema_raw)
+        profile_raw = (
+            Path(__file__).resolve().parent
+            / "baseline_generation"
+            / "qwen3-14b-ollama-0.32.14.profile.json"
+        ).read_bytes()
+        if hashlib.sha256(profile_raw).hexdigest() != (
+            QUALIFIED_BUDGET_PROFILE_ASSET_SHA256
+        ):
+            raise ValueError("generation_runtime_mismatch")
+        profile = _strict_json(profile_raw)
+        if (
+            not isinstance(profile, dict)
+            or profile.get("profile_fingerprint")
+            != QUALIFIED_BUDGET_PROFILE_FINGERPRINT
+        ):
+            raise ValueError("generation_runtime_mismatch")
+        framing = profile.get("framing")
+        if not isinstance(framing, dict):
+            raise TypeError("generation_runtime_mismatch")
         with factory() as client:
             version_response = client.get(f"{endpoint}/api/version")
             tags_response = client.get(f"{endpoint}/api/tags")
@@ -501,9 +524,12 @@ def _generation_component(
             version_payload = version_response.json()
             tags_payload = tags_response.json()
             runtime_version = str(version_payload.get("version", ""))
-            numeric = runtime_version.split("-", 1)[0].split("+", 1)[0]
-            parsed_version = tuple(int(item) for item in numeric.split("."))
-            if len(parsed_version) != 3 or parsed_version < _MINIMUM_OLLAMA:
+            if runtime_version != _QUALIFIED_OLLAMA:
+                raise ValueError("generation_runtime_mismatch")
+            if (
+                settings.baseline_generation_context_tokens != QUALIFIED_CONTEXT_TOKENS
+                or settings.baseline_generation_output_tokens != QUALIFIED_OUTPUT_TOKENS
+            ):
                 raise ValueError("generation_runtime_mismatch")
             models = tags_payload.get("models")
             if not isinstance(models, list):
@@ -525,12 +551,64 @@ def _generation_component(
                 digest = f"sha256:{digest}"
             if digest != settings.baseline_generation_model_digest:
                 raise ValueError("generation_digest_mismatch")
+            if (
+                settings.baseline_generation_model != RECOMMENDED_GENERATION_MODEL
+                or digest != RECOMMENDED_GENERATION_MODEL_DIGEST
+            ):
+                raise ValueError("generation_runtime_mismatch")
+            render_body = {
+                "_debug_render_only": True,
+                "model": settings.baseline_generation_model,
+                "stream": False,
+                "think": False,
+                "truncate": False,
+                "format": schema,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": framing["attestation_system"],
+                    },
+                    {
+                        "role": "user",
+                        "content": framing["attestation_user"],
+                    },
+                ],
+                "options": {
+                    "temperature": 0,
+                    "seed": settings.baseline_generation_seed,
+                    "num_ctx": settings.baseline_generation_context_tokens,
+                    "num_predict": settings.baseline_generation_output_tokens,
+                },
+            }
+            render_response = client.post(f"{endpoint}/api/chat", json=render_body)
+            if render_response.status_code != 200:
+                raise ValueError("generation_runtime_mismatch")
+            render_payload = render_response.json()
+            expected_render = (
+                str(framing["system_prefix"])
+                + str(framing["attestation_system"])
+                + str(framing["system_suffix"])
+                + str(framing["user_prefix"])
+                + str(framing["attestation_user"])
+                + str(framing["user_suffix"])
+            )
+            debug_info = (
+                render_payload.get("_debug_info")
+                if isinstance(render_payload, dict)
+                else None
+            )
+            if (
+                not isinstance(debug_info, dict)
+                or debug_info.get("rendered_template") != expected_render
+            ):
+                raise ValueError("generation_runtime_mismatch")
             probe_outcome: str | None = None
             if probe:
                 body = {
                     "model": settings.baseline_generation_model,
                     "stream": False,
                     "think": False,
+                    "truncate": False,
                     "format": schema,
                     "messages": [
                         {

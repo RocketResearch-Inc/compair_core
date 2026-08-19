@@ -7,24 +7,25 @@ fallback and no translation proxy.
 
 ## Supported contract
 
-The adapter contract is `baseline-generation-ollama-http.v1`. Every request
+The adapter contract is `baseline-generation-ollama-http.v2`. Every request
 uses the packaged JSON Schema whose raw SHA-256 is
 `fc5a85d5d38c18775afe0966987ea74e7e9ac072148822c1be60a199e32cca27`.
 The specification SHA-256 is
 `e670731777b253f9d5e3984405c2d99871ba26f637a17e6221cc82d97bc8beb1`.
 Core neither projects nor simplifies this schema.
 
-Before evidence is sent, Core calls `GET /api/version` and `GET /api/tags` and
-requires:
+Before evidence is sent, Core checks the complete locally rendered prompt and
+the exact compact request bytes, then calls `GET /api/version`, `GET /api/tags`,
+and the non-inference `_debug_render_only` template attestation. It requires:
 
-- Ollama 0.32.13 or newer;
-- the exact configured model name; and
-- the exact configured `sha256:` digest.
+- exactly Ollama 0.32.14;
+- exactly `qwen3:14b` at the qualified immutable `sha256:` digest; and
+- the exact qualified native-template rendering.
 
 Core never calls a pull endpoint. The same attestation is repeated immediately
 before each evidence-bearing request, so a changed mutable tag fails closed.
 The request sets `stream=false`, `think=false`, no tools, temperature zero, a
-fixed seed, and bounded `num_ctx`/`num_predict`. Ordered stored renderer output
+fixed seed, `truncate=false`, and qualified `num_ctx`/`num_predict`. Ordered stored renderer output
 is passed without reranking, clipping, or normalization. Findings remain
 bounded by both the four-item schema and the persisted Reference count.
 
@@ -39,7 +40,12 @@ The supported recommended local profile is:
 - validated Ollama runtime: 0.32.14;
 - context: 32,768 tokens;
 - output limit: 1,024 tokens; and
-- adapter: `baseline-generation-ollama-http.v1`.
+- adapter: `baseline-generation-ollama-http.v2`.
+
+No newer runtime, alternate model/digest, or alternate context/output tuple
+inherits this budget profile. Provenance, asset hashes, third-party terms, and
+the deterministic derivation procedure are recorded in
+`baseline-generation-budget-profile-provenance.md`.
 
 The provider qualification produced 32/32 expected outcomes across two
 independent cold cycles. Peak Ollama RSS was 14.88 GB, maximum observed latency
@@ -89,12 +95,15 @@ The optional bounds are:
 | `COMPAIR_BASELINE_GENERATION_TIMEOUT_SECONDS` | 60 seconds | 0.1–300 seconds; use 300 for the supported CPU profile |
 | `COMPAIR_BASELINE_GENERATION_MAX_REQUEST_BYTES` | 256,000 | 4,096–8,000,000 |
 | `COMPAIR_BASELINE_GENERATION_MAX_RESPONSE_BYTES` | 200,000 | 4,096–1,000,000 |
-| `COMPAIR_BASELINE_GENERATION_CONTEXT_TOKENS` | 32,768 | 2,048–131,072 |
-| `COMPAIR_BASELINE_GENERATION_OUTPUT_TOKENS` | 1,024 | 64–4,096 |
+| `COMPAIR_BASELINE_GENERATION_CONTEXT_TOKENS` | 32,768 | exactly 32,768 in native Ollama mode |
+| `COMPAIR_BASELINE_GENERATION_OUTPUT_TOKENS` | 1,024 | exactly 1,024 in native Ollama mode |
 | `COMPAIR_BASELINE_GENERATION_SEED` | 0 | 0–2,147,483,647 |
 
-Inputs that cannot fit the conservative context bound fail; Core never relies
-on hidden model-side truncation.
+Core counts the exact template-rendered prompt with the pinned tokenizer and
+requires input tokens plus the output reservation to fit the qualified
+context. It separately checks the exact bytes later sent. Either excess uses
+the non-retryable `provider_request_too_large` outcome before per-call
+attestation; Core never relies on model-side truncation.
 
 ## Resource guidance
 
@@ -121,8 +130,9 @@ compair-core-generation verify --probe
 ```
 
 Both commands emit exactly one safe JSON value. Default verification checks
-configuration, transport, runtime, model, and digest without inference. The
-probe sends a minimal private-data-free prompt through the exact schema.
+configuration, transport, runtime, model, digest, and template selection
+without inference. The probe adds a minimal private-data-free structured-output
+inference through the exact schema.
 
 Readiness statuses are `provider_unconfigured`, `endpoint_unavailable`,
 `insecure_transport`, `unsupported_runtime`, `model_absent`, `digest_mismatch`,

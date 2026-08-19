@@ -25,8 +25,11 @@ from sqlalchemy.engine import URL, make_url
 from .baseline_generation.profile import (
     ACCELERATED_GENERATION_TIMEOUT_SECONDS,
     GENERATION_LEASE_COMMIT_MARGIN_SECONDS,
+    QUALIFIED_BUDGET_PROFILE_FINGERPRINT,
     QUALIFIED_CONTEXT_TOKENS,
     QUALIFIED_OUTPUT_TOKENS,
+    RECOMMENDED_GENERATION_MODEL,
+    RECOMMENDED_GENERATION_MODEL_DIGEST,
     required_generation_lease_seconds,
 )
 
@@ -38,7 +41,7 @@ BASELINE_INDEX_SCHEMA_VERSION = "baseline-index.v1"
 BASELINE_VECTOR_FORMAT = "float32-le.v1"
 BASELINE_EMBEDDING_CONTRACT = "baseline-embedding-http.v1"
 BASELINE_EMBEDDING_PROVIDER = "baseline_http_v1"
-BASELINE_GENERATION_ADAPTER_CONTRACT = "baseline-generation-ollama-http.v1"
+BASELINE_GENERATION_ADAPTER_CONTRACT = "baseline-generation-ollama-http.v2"
 BASELINE_GENERATION_OUTPUT_VERSION = "baseline-generation-output.v2"
 BASELINE_GENERATION_OUTPUT_SPEC_SHA256 = (
     "e670731777b253f9d5e3984405c2d99871ba26f637a17e6221cc82d97bc8beb1"
@@ -340,6 +343,30 @@ def _embedding_identity(settings: Any) -> dict[str, object]:
 
 
 def _generation_identity(settings: Any) -> dict[str, object]:
+    provider = str(getattr(settings, "baseline_generation_provider", "disabled"))
+    qualified_ollama = (
+        provider == "ollama"
+        and getattr(settings, "baseline_generation_model", None)
+        == RECOMMENDED_GENERATION_MODEL
+        and getattr(settings, "baseline_generation_model_digest", None)
+        == RECOMMENDED_GENERATION_MODEL_DIGEST
+        and int(
+            getattr(
+                settings,
+                "baseline_generation_context_tokens",
+                QUALIFIED_CONTEXT_TOKENS,
+            )
+        )
+        == QUALIFIED_CONTEXT_TOKENS
+        and int(
+            getattr(
+                settings,
+                "baseline_generation_output_tokens",
+                QUALIFIED_OUTPUT_TOKENS,
+            )
+        )
+        == QUALIFIED_OUTPUT_TOKENS
+    )
     identity = {
         "adapter_contract": BASELINE_GENERATION_ADAPTER_CONTRACT,
         "model": getattr(settings, "baseline_generation_model", None),
@@ -348,7 +375,12 @@ def _generation_identity(settings: Any) -> dict[str, object]:
         "output_schema_sha256": BASELINE_GENERATION_OUTPUT_SCHEMA_SHA256,
         "output_schema_version": BASELINE_GENERATION_OUTPUT_VERSION,
         "output_spec_sha256": BASELINE_GENERATION_OUTPUT_SPEC_SHA256,
-        "provider": str(getattr(settings, "baseline_generation_provider", "disabled")),
+        "provider": provider,
+        **(
+            {"budget_profile_fingerprint": QUALIFIED_BUDGET_PROFILE_FINGERPRINT}
+            if qualified_ollama
+            else {}
+        ),
     }
     return {
         **identity,
@@ -614,7 +646,6 @@ def validate_runtime_configuration(
         not in {"verified_https", "explicit_loopback_http"}
     ):
         raise RuntimeConfigurationError("generation_configuration_invalid")
-
     keyring = attest_keyring(getattr(settings, "baseline_run_encryption_keyring", None))
     baseline_required = require_worker_baseline or bool(
         getattr(settings, "baseline_runs_enabled", False)
