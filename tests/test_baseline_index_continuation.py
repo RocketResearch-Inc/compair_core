@@ -145,14 +145,25 @@ def _payload(
     *,
     idempotency_key: str = "opaque-index-build-intent-00000001",
     identity: BaselineEmbeddingIdentity | None = None,
+    continuation_job_id: str | None = None,
 ) -> dict[str, object]:
     identity = identity or _identity()
     with environment.engine.connect() as connection:
-        continuation = connection.execute(
-            select(snapshot_continuation_job).where(
-                snapshot_continuation_job.c.state == "succeeded"
-            ).order_by(snapshot_continuation_job.c.finished_at.desc())
-        ).mappings().first()
+        statement = select(snapshot_continuation_job).where(
+            snapshot_continuation_job.c.state == "succeeded"
+        )
+        if continuation_job_id is not None:
+            statement = statement.where(
+                snapshot_continuation_job.c.continuation_job_id
+                == continuation_job_id
+            )
+        continuation = (
+            connection.execute(
+                statement.order_by(snapshot_continuation_job.c.finished_at.desc())
+            )
+            .mappings()
+            .first()
+        )
     assert continuation is not None
     return {
         "protocol_version": PROTOCOL_VERSION,

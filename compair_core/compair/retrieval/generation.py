@@ -35,6 +35,10 @@ from ...baseline_evidence_schema import (
     SOURCE_SCOPE_LEGACY_CHUNK,
     SOURCE_SCOPE_VERSION,
 )
+from .control_document_scope import (
+    ControlDocumentCorpusScopeError,
+    control_document_corpus_identity,
+)
 from .corpus import (
     BaselineIndexBuildStatus,
     CorpusGenerationStatus,
@@ -2127,7 +2131,8 @@ class BaselineGenerationService:
             if run["source_chunk_id"] is not None:
                 return "generation_source_scope_invalid", None
             source_sql = (
-                "SELECT d.content FROM document d "
+                "SELECT d.content, j.changed_repository_registration_id, "
+                "j.corpus_id AS control_corpus_id FROM document d "
                 "JOIN document_to_group dtg ON dtg.document_id = d.document_id "
                 "JOIN user_to_group utg ON utg.group_id = dtg.group_id "
                 'JOIN "user" u ON u.user_id = utg.user_id '
@@ -2144,23 +2149,56 @@ class BaselineGenerationService:
         source = session.execute(text(source_sql), parameters).mappings().one_or_none()
         if source is None:
             return "generation_authorization_revoked", None
-        expected_scope = f"group:{command.group_id}"
-        if run["corpus_scope_key"] != expected_scope:
-            return "generation_scope_mismatch", None
-        corpus_statement = select(RetrievalCorpus).where(
-            RetrievalCorpus.scope_key == expected_scope
-        )
+        control_identity = None
+        if source_scope == SOURCE_SCOPE_CONTROL_DOCUMENT:
+            try:
+                control_identity = control_document_corpus_identity(
+                    group_id=command.group_id,
+                    changed_repository_registration_id=str(
+                        source["changed_repository_registration_id"]
+                    ),
+                    source_document_id=str(run["source_document_id"]),
+                )
+            except ControlDocumentCorpusScopeError:
+                return "generation_source_scope_invalid", None
+            if source["control_corpus_id"] != run[
+                "corpus_id"
+            ] or not control_identity.matches_stored_corpus(
+                scope_key=str(run["corpus_scope_key"]),
+                changed_repository_id=str(source["changed_repository_registration_id"]),
+                source_document_id=str(run["source_document_id"]),
+            ):
+                return "generation_scope_mismatch", None
+            corpus_statement = select(RetrievalCorpus).where(
+                RetrievalCorpus.corpus_id == run["corpus_id"]
+            )
+        else:
+            expected_scope = f"group:{command.group_id}"
+            if run["corpus_scope_key"] != expected_scope:
+                return "generation_scope_mismatch", None
+            corpus_statement = select(RetrievalCorpus).where(
+                RetrievalCorpus.scope_key == expected_scope
+            )
         if session.get_bind().dialect.name == "postgresql":
             corpus_statement = corpus_statement.with_for_update()
         corpus = session.scalar(corpus_statement)
+        corpus_matches_source = corpus is not None
+        if corpus is not None and control_identity is not None:
+            corpus_matches_source = control_identity.matches_stored_corpus(
+                scope_key=corpus.scope_key,
+                changed_repository_id=corpus.changed_repository_id,
+                source_document_id=corpus.source_document_id,
+            )
+        elif corpus is not None:
+            corpus_matches_source = (
+                corpus.source_document_id is None
+                or corpus.source_document_id == run["source_document_id"]
+            )
         if (
             corpus is None
+            or not corpus_matches_source
             or corpus.corpus_id != run["corpus_id"]
             or corpus.active_generation_id != run["corpus_generation_id"]
-            or (
-                corpus.source_document_id is not None
-                and corpus.source_document_id != run["source_document_id"]
-            )
         ):
             return "generation_corpus_stale", None
         generation = session.get(RetrievalCorpusGeneration, corpus.active_generation_id)

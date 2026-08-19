@@ -37,7 +37,7 @@ from ...baseline_evidence_schema import (
 )
 from .baseline import MAX_EVIDENCE_CHARACTERS, MAX_EVIDENCE_ITEMS, RETRIEVAL_LIMIT
 from .control_plane_v2 import PROTOCOL_V2_SHA256, PROTOCOL_V2_VERSION
-from .corpus import RetrievalCorpusGeneration
+from .corpus import RetrievalCorpus, RetrievalCorpusGeneration
 from .embedding import create_configured_persistent_baseline_retriever
 from .evidence_persistence import (
     BaselineEvidencePersistenceCommand,
@@ -209,6 +209,7 @@ class _ExecutionContext:
     job: Mapping[str, Any]
     generation_version: str
     generation_manifest_hash: str
+    corpus_scope_key: str
 
 
 def derive_document_persistence_identity(
@@ -338,7 +339,7 @@ class BaselineDocumentRunExecutor:
         self,
         session: Session,
         job: Mapping[str, Any],
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, str]:
         self._validate_frozen_job(job)
         try:
             authorized = self.jobs._authorize_publication(
@@ -366,15 +367,22 @@ class BaselineDocumentRunExecutor:
         generation = session.get(
             RetrievalCorpusGeneration, str(job["corpus_generation_id"])
         )
+        corpus = session.get(RetrievalCorpus, authorized.corpus_id)
         if (
             generation is None
+            or corpus is None
+            or generation.corpus_id != corpus.corpus_id
             or not isinstance(generation.manifest_hash, str)
             or len(generation.manifest_hash) != 64
         ):
             raise BaselineRunExecutorError(
                 "corpus_incompatible", retryable=False, state="blocked"
             )
-        return generation.generation_version, generation.manifest_hash
+        return (
+            generation.generation_version,
+            generation.manifest_hash,
+            corpus.scope_key,
+        )
 
     def _payload(
         self,
@@ -623,9 +631,11 @@ class BaselineDocumentRunExecutor:
                         "job_lease_unavailable", retryable=True
                     )
                 try:
-                    generation_version, generation_manifest_hash = self._reauthorize(
-                        session, job
-                    )
+                    (
+                        generation_version,
+                        generation_manifest_hash,
+                        corpus_scope_key,
+                    ) = self._reauthorize(session, job)
                     payload = self._payload(session, job)
                     opened = self.jobs.cipher.decrypt(job=job, payload=payload)
                 except (BaselineRunJobError, BaselineRunExecutorError) as exc:
@@ -656,6 +666,7 @@ class BaselineDocumentRunExecutor:
                         job=dict(job),
                         generation_version=generation_version,
                         generation_manifest_hash=generation_manifest_hash,
+                        corpus_scope_key=corpus_scope_key,
                     )
                 session.commit()
             except Exception:
@@ -681,7 +692,7 @@ class BaselineDocumentRunExecutor:
             retrieval_query_origin=RetrievalQueryOrigin.EXPLICIT,
             query_kind="raw_git_diff_v1",
             corpus_complete=True,
-            corpus_scope_key=f"group:{job['group_id']}",
+            corpus_scope_key=context.corpus_scope_key,
             changed_repository_id=str(job["changed_repository_registration_id"]),
             group_id=str(job["group_id"]),
             source_document_id=str(job["source_document_id"]),
@@ -742,7 +753,7 @@ class BaselineDocumentRunExecutor:
             result.config_fingerprint != job["retrieval_config_fingerprint"]
             or result.corpus_id != job["corpus_id"]
             or result.corpus_manifest_hash != context.generation_manifest_hash
-            or result.corpus_scope_key != f"group:{job['group_id']}"
+            or result.corpus_scope_key != context.corpus_scope_key
             or result.index_id != job["index_publication_id"]
             or result.index_schema_version != job["index_format_version"]
             or result.index_fingerprint != job["index_fingerprint"]

@@ -26,12 +26,17 @@ from compair_core.baseline_control_plane_schema import (
     compatible_index_job,
     control_job,
     snapshot_continuation_job,
+    snapshot_staging,
 )
 
 from .baseline import BASELINE_TOKENIZER_VERSION
 from .continuation_worker import (
     BaselineContinuationWorker,
     continuation_result_provenance_fingerprint,
+)
+from .control_document_scope import (
+    ControlDocumentCorpusScopeError,
+    control_document_corpus_identity,
 )
 from .control_plane import (
     DEFAULT_LEASE_LIFETIME,
@@ -477,11 +482,38 @@ class BaselineCompatibleIndexJobService:
             raise IndexJobError("corpus_generation_absent", retryable=False)
         corpus = session.get(RetrievalCorpus, generation.corpus_id)
         ingestion = session.get(RetrievalCorpusIngestion, generation_id)
+        staging = (
+            session.execute(
+                select(snapshot_staging).where(
+                    snapshot_staging.c.group_id == group_id,
+                    snapshot_staging.c.staging_id == continuation["staging_id"],
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        scope_matches = False
+        if corpus is not None and staging is not None:
+            snapshot = self.control._snapshot_from_staging(staging)
+            changed = snapshot.manifest["changed_repository"]
+            try:
+                scope_identity = control_document_corpus_identity(
+                    group_id=group_id,
+                    changed_repository_registration_id=str(changed["repository_id"]),
+                    source_document_id=str(changed["source_document_id"]),
+                )
+                scope_matches = scope_identity.matches_stored_corpus(
+                    scope_key=corpus.scope_key,
+                    changed_repository_id=corpus.changed_repository_id,
+                    source_document_id=corpus.source_document_id,
+                )
+            except ControlDocumentCorpusScopeError:
+                scope_matches = False
         if (
             corpus is None
             or ingestion is None
             or corpus.corpus_id != continuation["result_corpus_id"]
-            or corpus.scope_key != f"group:{group_id}"
+            or not scope_matches
             or corpus.active_generation_id != generation_id
             or generation.status != CorpusGenerationStatus.ACTIVE.value
             or generation.generation_version

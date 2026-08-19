@@ -25,6 +25,10 @@ from ...baseline_evidence_schema import (
     SOURCE_SCOPE_LEGACY_CHUNK,
     SOURCE_SCOPE_VERSION,
 )
+from .control_document_scope import (
+    ControlDocumentCorpusScopeError,
+    control_document_corpus_identity,
+)
 from .generation import (
     GENERATION_OUTPUT_SCHEMA_SHA256,
     GENERATION_OUTPUT_SCHEMA_VERSION,
@@ -326,7 +330,8 @@ class BaselinePreviewService:
                 text(
                     "SELECT j.job_id, j.group_id, j.submitted_by_user_id, "
                     "j.source_document_id AS job_source_document_id, j.state AS job_state, "
-                    "j.changed_repository_registration_id, j.corpus_generation_id "
+                    "j.changed_repository_registration_id, j.corpus_id AS job_corpus_id, "
+                    "j.corpus_generation_id "
                     "AS job_corpus_generation_id, j.index_publication_id, "
                     "j.corpus_manifest_hash AS job_corpus_manifest_hash, "
                     "index_job.corpus_manifest_hash AS submission_manifest_hash, "
@@ -350,7 +355,8 @@ class BaselinePreviewService:
                     "j.generation_output_fingerprint AS job_generation_output_fingerprint, "
                     "j.generation_completed_at, j.finished_at, "
                     "r.source_scope_version, r.source_scope, r.source_chunk_id, "
-                    "r.source_document_id, r.retrieval_status, r.result_schema_version, "
+                    "r.source_document_id, r.corpus_id AS run_corpus_id, "
+                    "r.corpus_scope_key, r.retrieval_status, r.result_schema_version, "
                     "r.engine, r.engine_version, r.config_fingerprint, "
                     "r.query_sha256, r.query_length, r.query_origin, "
                     "r.corpus_generation_id, r.corpus_generation_version, "
@@ -362,7 +368,8 @@ class BaselinePreviewService:
                     "r.generation_provider, r.generation_model, "
                     "r.generation_model_version, r.generation_input_fingerprint, "
                     "r.generation_output_fingerprint, r.generation_completed_at "
-                    "AS run_generation_completed_at "
+                    "AS run_generation_completed_at, corpus.scope_key "
+                    "AS stored_corpus_scope_key "
                     "FROM baseline_control_run_job j "
                     "JOIN baseline_retrieval_run r ON r.run_id = j.persisted_run_id "
                     "AND r.group_id = j.group_id "
@@ -377,6 +384,7 @@ class BaselinePreviewService:
                     "AND index_control.group_id = index_job.group_id "
                     "AND index_control.operation = 'index_build' "
                     "AND index_control.state = 'succeeded' "
+                    "JOIN retrieval_corpus corpus ON corpus.corpus_id = j.corpus_id "
                     'JOIN "user" u ON u.user_id = j.submitted_by_user_id '
                     "JOIN user_to_group utg ON utg.user_id = :caller_user_id "
                     "AND utg.group_id = j.group_id "
@@ -388,6 +396,8 @@ class BaselinePreviewService:
                     "j.changed_repository_registration_id "
                     "AND registration.group_id = j.group_id "
                     "AND registration.enabled = true "
+                    "AND corpus.changed_repository_id = registration.registration_id "
+                    "AND corpus.source_document_id = j.source_document_id "
                     "JOIN baseline_control_repository_approval approval "
                     "ON approval.registration_id = registration.registration_id "
                     "AND approval.group_id = registration.group_id "
@@ -515,6 +525,21 @@ class BaselinePreviewService:
             row["job_generation_input_fingerprint"],
             row["job_generation_output_fingerprint"],
         )
+        try:
+            control_corpus_identity = control_document_corpus_identity(
+                group_id=str(row["group_id"]),
+                changed_repository_registration_id=str(
+                    row["changed_repository_registration_id"]
+                ),
+                source_document_id=str(row["source_document_id"]),
+            )
+            control_corpus_matches = control_corpus_identity.matches_stored_corpus(
+                scope_key=str(row["stored_corpus_scope_key"]),
+                changed_repository_id=str(row["changed_repository_registration_id"]),
+                source_document_id=str(row["source_document_id"]),
+            )
+        except ControlDocumentCorpusScopeError:
+            control_corpus_matches = False
         invalid = (
             row["job_state"] != "feedback_persisted"
             or row["retrieval_status"] != "ok"
@@ -526,6 +551,9 @@ class BaselinePreviewService:
             or not 0 <= feedback_count <= 4
             or outbox_count not in {0, 1}
             or row["job_source_document_id"] != row["source_document_id"]
+            or row["job_corpus_id"] != row["run_corpus_id"]
+            or row["corpus_scope_key"] != row["stored_corpus_scope_key"]
+            or not control_corpus_matches
             or row["job_corpus_generation_id"] != row["corpus_generation_id"]
             or row["job_corpus_manifest_hash"] != row["submission_manifest_hash"]
             or row["corpus_manifest_hash"] != row["publication_file_manifest_hash"]

@@ -51,6 +51,11 @@ from .baseline import (
     normalize_retrieved_candidates,
     reciprocal_rank_fusion,
 )
+from .control_document_scope import (
+    ControlDocumentCorpusIdentity,
+    ControlDocumentCorpusScopeError,
+    control_document_corpus_identity,
+)
 from .corpus import (
     BaselineIndexBuildStatus,
     CorpusFileState,
@@ -519,11 +524,27 @@ class BaselineEvidencePersistenceService:
                 lease_token=source.lease_token,
                 caller_user_id=caller_user_id,
             )
+        control_document_identity: ControlDocumentCorpusIdentity | None = None
+        if control_job is not None:
+            try:
+                control_document_identity = control_document_corpus_identity(
+                    group_id=group_id,
+                    changed_repository_registration_id=str(
+                        control_job["changed_repository_registration_id"]
+                    ),
+                    source_document_id=document_id,
+                )
+            except ControlDocumentCorpusScopeError as exc:
+                raise BaselineEvidencePersistenceError(
+                    "control_job_intent_mismatch",
+                    exc.code,
+                ) from None
         corpus, generation, _ingestion, publication, build = self._lock_publication(
             session,
             group_id=group_id,
             source_document_id=document_id,
             result=result,
+            control_document_identity=control_document_identity,
         )
         self._validate_result_header(result, corpus, generation, build)
         if control_job is not None:
@@ -1011,6 +1032,7 @@ class BaselineEvidencePersistenceService:
         group_id: str,
         source_document_id: str,
         result: RetrievalResult,
+        control_document_identity: ControlDocumentCorpusIdentity | None,
     ) -> tuple[
         RetrievalCorpus,
         RetrievalCorpusGeneration,
@@ -1018,9 +1040,14 @@ class BaselineEvidencePersistenceService:
         RetrievalBaselineIndexPublication,
         RetrievalBaselineIndexBuild,
     ]:
-        corpus_statement = select(RetrievalCorpus).where(
-            RetrievalCorpus.scope_key == _scope_key(group_id)
-        )
+        if control_document_identity is None:
+            corpus_statement = select(RetrievalCorpus).where(
+                RetrievalCorpus.scope_key == _scope_key(group_id)
+            )
+        else:
+            corpus_statement = select(RetrievalCorpus).where(
+                RetrievalCorpus.corpus_id == result.corpus_id
+            )
         if session.get_bind().dialect.name == "postgresql":
             corpus_statement = corpus_statement.with_for_update()
         corpus = session.scalar(corpus_statement)
@@ -1028,7 +1055,15 @@ class BaselineEvidencePersistenceService:
             raise BaselineEvidencePersistenceError(
                 "active_corpus_absent", "group has no active trusted corpus"
             )
-        if corpus.source_document_id != source_document_id:
+        if control_document_identity is None:
+            source_matches = corpus.source_document_id == source_document_id
+        else:
+            source_matches = control_document_identity.matches_stored_corpus(
+                scope_key=corpus.scope_key,
+                changed_repository_id=corpus.changed_repository_id,
+                source_document_id=corpus.source_document_id,
+            )
+        if not source_matches:
             raise BaselineEvidencePersistenceError(
                 "corpus_source_mismatch",
                 "active corpus is not authoritative for the source document",

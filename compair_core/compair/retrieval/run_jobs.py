@@ -39,6 +39,10 @@ from compair_core.run_keyring import (
     parse_run_keyring,
 )
 
+from .control_document_scope import (
+    ControlDocumentCorpusScopeError,
+    control_document_corpus_identity,
+)
 from .control_plane import BaselineControlPlaneService, ControlPlaneError, canonicalize
 from .control_plane_v2 import (
     PROTOCOL_V2_SHA256,
@@ -562,6 +566,22 @@ class BaselineRunJobService:
             RetrievalBaselineIndexBuild, publication.index_publication_id
         )
         index_state = session.get(RetrievalIndexState, publication.corpus_generation_id)
+        try:
+            scope_matches = control_document_corpus_identity(
+                group_id=group_id,
+                changed_repository_registration_id=changed_registration_id,
+                source_document_id=source_document_id,
+            ).matches_stored_corpus(
+                scope_key=corpus.scope_key if corpus is not None else None,
+                changed_repository_id=(
+                    corpus.changed_repository_id if corpus is not None else None
+                ),
+                source_document_id=(
+                    corpus.source_document_id if corpus is not None else None
+                ),
+            )
+        except ControlDocumentCorpusScopeError:
+            scope_matches = False
         if (
             corpus is None
             or generation is None
@@ -569,7 +589,7 @@ class BaselineRunJobService:
             or current is None
             or build is None
             or index_state is None
-            or corpus.scope_key != f"group:{group_id}"
+            or not scope_matches
             or corpus.source_document_id != source_document_id
             or corpus.changed_repository_id != changed_registration_id
             or corpus.active_generation_id != publication.corpus_generation_id

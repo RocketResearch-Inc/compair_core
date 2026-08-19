@@ -32,6 +32,10 @@ from ...schema_migrations import (
     MIGRATION_TABLE_NAME,
     schema_migration_table,
 )
+from .control_document_scope import (
+    ControlDocumentCorpusScopeError,
+    control_document_corpus_identity,
+)
 from .control_plane_v2 import (
     V2IndexPublication,
     V2RunCapability,
@@ -402,15 +406,29 @@ class BaselineRunRuntime:
     ) -> bool:
         with self.sessions() as session:
             corpora = session.scalars(
-                select(RetrievalCorpus)
-                .where(RetrievalCorpus.scope_key == f"group:{group_id}")
-                .order_by(RetrievalCorpus.corpus_id)
+                select(RetrievalCorpus).order_by(RetrievalCorpus.corpus_id)
             ).all()
             for corpus in corpora:
                 if (
                     corpus.source_document_id is None
                     or corpus.active_generation_id is None
                     or corpus.changed_repository_id is None
+                ):
+                    continue
+                try:
+                    corpus_identity = control_document_corpus_identity(
+                        group_id=group_id,
+                        changed_repository_registration_id=(
+                            corpus.changed_repository_id
+                        ),
+                        source_document_id=corpus.source_document_id,
+                    )
+                except ControlDocumentCorpusScopeError:
+                    continue
+                if not corpus_identity.matches_stored_corpus(
+                    scope_key=corpus.scope_key,
+                    changed_repository_id=corpus.changed_repository_id,
+                    source_document_id=corpus.source_document_id,
                 ):
                     continue
                 publication = session.get(

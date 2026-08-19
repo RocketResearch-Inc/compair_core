@@ -14,6 +14,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from .control_document_scope import (
+    ControlDocumentCorpusScopeError,
+    control_document_corpus_identity,
+)
+
 REQUEST_SCHEMA_VERSION = "retrieval-request.v2"
 RESULT_SCHEMA_VERSION = "retrieval-result.v2"
 
@@ -136,7 +141,17 @@ class RetrievalRequest:
                 )
             ):
                 raise ValueError("group_id must be a canonical authorization scope")
-            if self.corpus_scope_key != f"group:{self.group_id}":
+            accepted_scope_keys = (f"group:{self.group_id}",)
+            if self.changed_repository_id is not None and self.source_document_id:
+                try:
+                    accepted_scope_keys = control_document_corpus_identity(
+                        group_id=self.group_id,
+                        changed_repository_registration_id=(self.changed_repository_id),
+                        source_document_id=self.source_document_id,
+                    ).accepted_scope_keys
+                except ControlDocumentCorpusScopeError as exc:
+                    raise ValueError(exc.code) from None
+            if self.corpus_scope_key not in accepted_scope_keys:
                 raise ValueError(
                     "group_id and corpus_scope_key must identify the same scope"
                 )

@@ -2237,11 +2237,8 @@ def test_continuation_worker_failure_rolls_back_publication_and_retry_resumes(
     )
     sessions = core_db.sessionmaker(environment.engine, expire_on_commit=False)
     with sessions() as session:
-        corpus = (
-            session.query(RetrievalCorpus)
-            .filter_by(scope_key=f"group:{environment.group_id}")
-            .one()
-        )
+        corpus = session.get(RetrievalCorpus, first.corpus_id)
+    assert corpus is not None
     assert corpus.active_generation_id == first.generation_id
     with environment.engine.connect() as connection:
         failed = (

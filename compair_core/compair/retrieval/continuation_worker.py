@@ -28,6 +28,11 @@ from compair_core.baseline_control_plane_schema import (
     snapshot_staging,
 )
 
+from .control_document_scope import (
+    ControlDocumentCorpusScopeError,
+    choose_control_document_corpus_scope_key,
+    control_document_corpus_identity,
+)
 from .control_plane import (
     DEFAULT_LEASE_LIFETIME,
     MAX_CONTENT_PART_REQUEST_BYTES,
@@ -40,6 +45,7 @@ from .corpus import (
     CorpusFileInput,
     CorpusFileSkipReason,
     CorpusFileState,
+    RetrievalCorpus,
     RetrievalIndexState,
 )
 from .ingestion import (
@@ -355,6 +361,15 @@ class BaselineContinuationWorker:
                 retryable=retryable,
             )
             raise ContinuationWorkerError(exc.code, retryable=retryable) from None
+        except ControlDocumentCorpusScopeError as exc:
+            self._record_failure(
+                group_id=group_id,
+                continuation_job_id=continuation_job_id,
+                lease_token=receipt.lease_token,
+                code=exc.code,
+                retryable=False,
+            )
+            raise ContinuationWorkerError(exc.code, retryable=False) from None
         except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
             self._record_failure(
                 group_id=group_id,
@@ -462,6 +477,25 @@ class BaselineContinuationWorker:
                 .mappings()
                 .all()
             )
+            changed = snapshot.manifest["changed_repository"]
+            scope_identity = control_document_corpus_identity(
+                group_id=group_id,
+                changed_repository_registration_id=str(changed["repository_id"]),
+                source_document_id=str(changed["source_document_id"]),
+            )
+            corpus_rows = connection.execute(
+                select(
+                    RetrievalCorpus.scope_key,
+                    RetrievalCorpus.changed_repository_id,
+                    RetrievalCorpus.source_document_id,
+                ).where(
+                    RetrievalCorpus.scope_key.in_(scope_identity.accepted_scope_keys)
+                )
+            ).all()
+            scope_key = choose_control_document_corpus_scope_key(
+                scope_identity,
+                tuple(tuple(row) for row in corpus_rows),
+            )
 
         if [int(row["part_ordinal"]) for row in part_rows] != list(
             range(1, len(snapshot.expected_parts) + 1)
@@ -523,6 +557,7 @@ class BaselineContinuationWorker:
             raise ValueError("content_manifest")
         return self._to_corpus_snapshot(
             group_id=group_id,
+            scope_key=scope_key,
             continuation_job_id=continuation_job_id,
             continuation=continuation,
             snapshot=snapshot,
@@ -533,6 +568,7 @@ class BaselineContinuationWorker:
     def _to_corpus_snapshot(
         *,
         group_id: str,
+        scope_key: str,
         continuation_job_id: str,
         continuation: Mapping[str, Any],
         snapshot: Any,
@@ -586,7 +622,7 @@ class BaselineContinuationWorker:
         if set(content_by_file) != expected_supported:
             raise ValueError("content_coverage")
         return CorpusSnapshotInput.create(
-            scope_key=f"group:{group_id}",
+            scope_key=scope_key,
             generation_version=str(snapshot.snapshot_id),
             changed_repository=CorpusRepositoryInput(
                 repository_id=str(changed["repository_id"]),
