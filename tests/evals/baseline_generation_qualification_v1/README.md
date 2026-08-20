@@ -29,6 +29,13 @@ Expected direct-byte SHA-256 values:
 - semantic audit: `6c6778ed3e007caaa4f7d76c2efa6b37863938dcb5f43170e8230369b2eb1167`
 - decoded 16-case anchor: `886ce0e93ac0749ade3bb109e736e3ffc0a08d0893c23fc5a83430bb0b700f2a`
 
+## Evaluation tooling
+
+`runner.py` is an evaluation-only production-adapter qualification runner. It
+is not part of the frozen examination and stores no source, evidence, feedback
+text, endpoint, or raw provider output. Like the frozen assets, it remains
+under `tests/evals` and is excluded from distributions.
+
 Hash the examination and audit files exactly as stored. Do not parse,
 normalize, canonicalize, or reserialize them first. Both are strict UTF-8 with
 LF line endings, no BOM, and exactly one final LF. The anchor digest is over
@@ -66,6 +73,55 @@ execution phase must use Core's unchanged production prompt, parser, provider,
 attestation, and supported runtime profile. Provider responses and examination
 results must be stored outside this source tree.
 
+## Qualification runner
+
+The runner uses `OllamaGenerationConfig`,
+`OllamaBaselineGenerationProvider._prepare_chat`,
+`OllamaBaselineGenerationProvider.generate`, and
+`BaselineGenerationService._parse_output` directly. This keeps qualification
+on the production request, attestation, context-budget, serialization, and
+structured-result paths without adding a second prompt or parser.
+
+Configure the exact qualified provider through the normal Core environment and
+choose a result directory outside the checkout. Run one case by stable ID or
+one-based ordinal:
+
+```console
+python3 tests/evals/baseline_generation_qualification_v1/runner.py \
+  --output-dir /external/eval-runs/qwen3-case-1 \
+  --case 1
+```
+
+Run the complete ordered examination:
+
+```console
+python3 tests/evals/baseline_generation_qualification_v1/runner.py \
+  --output-dir /external/eval-runs/qwen3-full
+```
+
+After an interruption, repeat the identical configuration and selection with
+`--resume`. Before contacting the provider, resume validates the frozen
+fixture and audit, run/configuration/selection fingerprints, every completed
+case's identity and token bounds, and the ordered result hash chain. A changed
+endpoint, seed, timeout, request/response limit, qualified profile, selection,
+fixture, or result record is a mismatch and cannot resume.
+
+The result directory contains:
+
+- `run.json`: frozen input hashes, privacy-safe configuration fingerprint,
+  qualified provider identity, and non-inference attestation latency;
+- `cases.jsonl`: one atomically checkpointed record per completed case with
+  case identity/hash, input-token and request-byte counts, expected and actual
+  outcome, finding count, match result, provider identity fingerprint, and
+  generation latency;
+- `summary.json`: completion, outcome, token, latency, and result-file totals.
+
+The runner never persists source/evidence strings, feedback strings, raw model
+output, or the provider endpoint. Result checkpoints are replaced atomically
+and fsynced after structured-output validation. Because the qualified Ollama
+adapter has no channel-side idempotency contract, a process termination after
+inference but before the atomic checkpoint can repeat that case on resume.
+
 ## Validation
 
 Run:
@@ -73,8 +129,9 @@ Run:
 ```console
 python3 tests/evals/baseline_generation_qualification_v1/validator.py
 python3 -m pytest -q tests/test_baseline_generation_qualification_eval.py
+python3 -m pytest -q tests/test_baseline_generation_qualification_runner.py
 ```
 
-The validator prints one privacy-safe JSON summary. It never prints source or
-evidence text. No command in this eval surface performs inference or network
-access.
+The validator and tests print only privacy-safe summaries and use no model or
+network. Running `runner.py` is the explicit inference action; do not invoke it
+until the exact model/runtime qualification execution is authorized.
